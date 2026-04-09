@@ -25,12 +25,7 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       PYTHONPATH: /opt/airflow
     env_file: .env
-    command: >
-      bash -c "airflow db init &&
-               airflow users create
-               --username admin --password admin
-               --firstname Admin --lastname User
-               --role Admin --email admin@tariffiq.com"
+    command: bash -c "airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@tariffiq.com"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./ingestion:/opt/airflow/ingestion
@@ -87,7 +82,7 @@ services:
     environment:
       CHROMA_SERVER_HOST: 0.0.0.0
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8000/api/v1/heartbeat"]
+      test: ["CMD-SHELL", "perl -e 'use Socket; socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\")); connect(S,sockaddr_in(8000,inet_aton(\"127.0.0.1\"))) or exit 1; exit 0'"]
       interval: 10s
       retries: 5
 
