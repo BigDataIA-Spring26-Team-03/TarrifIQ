@@ -3,8 +3,8 @@ CREATE SCHEMA IF NOT EXISTS TARIFFIQ.RAW;
 USE TARIFFIQ.RAW;
 
 CREATE TABLE IF NOT EXISTS HTS_CODES (
-    hts_id          VARCHAR(20)     NOT NULL,
-    hts_code        VARCHAR(12)     NOT NULL,
+    hts_id          VARCHAR(32)     NOT NULL,
+    hts_code        VARCHAR(32)     NOT NULL,
     stat_suffix     VARCHAR(2),
     chapter         VARCHAR(2),
     level           VARCHAR(20),
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS FEDERAL_REGISTER_NOTICES (
 
 CREATE TABLE IF NOT EXISTS NOTICE_HTS_CODES (
     document_number     VARCHAR(20)     NOT NULL,
-    hts_code            VARCHAR(12)     NOT NULL,
+    hts_code            VARCHAR(32)     NOT NULL,
     hts_chapter         VARCHAR(2),
     context_snippet     TEXT,
     match_status        VARCHAR(20)     DEFAULT 'UNVERIFIED',
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS NOTICE_HTS_CODES (
 
 CREATE TABLE IF NOT EXISTS PRODUCT_ALIASES (
     alias               VARCHAR(200)    NOT NULL,
-    hts_code            VARCHAR(12)     NOT NULL,
+    hts_code            VARCHAR(32)     NOT NULL,
     confidence          DECIMAL(4,2),
     created_at          TIMESTAMP_NTZ   DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (alias)
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS HITL_RECORDS (
     hitl_id             VARCHAR(50)     NOT NULL,
     query_text          TEXT,
     trigger_reason      VARCHAR(100),
-    classifier_hts      VARCHAR(12),
+    classifier_hts      VARCHAR(32),
     classifier_conf     DECIMAL(4,2),
     human_decision      VARCHAR(200),
     adjudicated_at      TIMESTAMP_NTZ,
