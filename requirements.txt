@@ -1,0 +1,58 @@
+# Snowflake
+snowflake-connector-python==3.7.0
+ 
+# Airflow
+apache-airflow==2.10.4
+ 
+# FastAPI
+fastapi==0.111.0
+uvicorn==0.30.1
+httpx==0.27.0
+ 
+# LangGraph + LangChain
+langgraph==0.1.5
+langchain==0.2.5
+langchain-anthropic==0.1.15
+langchain-openai==0.1.8
+ 
+# LiteLLM
+litellm==1.40.0
+ 
+# Redis
+redis==5.0.4
+ 
+# ChromaDB
+chromadb==0.5.3
+ 
+# Embeddings
+sentence-transformers==3.0.1
+ 
+# spaCy
+spacy==3.7.4
+ 
+# BM25
+rank-bm25==0.2.2
+ 
+# Pydantic
+pydantic==2.7.1
+ 
+# BeautifulSoup
+beautifulsoup4==4.12.3
+ 
+# Streamlit
+streamlit==1.36.0
+ 
+# PDF export
+fpdf2==2.7.9
+ 
+# Structlog
+structlog==24.1.0
+ 
+# Testing
+pytest==8.2.2
+pytest-cov==5.0.0
+pytest-asyncio==0.23.7
+ 
+# Utilities
+python-dotenv==1.0.1
+asyncio==3.4.3

@@ -1,0 +1,156 @@
+version: "3.8"
+
+services:
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+
+  airflow-init:
+    image: apache/airflow:2.10.4
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONPATH: /opt/airflow
+    env_file: .env
+    command: >
+      bash -c "airflow db init &&
+               airflow users create
+               --username admin --password admin
+               --firstname Admin --lastname User
+               --role Admin --email admin@tariffiq.com"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./snowflake:/opt/airflow/snowflake
+      - ./chromadb:/opt/airflow/chromadb
+
+  airflow-webserver:
+    image: apache/airflow:2.10.4
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "9090:8080"
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      PYTHONPATH: /opt/airflow
+    env_file: .env
+    command: webserver
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./snowflake:/opt/airflow/snowflake
+      - ./chromadb:/opt/airflow/chromadb
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.4
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONPATH: /opt/airflow
+    env_file: .env
+    command: scheduler
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./snowflake:/opt/airflow/snowflake
+      - ./chromadb:/opt/airflow/chromadb
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "9001:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      CHROMA_SERVER_HOST: 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    env_file: .env
+    environment:
+      CHROMADB_HOST: chromadb
+      CHROMADB_PORT: 8000
+      REDIS_URL: redis://redis:6379
+      PYTHONPATH: /app
+    volumes:
+      - ./api:/app/api
+      - ./agents:/app/agents
+      - ./llm:/app/llm
+      - ./validation:/app/validation
+      - ./snowflake:/app/snowflake
+      - ./chromadb:/app/chromadb
+      - ./ingestion:/app/ingestion
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8001 --reload
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8001/health"]
+      interval: 15s
+      retries: 5
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    depends_on:
+      fastapi:
+        condition: service_healthy
+    ports:
+      - "8502:8501"
+    env_file: .env
+    environment:
+      FASTAPI_URL: http://fastapi:8001
+      PYTHONPATH: /app
+    volumes:
+      - ./streamlit:/app/streamlit
+    command: streamlit run streamlit/app.py --server.port 8501 --server.address 0.0.0.0
+
+volumes:
+  postgres_data:
+  chromadb_data:
+  redis_data:
