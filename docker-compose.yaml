@@ -24,6 +24,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       PYTHONPATH: /opt/airflow
+      _PIP_ADDITIONAL_REQUIREMENTS: structlog==24.1.0 requests==2.32.3 snowflake-connector-python==3.7.0 python-dotenv==1.0.1
     env_file: .env
     command: bash -c "airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@tariffiq.com"
     volumes:
@@ -44,6 +45,7 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
       PYTHONPATH: /opt/airflow
+      _PIP_ADDITIONAL_REQUIREMENTS: structlog==24.1.0 requests==2.32.3 snowflake-connector-python==3.7.0 python-dotenv==1.0.1
     env_file: .env
     command: webserver
     volumes:
@@ -65,6 +67,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       PYTHONPATH: /opt/airflow
+      _PIP_ADDITIONAL_REQUIREMENTS: structlog==24.1.0 requests==2.32.3 snowflake-connector-python==3.7.0 python-dotenv==1.0.1
     env_file: .env
     command: scheduler
     volumes:
