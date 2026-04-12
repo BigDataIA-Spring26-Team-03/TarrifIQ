@@ -3,25 +3,26 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.schemas import HealthResponse, QueryRequest, CitedTariffResponse
 from api.tools.resolve_hts_rate import router as resolve_hts_rate_router
 from api.tools.lookup_product_alias import router as lookup_product_alias_router
 from api.tools.log_hitl_record import router as log_hitl_record_router
+from ingestion.chroma_loader import load_federal_register_to_chroma
+from agents.graph import run_pipeline
 
 logger = structlog.get_logger()
 
 
 def rebuild_on_startup() -> None:
-    """
-    Rebuild ChromaDB vector index from Snowflake on startup.
-    Stub for now — replace with real embedding logic in later milestone.
-    """
     logger.info("chromadb_rebuild_started")
-    # TODO: pull chunks from FEDERAL_REGISTER_NOTICES, embed, load into ChromaDB
-    logger.info("chromadb_rebuild_complete")
+    try:
+        total = load_federal_register_to_chroma()
+        logger.info("chromadb_rebuild_complete", total_chunks=total)
+    except Exception as e:
+        logger.error("chromadb_rebuild_failed", error=str(e))
 
 
 @asynccontextmanager
@@ -49,7 +50,7 @@ app.include_router(resolve_hts_rate_router, prefix="/tools")
 app.include_router(lookup_product_alias_router, prefix="/tools")
 app.include_router(log_hitl_record_router, prefix="/tools")
 
-# --- Stub routers for remaining 5 tool endpoints ---
+# --- Stub routers for remaining tool endpoints ---
 from fastapi import APIRouter
 
 stubs = APIRouter()
@@ -86,12 +87,33 @@ async def health():
     )
 
 
-# --- Query endpoint (stub) ---
+# --- Query endpoint ---
 @app.post("/query", response_model=dict)
 async def query(request: QueryRequest):
     logger.info("query_received", query=request.query)
-    return {
-        "status": "received",
-        "query": request.query,
-        "message": "Agent pipeline not wired yet — stub response",
-    }
+    try:
+        result = run_pipeline(request.query)
+        return {
+            "status": "ok",
+            "query": request.query,
+            "product": result.get("product"),
+            "country": result.get("country"),
+            "hts_code": result.get("hts_code"),
+            "hts_description": result.get("hts_description"),
+            "classification_confidence": result.get("classification_confidence"),
+            "total_duty": result.get("total_duty"),
+            "base_rate": result.get("base_rate"),
+            "adder_rate": result.get("adder_rate"),
+            "policy_summary": result.get("policy_summary"),
+            "import_value_usd": result.get("import_value_usd"),
+            "trade_period": result.get("trade_period"),
+            "trade_suppressed": result.get("trade_suppressed"),
+            "final_response": result.get("final_response"),
+            "citations": result.get("citations"),
+            "hitl_required": result.get("hitl_required"),
+            "hitl_reason": result.get("hitl_reason"),
+            "error": result.get("error"),
+        }
+    except Exception as e:
+        logger.error("query_pipeline_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
