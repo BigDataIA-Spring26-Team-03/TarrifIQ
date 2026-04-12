@@ -94,15 +94,14 @@ def _get_with_retry(url: str, params=None) -> requests.Response:
 
 def _fetch_page(page: int, agencies: List[str]) -> dict:
     """Fetch one page of document metadata from the FR API."""
-    params = [
-        ("per_page", 20),
-        ("page", page),
-        ("order", "newest"),
-    ]
-    for agency in agencies:
-        params.append(("conditions[agencies][]", agency))
-    for field in FIELDS:
-        params.append(("fields[]", field))
+    # FR API prefers params as dict with lists, not as param tuples
+    params = {
+        "per_page": 20,
+        "page": page,
+        "order": "newest",
+        "conditions[agencies][]": agencies,
+        "fields[]": FIELDS,
+    }
 
     resp = _get_with_retry(BASE_URL, params=params)
     return resp.json()
@@ -207,7 +206,10 @@ def upload_raw_xml_to_s3(document_number: str, xml_content: bytes, publication_d
             s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
             logger.debug("S3 key already exists: %s", s3_key)
             return s3_key
-        except s3_client.exceptions.NoSuchKey:
+        except Exception as e:
+            # Key doesn't exist (404) or other error - proceed with upload
+            if "404" not in str(e) and "NoSuchKey" not in str(e):
+                logger.debug("head_object check: %s", e)
             pass
 
         # Upload
@@ -268,51 +270,53 @@ def fetch_federal_register_docs(test_mode: bool = False) -> List[dict]:
     docs: List[dict] = []
     skipped = 0
 
-    for page_results in _iter_pages(agencies, max_pages=max_pages):
-        for item in page_results:
-            html_url = item.get("html_url", "")
-            xml_url = item.get("full_text_xml_url", "")
-            document_number = item.get("document_number", "")
-            publication_date = item.get("publication_date", "")
+    # Fetch from each agency separately to avoid API errors
+    for agency in agencies:
+        logger.info("Fetching from agency: %s", agency)
+        for page_results in _iter_pages([agency], max_pages=max_pages):
+            for item in page_results:
+                html_url = item.get("html_url", "")
+                xml_url = item.get("full_text_xml_url", "")
+                document_number = item.get("document_number", "")
+                publication_date = item.get("publication_date", "")
 
-            if not xml_url:
-                logger.debug("No xml_url for %s — skipping", document_number)
-                skipped += 1
-                continue
+                if not xml_url:
+                    logger.debug("No xml_url for %s — skipping", document_number)
+                    skipped += 1
+                    continue
 
-            full_text, s3_key = _fetch_full_text(xml_url, document_number, publication_date)
-            if not full_text.strip():
-                logger.debug(
-                    "Skipping empty doc document_number=%s", document_number
+                full_text, s3_key = _fetch_full_text(xml_url, document_number, publication_date)
+                if not full_text.strip():
+                    logger.debug(
+                        "Skipping empty doc document_number=%s", document_number
+                    )
+                    skipped += 1
+                    continue
+
+                # Normalise agency_names to a plain list of strings
+                raw_agencies = item.get("agencies") or []
+                agency_names = [
+                    a.get("raw_name") or a.get("name") or ""
+                    for a in raw_agencies
+                    if isinstance(a, dict)
+                ]
+
+                docs.append(
+                    {
+                        "document_number": document_number,
+                        "title": item.get("title", ""),
+                        "publication_date": publication_date,  # "YYYY-MM-DD"
+                        "html_url": html_url,
+                        "body_html_url": item.get("full_text_xml_url", ""),
+                        "document_type": item.get("type", ""),
+                        "agency_names": agency_names,
+                        "char_count": len(full_text),
+                        "chunk_count": 0,       # updated later by chunker
+                        "s3_key": s3_key,       # raw XML stored in S3
+                        "raw_json": item,       # store full API response
+                        "processing_status": "downloaded",  # Mark as downloaded
+                    }
                 )
-                skipped += 1
-                continue
-
-            # Normalise agency_names to a plain list of strings
-            raw_agencies = item.get("agencies") or []
-            agency_names = [
-                a.get("raw_name") or a.get("name") or ""
-                for a in raw_agencies
-                if isinstance(a, dict)
-            ]
-
-            docs.append(
-                {
-                    "document_number": document_number,
-                    "title": item.get("title", ""),
-                    "abstract": item.get("abstract", ""),
-                    "publication_date": publication_date,  # "YYYY-MM-DD"
-                    "html_url": html_url,
-                    "body_html_url": item.get("full_text_xml_url", ""),
-                    "document_type": item.get("type", ""),
-                    "agency_names": agency_names,
-                    "full_text": full_text,
-                    "char_count": len(full_text),
-                    "chunk_count": 0,       # updated later by chunker
-                    "s3_key": s3_key,       # raw XML stored in S3
-                    "raw_json": item,       # store full API response
-                }
-            )
 
     logger.info(
         "fetch done total=%d skipped=%d", len(docs), skipped
@@ -351,55 +355,49 @@ def load_to_snowflake(rows: List[dict]) -> int:
                         SELECT
                             %s  AS document_number,
                             %s  AS title,
-                            %s  AS abstract,
                             %s  AS publication_date,
                             %s  AS document_type,
                             PARSE_JSON(%s) AS agency_names,
-                            %s  AS full_text,
                             %s  AS html_url,
                             %s  AS body_html_url,
-                            %s  AS char_count,
                             %s  AS chunk_count,
                             %s  AS s3_key,
-                            PARSE_JSON(%s) AS raw_json
+                            PARSE_JSON(%s) AS raw_json,
+                            %s  AS processing_status
                     ) AS s
                     ON t.document_number = s.document_number
                     WHEN MATCHED THEN UPDATE SET
                         t.title          = s.title,
-                        t.abstract       = s.abstract,
                         t.publication_date = s.publication_date,
                         t.document_type  = s.document_type,
                         t.agency_names   = s.agency_names,
-                        t.full_text      = s.full_text,
                         t.html_url       = s.html_url,
                         t.body_html_url  = s.body_html_url,
-                        t.char_count     = s.char_count,
                         t.chunk_count    = s.chunk_count,
                         t.s3_key         = s.s3_key,
-                        t.raw_json       = s.raw_json
+                        t.raw_json       = s.raw_json,
+                        t.processing_status = s.processing_status
                     WHEN NOT MATCHED THEN INSERT
-                        (document_number, title, abstract, publication_date,
-                         document_type, agency_names, full_text, html_url,
-                         body_html_url, char_count, chunk_count, s3_key, raw_json)
+                        (document_number, title, publication_date,
+                         document_type, agency_names, html_url,
+                         body_html_url, chunk_count, s3_key, raw_json, processing_status)
                     VALUES
-                        (s.document_number, s.title, s.abstract, s.publication_date,
-                         s.document_type, s.agency_names, s.full_text, s.html_url,
-                         s.body_html_url, s.char_count, s.chunk_count, s.s3_key, s.raw_json)
+                        (s.document_number, s.title, s.publication_date,
+                         s.document_type, s.agency_names, s.html_url,
+                         s.body_html_url, s.chunk_count, s.s3_key, s.raw_json, s.processing_status)
                     """,
                     (
                         doc["document_number"],
                         doc["title"],
-                        doc["abstract"],
                         doc["publication_date"],
                         doc["document_type"],
                         json.dumps(doc["agency_names"]),
-                        doc["full_text"],
                         doc["html_url"],
                         doc["body_html_url"],
-                        doc["char_count"],
                         doc["chunk_count"],
                         doc.get("s3_key"),
                         json.dumps(doc["raw_json"]),
+                        doc.get("processing_status"),
                     ),
                 )
                 loaded += 1
