@@ -17,3 +17,9 @@ chroma/
 chromadb_data/
 postgres_data/
 redis_data/
+
+# Documentation files (generated, not for commit)
+CLAUDE.md
+DEPLOYMENT_CHECKLIST.md
+PIPELINE_STATUS.md
+.md
