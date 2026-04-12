@@ -3,7 +3,6 @@ Daily Federal Register ingestion pipeline:
 1. Fetch & store raw → S3 + Snowflake (DOWNLOADED)
 2. Parse documents → sections + hash (PARSED)
 3. Chunk semantically → section-aware chunks (CHUNKED)
-4. Embed & index → ChromaDB policy_rag (INDEXED)
 """
 
 from __future__ import annotations
@@ -32,10 +31,11 @@ def _task_fetch_and_store_raw() -> None:
 
 def _task_parse_documents() -> None:
     """
-    Task 2: Load raw docs from Snowflake, parse sections, compute content hash, update status.
+    Task 2: Load raw XML from S3, parse sections, compute content hash, update status.
     """
     from ingestion.connection import get_snowflake_conn
     from ingestion.html_parser import parse_fr_document
+    from ingestion.federal_register_client import _parse_xml_to_text, _get_s3_client
     import json
 
     conn = get_snowflake_conn()
@@ -46,7 +46,7 @@ def _task_parse_documents() -> None:
         cur.execute(
             """
             SELECT document_number, document_type, title, agency_names, publication_date,
-                   full_text, s3_key
+                   s3_key
             FROM FEDERAL_REGISTER_NOTICES
             WHERE processing_status IS NULL OR processing_status = 'pending' OR processing_status = 'downloaded'
             ORDER BY publication_date DESC
@@ -59,13 +59,27 @@ def _task_parse_documents() -> None:
             logger.info("Task 2: No documents to parse")
             return
 
+        s3_client = _get_s3_client()
         parsed_count = 0
         for row in rows:
-            document_number, document_type, title, agency_names_json, publication_date, full_text, s3_key = row
+            document_number, document_type, title, agency_names_json, publication_date, s3_key = row
 
             try:
                 # Parse agency_names from JSON
                 agency_names = json.loads(agency_names_json) if isinstance(agency_names_json, str) else agency_names_json or []
+
+                # Fetch full_text from S3
+                if not s3_key:
+                    logger.warning(f"No S3 key for {document_number} - skipping")
+                    continue
+
+                try:
+                    s3_obj = s3_client.get_object(Bucket="tariffiq-raw-docs", Key=s3_key)
+                    xml_content = s3_obj["Body"].read()
+                    full_text = _parse_xml_to_text(xml_content)
+                except Exception as e:
+                    logger.error(f"Failed to fetch from S3 for {document_number}: {e}")
+                    continue
 
                 # Parse document
                 parsed_doc = parse_fr_document(
@@ -113,17 +127,18 @@ def _task_parse_documents() -> None:
 
 def _task_chunk_documents() -> None:
     """
-    Task 3: Load parsed docs, run semantic chunking, extract HTS entities, update chunk_count.
+    Task 3: Load parsed docs from S3, run semantic chunking, update chunk_count.
     """
     from ingestion.connection import get_snowflake_conn
     from ingestion.html_parser import ParsedFRDocument, extract_fr_sections
     from ingestion.chunker import SemanticFRChunker
     from ingestion.embedder import Embedder
-    from ingestion.hts_extractor import extract_hts_entities
+    from ingestion.federal_register_client import _parse_xml_to_text, _get_s3_client
     import json
 
     embedder = Embedder()
     chunker = SemanticFRChunker(embedder)
+    s3_client = _get_s3_client()
 
     conn = get_snowflake_conn()
     cur = conn.cursor()
@@ -133,7 +148,7 @@ def _task_chunk_documents() -> None:
         cur.execute(
             """
             SELECT document_number, document_type, title, agency_names, publication_date,
-                   full_text, content_hash
+                   content_hash, s3_key
             FROM FEDERAL_REGISTER_NOTICES
             WHERE processing_status = 'parsed'
             ORDER BY publication_date DESC
@@ -148,14 +163,26 @@ def _task_chunk_documents() -> None:
 
         chunked_count = 0
         for row in rows:
-            document_number, document_type, title, agency_names_json, publication_date, full_text, content_hash = row
+            document_number, document_type, title, agency_names_json, publication_date, content_hash, s3_key = row
 
             try:
                 # Parse agency names
                 agency_names = json.loads(agency_names_json) if isinstance(agency_names_json, str) else agency_names_json or []
 
-                # Reconstruct ParsedFRDocument (sections already extracted, stored in the DB)
-                # For now, extract sections on-the-fly from full_text
+                # Fetch full_text from S3
+                if not s3_key:
+                    logger.warning(f"No S3 key for {document_number} - skipping")
+                    continue
+
+                try:
+                    s3_obj = s3_client.get_object(Bucket="tariffiq-raw-docs", Key=s3_key)
+                    xml_content = s3_obj["Body"].read()
+                    full_text = _parse_xml_to_text(xml_content)
+                except Exception as e:
+                    logger.error(f"Failed to fetch from S3 for {document_number}: {e}")
+                    continue
+
+                # Reconstruct ParsedFRDocument (sections extracted on-the-fly from full_text)
                 sections = extract_fr_sections(full_text, document_type)
 
                 parsed_doc = ParsedFRDocument(
@@ -170,20 +197,26 @@ def _task_chunk_documents() -> None:
                     word_count=len(full_text.split()),
                 )
 
-                # Extract HTS entities from full text
-                hts_entities = extract_hts_entities(full_text)
-                hts_annotations = {}
-                for entity in hts_entities:
-                    entity_text = full_text[entity["start_char"] : entity["end_char"]]
-                    hts_annotations[entity_text] = {
-                        "hts_code": entity["entity_text"] if entity["label"] == "HTS_CODE" else None,
-                        "hts_chapter": entity["entity_text"][:2] if entity["label"] == "HTS_CODE" else (
-                            entity["entity_text"].split()[-1] if entity["label"] == "HTS_CHAPTER" else None
-                        ),
-                    }
+                # Semantic chunk (without HTS annotation for now)
+                chunks = chunker.chunk_document(parsed_doc, {})
 
-                # Semantic chunk
-                chunks = chunker.chunk_document(parsed_doc, hts_annotations)
+                # Insert chunks into CHUNKS table
+                for chunk in chunks:
+                    chunk_id = f"{document_number}_{chunk['chunk_index']}"
+                    cur.execute(
+                        """
+                        INSERT INTO CHUNKS (chunk_id, document_number, chunk_index, chunk_text, section, word_count)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            chunk_id,
+                            chunk["document_number"],
+                            chunk["chunk_index"],
+                            chunk["chunk_text"],
+                            chunk["section"],
+                            len(chunk["chunk_text"].split()),
+                        ),
+                    )
 
                 # Update Snowflake: chunk_count, status
                 cur.execute(
@@ -216,116 +249,6 @@ def _task_chunk_documents() -> None:
         conn.close()
 
 
-def _task_embed_and_index() -> None:
-    """
-    Task 4: Load chunked docs, embed chunks, upsert into ChromaDB policy_rag.
-    """
-    from ingestion.connection import get_snowflake_conn
-    from ingestion.embedder import Embedder
-    from storage.chromadb_client import get_chromadb_client
-    import json
-
-    embedder = Embedder()
-    chroma_client = get_chromadb_client()
-    policy_rag = chroma_client.get_or_create_collection(name="policy_rag")
-
-    conn = get_snowflake_conn()
-    cur = conn.cursor()
-
-    try:
-        # Fetch documents ready for embedding (CHUNKED status)
-        cur.execute(
-            """
-            SELECT document_number, full_text
-            FROM FEDERAL_REGISTER_NOTICES
-            WHERE processing_status = 'chunked'
-            ORDER BY publication_date DESC
-            LIMIT 1000
-            """
-        )
-        rows = cur.fetchall()
-
-        if not rows:
-            logger.info("Task 4: No documents to embed")
-            return
-
-        from ingestion.html_parser import extract_fr_sections
-        from ingestion.chunker import SemanticFRChunker
-
-        chunker = SemanticFRChunker(embedder)
-
-        indexed_count = 0
-        for row in rows:
-            document_number, full_text = row
-
-            try:
-                # Re-chunk to get chunk objects (in production, store chunks in DB for efficiency)
-                sections = extract_fr_sections(full_text, "Notice")  # assume Notice for fallback
-                parsed_doc_mini = type('ParsedFRDocument', (), {
-                    'document_number': document_number,
-                    'sections': sections,
-                    'content_hash': '',
-                    'word_count': len(full_text.split()),
-                })()
-
-                chunks = chunker.chunk_document(parsed_doc_mini, {})
-
-                if chunks:
-                    # Embed chunk texts
-                    chunk_texts = [c["chunk_text"] for c in chunks]
-                    embeddings = embedder.embed_batch(chunk_texts)
-
-                    # Prepare for ChromaDB upsert
-                    ids = [f"{document_number}_{i}" for i in range(len(chunks))]
-                    metadatas = [
-                        {
-                            "document_number": c["document_number"],
-                            "section": c["section"],
-                            "chunk_index": str(c["chunk_index"]),
-                            "hts_code": c.get("hts_code") or "",
-                            "hts_chapter": c.get("hts_chapter") or "",
-                        }
-                        for c in chunks
-                    ]
-
-                    # Upsert to ChromaDB
-                    policy_rag.upsert(
-                        ids=ids,
-                        embeddings=embeddings,
-                        documents=chunk_texts,
-                        metadatas=metadatas,
-                    )
-
-                    # Update Snowflake: status = INDEXED
-                    cur.execute(
-                        """
-                        UPDATE FEDERAL_REGISTER_NOTICES
-                        SET processing_status = 'indexed'
-                        WHERE document_number = %s
-                        """,
-                        (document_number,),
-                    )
-                    indexed_count += 1
-
-            except Exception as exc:
-                logger.error(f"Embed failed for doc {document_number}: {exc}")
-                cur.execute(
-                    """
-                    UPDATE FEDERAL_REGISTER_NOTICES
-                    SET processing_status = 'failed', processing_error = %s
-                    WHERE document_number = %s
-                    """,
-                    (str(exc), document_number),
-                )
-
-        conn.commit()
-        logger.info(f"Task 4 complete: indexed {indexed_count} documents")
-
-    finally:
-        cur.close()
-        conn.close()
-
-
 DEFAULT_ARGS = {
     "owner": "tariffiq",
     "depends_on_past": False,
@@ -337,7 +260,7 @@ DEFAULT_ARGS = {
 with DAG(
     dag_id="federal_register_ingest",
     default_args=DEFAULT_ARGS,
-    description="Daily Federal Register ingestion: fetch → parse → chunk → embed → index",
+    description="Daily Federal Register ingestion: fetch → parse → chunk",
     schedule_interval="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -362,11 +285,5 @@ with DAG(
         doc="Semantic chunking with section awareness",
     )
 
-    task_embed = PythonOperator(
-        task_id="embed_and_index",
-        python_callable=_task_embed_and_index,
-        doc="Embed chunks and upsert to ChromaDB policy_rag",
-    )
-
-    # Pipeline: fetch → parse → chunk → embed
-    task_fetch >> task_parse >> task_chunk >> task_embed
+    # Pipeline: fetch → parse → chunk
+    task_fetch >> task_parse >> task_chunk
