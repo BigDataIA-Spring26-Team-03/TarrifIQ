@@ -19,8 +19,42 @@ from snowflake.connection import get_connection
 
 logger = logging.getLogger(__name__)
 
-# VALUES (not INSERT...SELECT) so snowflake-connector executemany can batch safely.
-INSERT_SQL = """
+# Staging uses only types allowed in bulk VALUES; VARIANT is built via INSERT...SELECT PARSE_JSON.
+CREATE_STAGING_SQL = """
+CREATE OR REPLACE TEMPORARY TABLE hts_bulk_load_staging (
+    hts_id VARCHAR(32),
+    hts_code VARCHAR(32),
+    stat_suffix VARCHAR(2),
+    chapter VARCHAR(2),
+    level VARCHAR(20),
+    indent_level INTEGER,
+    description TEXT,
+    general_rate VARCHAR(100),
+    special_rate VARCHAR(500),
+    other_rate VARCHAR(100),
+    units VARCHAR(50),
+    footnotes_json VARCHAR(16777216),
+    is_chapter99 BOOLEAN,
+    is_header_row BOOLEAN,
+    raw_json VARCHAR(16777216)
+)
+"""
+
+TRUNCATE_STAGING_SQL = "TRUNCATE TABLE hts_bulk_load_staging"
+
+STAGING_INSERT_SQL = """
+INSERT INTO hts_bulk_load_staging (
+    hts_id, hts_code, stat_suffix, chapter, level, indent_level,
+    description, general_rate, special_rate, other_rate, units,
+    footnotes_json, is_chapter99, is_header_row, raw_json
+) VALUES (
+    %(hts_id)s, %(hts_code)s, %(stat_suffix)s, %(chapter)s, %(level)s, %(indent_level)s,
+    %(description)s, %(general_rate)s, %(special_rate)s, %(other_rate)s, %(units)s,
+    %(footnotes_json)s, %(is_chapter99)s, %(is_header_row)s, %(raw_json)s
+)
+"""
+
+INSERT_FROM_STAGING_SQL = """
 INSERT INTO HTS_CODES (
     hts_id,
     hts_code,
@@ -38,27 +72,41 @@ INSERT INTO HTS_CODES (
     is_header_row,
     raw_json,
     loaded_at
-) VALUES (
-    %(hts_id)s,
-    %(hts_code)s,
-    %(stat_suffix)s,
-    %(chapter)s,
-    %(level)s,
-    %(indent_level)s,
-    %(description)s,
-    %(general_rate)s,
-    %(special_rate)s,
-    %(other_rate)s,
-    %(units)s,
-    PARSE_JSON(%(footnotes_json)s),
-    %(is_chapter99)s,
-    %(is_header_row)s,
-    PARSE_JSON(%(raw_json)s),
-    CURRENT_TIMESTAMP()
 )
+SELECT
+    s.hts_id,
+    s.hts_code,
+    s.stat_suffix,
+    s.chapter,
+    s.level,
+    s.indent_level,
+    s.description,
+    s.general_rate,
+    s.special_rate,
+    s.other_rate,
+    s.units,
+    PARSE_JSON(s.footnotes_json),
+    s.is_chapter99,
+    s.is_header_row,
+    PARSE_JSON(s.raw_json),
+    CURRENT_TIMESTAMP()
+FROM hts_bulk_load_staging s
 """
 
 BATCH_SIZE = 3000
+
+
+def _ensure_hts_column_width(cur) -> None:
+    """Widen HTS_CODES keys if the table was created with legacy VARCHAR(12)."""
+    alters = (
+        "ALTER TABLE HTS_CODES ALTER COLUMN hts_code SET DATA TYPE VARCHAR(32)",
+        "ALTER TABLE HTS_CODES ALTER COLUMN hts_id SET DATA TYPE VARCHAR(32)",
+    )
+    for sql in alters:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            logger.warning("hts_alter_skipped sql=%s err=%s", sql[:60], e)
 
 
 def _chapter_from_htsno(htsno: str) -> Optional[str]:
@@ -192,11 +240,15 @@ def load_hts_codes(*, dry_run: bool = False) -> int:
     conn = get_connection()
     try:
         cur = conn.cursor()
+        _ensure_hts_column_width(cur)
         cur.execute("TRUNCATE TABLE IF EXISTS HTS_CODES")
+        cur.execute(CREATE_STAGING_SQL)
         inserted = 0
         for i in range(0, len(batches), BATCH_SIZE):
             chunk = batches[i : i + BATCH_SIZE]
-            cur.executemany(INSERT_SQL, chunk)
+            cur.execute(TRUNCATE_STAGING_SQL)
+            cur.executemany(STAGING_INSERT_SQL, chunk)
+            cur.execute(INSERT_FROM_STAGING_SQL)
             inserted += len(chunk)
             logger.info("hts_batch_inserted total_so_far=%s", inserted)
         conn.commit()
