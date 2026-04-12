@@ -74,7 +74,7 @@ services:
       - ./chromadb:/opt/airflow/chromadb
 
   chromadb:
-    image: chromadb/chroma:0.4.24
+    image: chromadb/chroma:latest
     ports:
       - "9001:8000"
     volumes:
@@ -124,9 +124,10 @@ services:
       - ./ingestion:/app/ingestion
     command: uvicorn api.main:app --host 0.0.0.0 --port 8001 --reload
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8001/health"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
       interval: 15s
       retries: 5
+      start_period: 60s
 
   streamlit:
     build:
