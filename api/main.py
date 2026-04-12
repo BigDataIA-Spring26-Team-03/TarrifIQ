@@ -10,18 +10,18 @@ from api.schemas import HealthResponse, QueryRequest, CitedTariffResponse
 from api.tools.resolve_hts_rate import router as resolve_hts_rate_router
 from api.tools.lookup_product_alias import router as lookup_product_alias_router
 from api.tools.log_hitl_record import router as log_hitl_record_router
+from ingestion.chroma_loader import load_federal_register_to_chroma
 
 logger = structlog.get_logger()
 
 
 def rebuild_on_startup() -> None:
-    """
-    Rebuild ChromaDB vector index from Snowflake on startup.
-    Stub for now — replace with real embedding logic in later milestone.
-    """
     logger.info("chromadb_rebuild_started")
-    # TODO: pull chunks from FEDERAL_REGISTER_NOTICES, embed, load into ChromaDB
-    logger.info("chromadb_rebuild_complete")
+    try:
+        total = load_federal_register_to_chroma()
+        logger.info("chromadb_rebuild_complete", total_chunks=total)
+    except Exception as e:
+        logger.error("chromadb_rebuild_failed", error=str(e))
 
 
 @asynccontextmanager
