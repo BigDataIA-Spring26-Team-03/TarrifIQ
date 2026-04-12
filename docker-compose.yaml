@@ -74,7 +74,7 @@ services:
       - ./chromadb:/opt/airflow/chromadb
 
   chromadb:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:0.4.24
     ports:
       - "9001:8000"
     volumes:
