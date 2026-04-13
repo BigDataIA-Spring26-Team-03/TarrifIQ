@@ -22,14 +22,14 @@ class SemanticFRChunker:
         embedder: Embedder,
         breakpoint_threshold: float = 0.75,
         max_chunk_words: int = 400,
-        min_chunk_words: int = 30,
+        min_chunk_words: int = 50,
     ):
         """
         Args:
             embedder: Embedder instance (uses all-MiniLM-L6-v2)
             breakpoint_threshold: Cosine similarity below this creates new chunk
             max_chunk_words: Hard cap on chunk size to prevent runaway merges
-            min_chunk_words: Discard chunks smaller than this
+            min_chunk_words: Discard chunks smaller than this (Layer 4: raised from 30 to 50 to eliminate micro-chunks)
         """
         self.embedder = embedder
         self.breakpoint_threshold = breakpoint_threshold
