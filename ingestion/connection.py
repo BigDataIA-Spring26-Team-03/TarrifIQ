@@ -3,14 +3,13 @@ import os
 import snowflake.connector
 from dotenv import load_dotenv
 
-load_dotenv()
-
 
 def get_snowflake_conn():
     """
     Returns a new Snowflake connection using environment variables.
     Caller is responsible for closing the connection.
     """
+    load_dotenv(override=False)
     return snowflake.connector.connect(
         user=os.environ["SNOWFLAKE_USER"],
         password=os.environ["SNOWFLAKE_PASSWORD"],
