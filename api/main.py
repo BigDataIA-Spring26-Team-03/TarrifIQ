@@ -10,6 +10,7 @@ from api.schemas import HealthResponse, QueryRequest, CitedTariffResponse
 from api.tools.resolve_hts_rate import router as resolve_hts_rate_router
 from api.tools.lookup_product_alias import router as lookup_product_alias_router
 from api.tools.log_hitl_record import router as log_hitl_record_router
+from api.tools.trade_flow import router as trade_flow_router
 from ingestion.chroma_loader import load_federal_register_to_chroma
 from agents.graph import run_pipeline
 
@@ -49,6 +50,7 @@ app.add_middleware(
 app.include_router(resolve_hts_rate_router, prefix="/tools")
 app.include_router(lookup_product_alias_router, prefix="/tools")
 app.include_router(log_hitl_record_router, prefix="/tools")
+app.include_router(trade_flow_router, prefix="/tools")
 
 # --- Stub routers for remaining tool endpoints ---
 from fastapi import APIRouter
@@ -57,10 +59,6 @@ stubs = APIRouter()
 
 @stubs.get("/tools/search_policy")
 async def search_policy_stub():
-    return {"status": "ok", "message": "stub — not implemented yet"}
-
-@stubs.get("/tools/trade_flow")
-async def trade_flow_stub():
     return {"status": "ok", "message": "stub — not implemented yet"}
 
 @stubs.get("/tools/classify_query")

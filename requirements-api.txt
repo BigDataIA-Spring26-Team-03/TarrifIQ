@@ -1,0 +1,10 @@
+# Minimal deps for the FastAPI service only (keeps Docker image small).
+# Full stack: see requirements.txt
+
+snowflake-connector-python==3.7.0
+fastapi==0.100.1
+uvicorn==0.30.1
+httpx==0.27.0
+pydantic==2.7.1
+structlog==24.1.0
+python-dotenv==1.0.1
