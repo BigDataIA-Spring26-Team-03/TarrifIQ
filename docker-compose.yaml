@@ -16,7 +16,9 @@ services:
       retries: 5
 
   airflow-init:
-    image: apache/airflow:2.10.4
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,7 +35,9 @@ services:
       - ./chromadb:/opt/airflow/chromadb
 
   airflow-webserver:
-    image: apache/airflow:2.10.4
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -57,7 +61,9 @@ services:
       retries: 5
 
   airflow-scheduler:
-    image: apache/airflow:2.10.4
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     depends_on:
       airflow-webserver:
         condition: service_healthy
