@@ -18,15 +18,16 @@ logger = logging.getLogger(__name__)
 
 
 def _task_fetch_and_store_raw() -> None:
-    """Task 1: Fetch documents from FR API, store raw XML in S3, insert into Snowflake."""
-    from ingestion.federal_register_client import fetch_federal_register_docs, load_to_snowflake
+    """Task 1: Fetch documents from FR API incrementally, store raw XML in S3, load to Snowflake in batches."""
+    from ingestion.federal_register_client import fetch_and_load_incrementally
 
-    docs = fetch_federal_register_docs(test_mode=False)
-    if docs:
-        loaded = load_to_snowflake(docs)
-        logger.info(f"Task 1 complete: fetched {len(docs)} docs, loaded {loaded} to Snowflake")
-    else:
-        logger.info("Task 1 complete: no new documents")
+    try:
+        logger.info("Task 1: Starting incremental fetch from FR API (cutoff_year=2016)")
+        loaded = fetch_and_load_incrementally(test_mode=False, cutoff_year=2016, batch_size=50)
+        logger.info(f"Task 1 complete: fetched and loaded {loaded} documents to Snowflake")
+    except Exception as exc:
+        logger.error(f"Task 1 FAILED: {str(exc)}", exc_info=True)
+        raise
 
 
 def _task_parse_documents() -> None:
@@ -42,13 +43,14 @@ def _task_parse_documents() -> None:
     cur = conn.cursor()
 
     try:
-        # Fetch documents that are ready for parsing (PENDING or DOWNLOADED status)
+        # Fetch documents that are ready for parsing (PENDING or DOWNLOADED status) from 2016 onwards
         cur.execute(
             """
             SELECT document_number, document_type, title, agency_names, publication_date,
                    s3_key
             FROM FEDERAL_REGISTER_NOTICES
-            WHERE processing_status IS NULL OR processing_status = 'pending' OR processing_status = 'downloaded'
+            WHERE (processing_status IS NULL OR processing_status = 'pending' OR processing_status = 'downloaded')
+              AND YEAR(publication_date) >= 2016
             ORDER BY publication_date DESC
             LIMIT 1000
             """
@@ -144,13 +146,14 @@ def _task_chunk_documents() -> None:
     cur = conn.cursor()
 
     try:
-        # Fetch documents ready for chunking (PARSED status)
+        # Fetch documents ready for chunking (PARSED status) from 2016 onwards
         cur.execute(
             """
             SELECT document_number, document_type, title, agency_names, publication_date,
                    content_hash, s3_key
             FROM FEDERAL_REGISTER_NOTICES
             WHERE processing_status = 'parsed'
+              AND YEAR(publication_date) >= 2016
             ORDER BY publication_date DESC
             LIMIT 1000
             """
@@ -202,7 +205,8 @@ def _task_chunk_documents() -> None:
 
                 # Insert chunks into CHUNKS table
                 for chunk in chunks:
-                    chunk_id = f"{document_number}_{chunk['chunk_index']}"
+                    # Layer 4: Fixed chunk ID format to include section, preventing duplicates
+                    chunk_id = f"{document_number}_{chunk['section']}_{chunk['chunk_index']}"
                     cur.execute(
                         """
                         INSERT INTO CHUNKS (chunk_id, document_number, chunk_index, chunk_text, section, word_count)
