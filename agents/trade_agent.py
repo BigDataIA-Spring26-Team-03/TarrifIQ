@@ -1,27 +1,24 @@
 """
 Trade Agent — TariffIQ Pipeline Step 5
 
-Queries Census Bureau International Trade API live at query time.
-HS6 only — HS8 is confirmed broken by Census Bureau.
-No data stored in Snowflake.
+Uses Ishaan's census_client for live Census Bureau data with:
+- Redis caching
+- HS10 -> HS6 -> HS4 fallback chain
+- Effective tariff rate calculation
+- Multi-month trend support
 
-API: https://api.census.gov/data/timeseries/intltrade/imports/hs
+No data stored in Snowflake — queried live at query time.
 """
 
 import logging
-import os
 from typing import Dict, Any, Optional
 
-import requests
-
+from ingestion.census_client import get_trade_flow
 from agents.state import TariffState
 
 logger = logging.getLogger(__name__)
 
-CENSUS_BASE_URL = "https://api.census.gov/data/timeseries/intltrade/imports/hs"
-REQUEST_TIMEOUT = 15
-
-# Country name to Census country code mapping for common trade partners
+# Country name to Census country code mapping
 COUNTRY_CODE_MAP = {
     "china": "5700",
     "canada": "1220",
@@ -41,98 +38,34 @@ COUNTRY_CODE_MAP = {
     "thailand": "5490",
 }
 
-# Most recent available Census data period
-DEFAULT_PERIOD = os.environ.get("CENSUS_DEFAULT_PERIOD", "2024-12")
-
 
 def _get_country_code(country: Optional[str]) -> Optional[str]:
-    """Map country name to Census country code."""
     if not country:
         return None
     return COUNTRY_CODE_MAP.get(country.lower().strip())
 
 
-def _parse_hs6(hts_code: str) -> Optional[str]:
-    """
-    Strip HTS code to HS6 format (6 digits, no dots).
-    e.g. "8471.30.01.00" -> "847130"
-    """
-    if not hts_code:
-        return None
-    digits = hts_code.replace(".", "").replace(" ", "")
-    if len(digits) >= 6:
-        return digits[:6]
-    return None
+def _filter_by_country(
+    rows: list, country: Optional[str], country_code: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Find the row matching the requested country."""
+    if not rows or not country:
+        return rows[0] if rows else None
 
+    country_lower = country.lower()
+    for row in rows:
+        cty_name = str(row.get("CTY_NAME", "")).lower()
+        cty_code = str(row.get("CTY_CODE", ""))
+        if country_lower in cty_name or (country_code and cty_code == country_code):
+            return row
 
-def _query_census(hs6: str, country_code: Optional[str], period: str) -> Dict[str, Any]:
-    """
-    Query Census Bureau API for import data.
-
-    Returns dict with import_value_usd, import_quantity, suppressed flag.
-    """
-    params = {
-        "get": "GEN_VAL_MO,GEN_QY1_MO,CTY_NAME,I_COMMODITY_LDESC",
-        "COMM_LVL": "HS6",
-        "I_COMMODITY": hs6,
-        "time": period,
-    }
-
-    if country_code:
-        params["CTY_CODE"] = country_code
-
-    census_api_key = os.environ.get("CENSUS_API_KEY")
-    if census_api_key:
-        params["key"] = census_api_key
-
-    try:
-        resp = requests.get(CENSUS_BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
-
-        # 204 = data suppressed (below reporting threshold)
-        if resp.status_code == 204:
-            logger.info("census_data_suppressed hs6=%s period=%s", hs6, period)
-            return {"suppressed": True}
-
-        if resp.status_code == 400:
-            logger.warning("census_bad_request hs6=%s status=400", hs6)
-            return {"suppressed": True}
-
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Census returns [header_row, data_row, ...]
-        if not data or len(data) < 2:
-            return {"suppressed": True}
-
-        headers = data[0]
-        row = data[1]
-        record = dict(zip(headers, row))
-
-        val = record.get("GEN_VAL_MO")
-        qty = record.get("GEN_QY1_MO")
-
-        import_value = float(val) if val and val != "null" else None
-        import_quantity = float(qty) if qty and qty != "null" else None
-
-        if import_value is None and import_quantity is None:
-            return {"suppressed": True}
-
-        return {
-            "suppressed": False,
-            "import_value_usd": import_value,
-            "import_quantity": import_quantity,
-            "country_name": record.get("CTY_NAME", ""),
-            "commodity_desc": record.get("I_COMMODITY_LDESC", ""),
-        }
-
-    except requests.RequestException as e:
-        logger.error("census_request_failed hs6=%s error=%s", hs6, e)
-        return {"suppressed": True, "error": str(e)}
+    # Fallback to first row if no country match
+    return rows[0] if rows else None
 
 
 def run_trade_agent(state: TariffState) -> Dict[str, Any]:
     """
-    Fetch live import trade flow data from Census Bureau.
+    Fetch live import trade flow data from Census Bureau via census_client.
 
     Args:
         state: TariffState with hts_code and optionally country populated
@@ -144,9 +77,8 @@ def run_trade_agent(state: TariffState) -> Dict[str, Any]:
     hts_code = state.get("hts_code")
     country = state.get("country")
 
-    hs6 = _parse_hs6(hts_code)
-    if not hs6:
-        logger.warning("trade_agent_skipped no valid hts_code")
+    if not hts_code:
+        logger.warning("trade_agent_skipped no hts_code")
         return {
             "import_value_usd": None,
             "import_quantity": None,
@@ -156,36 +88,73 @@ def run_trade_agent(state: TariffState) -> Dict[str, Any]:
         }
 
     country_code = _get_country_code(country)
-    period = DEFAULT_PERIOD
 
     logger.info(
-        "trade_agent_start hs6=%s country=%s country_code=%s period=%s",
-        hs6, country, country_code, period,
+        "trade_agent_start hts=%s country=%s country_code=%s",
+        hts_code, country, country_code,
     )
 
-    result = _query_census(hs6, country_code, period)
+    try:
+        result = get_trade_flow(hts_code)
 
-    if result.get("suppressed"):
-        logger.info("trade_agent_suppressed hs6=%s", hs6)
+        rows = result.get("rows") or []
+        period = result.get("time", "")
+        note = result.get("note", "")
+
+        if not rows or note == "data not available at this resolution":
+            logger.info("trade_agent_suppressed hts=%s note=%s", hts_code, note)
+            return {
+                "import_value_usd": None,
+                "import_quantity": None,
+                "trade_period": period,
+                "trade_country_code": country_code,
+                "trade_suppressed": True,
+            }
+
+        # Filter to requested country if specified
+        row = _filter_by_country(rows, country, country_code)
+        if not row:
+            return {
+                "import_value_usd": None,
+                "import_quantity": None,
+                "trade_period": period,
+                "trade_country_code": country_code,
+                "trade_suppressed": True,
+            }
+
+        # Parse import value
+        val_raw = row.get("GEN_VAL_MO")
+        try:
+            import_value = float(str(val_raw).replace(",", "")) if val_raw not in (None, "", "(D)") else None
+        except (ValueError, TypeError):
+            import_value = None
+
+        # Parse quantity
+        qty_raw = row.get("GEN_QY1_MO") or row.get("CON_VAL_MO")
+        try:
+            import_qty = float(str(qty_raw).replace(",", "")) if qty_raw not in (None, "", "(D)") else None
+        except (ValueError, TypeError):
+            import_qty = None
+
+        logger.info(
+            "trade_agent_done hts=%s country=%s value=%s period=%s",
+            hts_code, country, import_value, period,
+        )
+
+        return {
+            "import_value_usd": import_value,
+            "import_quantity": import_qty,
+            "trade_period": period,
+            "trade_country_code": country_code,
+            "trade_suppressed": import_value is None,
+        }
+
+    except Exception as e:
+        logger.error("trade_agent_failed hts=%s error=%s", hts_code, e)
         return {
             "import_value_usd": None,
             "import_quantity": None,
-            "trade_period": period,
+            "trade_period": None,
             "trade_country_code": country_code,
             "trade_suppressed": True,
         }
-
-    logger.info(
-        "trade_agent_done hs6=%s value=%s qty=%s",
-        hs6,
-        result.get("import_value_usd"),
-        result.get("import_quantity"),
-    )
-
-    return {
-        "import_value_usd": result.get("import_value_usd"),
-        "import_quantity": result.get("import_quantity"),
-        "trade_period": period,
-        "trade_country_code": country_code,
-        "trade_suppressed": False,
-    }
