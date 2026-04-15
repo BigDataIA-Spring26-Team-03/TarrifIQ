@@ -37,61 +37,19 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.federalregister.gov/api/v1/documents.json"
 
 ALL_AGENCIES = [
-    "international-trade-administration",             # AD/CVD orders — core
-    "international-trade-commission",                 # USITC injury determinations — core
-    "trade-representative-office-of-united-states",  # Section 301, IEEPA, FTA, GSP — core
-    "customs-and-border-protection",                  # HTS classification rulings — core
-    "office-of-the-federal-register",                 # Presidential proclamations — important
-    "energy-department",                              # Section 232 critical minerals — optional
+    "trade-representative-office-of-united-states",
 ]
 
 TEST_AGENCIES = ["trade-representative-office-of-united-states"]
 
 # FR API search terms for server-side filtering
-TARIFF_SEARCH_TERMS = [
-    "antidumping duty order",
-    "countervailing duty order",
-    "less than fair value",
-    "sunset review",
-    "section 301",
-    "section 232",
-    "harmonized tariff schedule",
-    "IEEPA",
-    "tariff rate quota",
-    "safeguard measure",
-    "circumvention",
-    "scope ruling",
-    "dumping margin",
-    "trade remedy",
-]
+TARIFF_SEARCH_TERMS = []
 
-# Python safety filter keywords (Layer 3)
-SAFETY_FILTER_KEYWORDS = {
-    "antidumping",
-    "countervailing",
-    "dumping",
-    "tariff",
-    "duty order",
-    "htsus",
-    "harmonized tariff",
-    "section 301",
-    "section 232",
-    "ieepa",
-    "less than fair value",
-    "ltfv",
-    "sunset review",
-    "scope ruling",
-    "circumvention",
-    "trade remedy",
-    "safeguard",
-    "exclusion",
-    "liquidation",
-    "cash deposit",
-    "dumping margin",
-    "subsidy rate",
-    "material injury",
-    "cvd",
-    "ad order",
+ALLOWED_DOC_TYPES = {
+    "Rule",
+    "Notice",
+    "Presidential Document",
+    "Proposed Rule",
 }
 
 FIELDS = [
@@ -110,25 +68,10 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAYS = [1, 2, 4]   # exponential backoff in seconds
 SNOWFLAKE_BATCH_SIZE = 50  # rows per MERGE batch
-S3_BUCKET = os.environ.get("S3_BUCKET", "tariffiq-raw-docs")
-
-
-# ── Relevance filtering (Layer 3) ────────────────────────────────────────────
-
-def _is_tariff_relevant(doc: dict) -> bool:
-    """
-    Safety filter: Check document title and abstract for tariff keywords.
-    Only applied after server-side API filtering (Layer 2).
-    Returns True if any keyword found in title or abstract; False otherwise.
-    """
-    title = (doc.get("title") or "").lower()
-    abstract = (doc.get("abstract") or "").lower()
-    combined = f"{title} {abstract}"
-
-    for keyword in SAFETY_FILTER_KEYWORDS:
-        if keyword in combined:
-            return True
-    return False
+# Federal Register XML lives under raw/ in the bucket (override with S3_BUCKET in .env).
+DEFAULT_S3_BUCKET = "tariff-iq-federal-registry-bucket"
+S3_FR_RAW_PREFIX = "raw/federal-register"
+S3_BUCKET = (os.environ.get("S3_BUCKET") or DEFAULT_S3_BUCKET).strip() or None
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -261,16 +204,16 @@ def upload_raw_xml_to_s3(document_number: str, xml_content: bytes, publication_d
         return None
 
     try:
-        # Parse date to extract year/month
         try:
             dt = datetime.fromisoformat(publication_date)
-            year = dt.year
-            month = dt.month
+            year_str = str(dt.year)
+            month_str = f"{dt.month:02d}"
         except (ValueError, TypeError):
-            year, month = "unknown", "unknown"
+            year_str = "unknown"
+            month_str = "unknown"
 
-        # S3 key: s3://bucket/federal-register/2024/01/2024-1234.xml
-        s3_key = f"federal-register/{year}/{month:02d}/{document_number}.xml"
+        # s3://<bucket>/raw/federal-register/2024/01/2024-1234.xml
+        s3_key = f"{S3_FR_RAW_PREFIX}/{year_str}/{month_str}/{document_number}.xml"
 
         s3_client = _get_s3_client()
 
@@ -295,13 +238,13 @@ def upload_raw_xml_to_s3(document_number: str, xml_content: bytes, publication_d
         return None
 
 
-def _iter_pages(agencies: List[str], max_pages: Optional[int] = None, cutoff_year: int = 2016, search_term: Optional[str] = None) -> Iterator[List[dict]]:
+def _iter_pages(agencies: List[str], max_pages: Optional[int] = None, cutoff_year: int = 2018, search_term: Optional[str] = None) -> Iterator[List[dict]]:
     """
     Yields one page of raw API results at a time.
     Stops when next_page_url is null, max_pages is reached, or documents are older than cutoff_year.
 
     If search_term is provided, uses server-side filtering via conditions[term] (Layer 2).
-    Default cutoff_year: 2016 (sweet spot for tariff data coverage).
+    Default cutoff_year: 2018 (Section 301 era onwards).
     """
     page = 1
     while True:
@@ -350,7 +293,12 @@ def _iter_pages(agencies: List[str], max_pages: Optional[int] = None, cutoff_yea
         time.sleep(PAGE_SLEEP_SECONDS)
 
 
-def fetch_and_load_incrementally(test_mode: bool = False, cutoff_year: int = 2016, batch_size: int = 50) -> int:
+def fetch_and_load_incrementally(
+    test_mode: bool = False,
+    cutoff_year: int = 2018,
+    batch_size: int = 50,
+    max_documents: Optional[int] = None,
+) -> int:
     """
     INCREMENTAL FETCH + LOAD: Fetches documents from FR API and loads to Snowflake in batches.
 
@@ -358,79 +306,138 @@ def fetch_and_load_incrementally(test_mode: bool = False, cutoff_year: int = 201
     - Snowflake populates immediately (not empty for 30+ mins)
     - Memory efficient (doesn't hold 600+ docs in RAM)
     - Progress visible in real-time
-    Default cutoff_year: 2016 (sweet spot for tariff data coverage)
+    Default cutoff_year: 2018 (Section 301 era onwards)
     - If fetch fails, at least some documents were saved
 
     Args:
         test_mode: True = 1 page from USTR only; False = all agencies, all pages
-        cutoff_year: Only fetch documents from this year onwards (default: 2015)
+        cutoff_year: Only fetch documents from this year onwards (default: 2018)
         batch_size: Documents to fetch before loading to Snowflake (default: 50)
+        max_documents: Stop after this many documents are collected (after S3/XML success); None = no cap
 
     Returns: Total documents loaded to Snowflake
     """
     agencies = TEST_AGENCIES if test_mode else ALL_AGENCIES
     max_pages = 1 if test_mode else None
+    search_terms = [None]  # Always fetch without search terms — agency is the filter
 
     logger.info(
-        "fetch_and_load_incrementally test_mode=%s agencies=%s cutoff_year=%d batch_size=%d",
-        test_mode, agencies, cutoff_year, batch_size
+        "fetch_and_load_incrementally test_mode=%s agencies=%s cutoff_year=%d batch_size=%d max_documents=%s",
+        test_mode, agencies, cutoff_year, batch_size, max_documents,
     )
 
     batch = []
     total_loaded = 0
     skipped = 0
+    documents_collected = 0
+    seen_document_numbers: set[str] = set()
 
-    # Fetch from each agency separately
+    # Fetch from each agency and term; deduplicate by document_number across terms.
     for agency in agencies:
         logger.info("Fetching from agency: %s (documents from %d onwards)", agency, cutoff_year)
+        fetched_for_agency = 0
+        skipped_by_type = 0
+        skipped_by_dedup = 0
+        skipped_by_api_error = 0
 
-        for page_results in _iter_pages([agency], max_pages=max_pages, cutoff_year=cutoff_year):
-            for item in page_results:
-                html_url = item.get("html_url", "")
-                xml_url = item.get("full_text_xml_url", "")
-                document_number = item.get("document_number", "")
-                publication_date = item.get("publication_date", "")
+        for search_term in search_terms:
+            logger.info("Fetching agency=%s with search_term=%s", agency, search_term)
+            try:
+                page_iter = _iter_pages([agency], max_pages=max_pages, cutoff_year=cutoff_year, search_term=None)
+                for page_results in page_iter:
+                    for item in page_results:
+                        document_type = (item.get("type") or "").strip()
+                        if document_type not in ALLOWED_DOC_TYPES:
+                            logger.debug(
+                                "skip_disallowed_type doc=%s type=%s",
+                                item.get("document_number", ""),
+                                document_type,
+                            )
+                            skipped_by_type += 1
+                            continue
 
-                if not xml_url:
-                    logger.debug("No xml_url for %s — skipping", document_number)
-                    skipped += 1
-                    continue
+                        document_number = item.get("document_number", "")
+                        if not document_number:
+                            skipped += 1
+                            continue
+                        if document_number in seen_document_numbers:
+                            skipped_by_dedup += 1
+                            continue
+                        seen_document_numbers.add(document_number)
 
-                full_text, s3_key = _fetch_full_text(xml_url, document_number, publication_date)
-                if not full_text.strip():
-                    logger.debug("Skipping empty doc document_number=%s", document_number)
-                    skipped += 1
-                    continue
+                        html_url = item.get("html_url", "")
+                        xml_url = item.get("full_text_xml_url", "")
+                        publication_date = item.get("publication_date", "")
 
-                # Normalise agency_names
-                raw_agencies = item.get("agencies") or []
-                agency_names = [
-                    a.get("raw_name") or a.get("name") or ""
-                    for a in raw_agencies
-                    if isinstance(a, dict)
-                ]
+                        if not xml_url:
+                            logger.debug("No xml_url for %s — skipping", document_number)
+                            skipped += 1
+                            continue
 
-                batch.append({
-                    "document_number": document_number,
-                    "title": item.get("title", ""),
-                    "publication_date": publication_date,
-                    "html_url": html_url,
-                    "body_html_url": item.get("full_text_xml_url", ""),
-                    "document_type": item.get("type", ""),
-                    "agency_names": agency_names,
-                    "char_count": len(full_text),
-                    "chunk_count": 0,
-                    "s3_key": s3_key,
-                    "raw_json": item,
-                    "processing_status": "downloaded",
-                })
+                        full_text, s3_key = _fetch_full_text(xml_url, document_number, publication_date)
+                        if not full_text.strip():
+                            logger.debug("Skipping empty doc document_number=%s", document_number)
+                            skipped += 1
+                            continue
 
-                # Load batch when it reaches batch_size
-                if len(batch) >= batch_size:
-                    loaded = load_to_snowflake(batch)
-                    total_loaded += loaded
-                    logger.info("✓ Batch loaded: %d documents (total so far: %d)", loaded, total_loaded)
-                    batch = []  # Reset for next batch
+                        # Normalise agency_names
+                        raw_agencies = item.get("agencies") or []
+                        agency_names = [
+                            a.get("raw_name") or a.get("name") or ""
+                            for a in raw_agencies
+                            if isinstance(a, dict)
+                        ]
+
+                        batch.append({
+                            "document_number": document_number,
+                            "title": item.get("title", ""),
+                            "publication_date": publication_date,
+                            "html_url": html_url,
+                            "body_html_url": item.get("full_text_xml_url", ""),
+                            "document_type": item.get("type", ""),
+                            "agency_names": agency_names,
+                            "char_count": len(full_text),
+                            "chunk_count": 0,
+                            "s3_key": s3_key,
+                            "raw_json": item,
+                            "processing_status": "downloaded",
+                        })
+                        documents_collected += 1
+                        fetched_for_agency += 1
+
+                        # Load batch when it reaches batch_size
+                        if len(batch) >= batch_size:
+                            loaded = load_to_snowflake(batch)
+                            total_loaded += loaded
+                            logger.info("✓ Batch loaded: %d documents (total so far: %d)", loaded, total_loaded)
+                            batch = []  # Reset for next batch
+
+                        if max_documents is not None and documents_collected >= max_documents:
+                            if batch:
+                                loaded = load_to_snowflake(batch)
+                                total_loaded += loaded
+                                logger.info("✓ Final batch loaded: %d documents", loaded)
+                                batch = []
+                            logger.info(
+                                "fetch_and_load_incrementally: max_documents=%s reached (collected=%s, loaded=%s)",
+                                max_documents,
+                                documents_collected,
+                                total_loaded,
+                            )
+                            return total_loaded
+            except requests.RequestException as exc:
+                skipped_by_api_error += 1
+                logger.error(
+                    "Skipping agency=%s due to FR API error: %s",
+                    agency,
+                    exc,
+                )
+                continue
+
+        logger.info(
+            "agency=%s fetched=%d skipped_type=%d skipped_dedup=%d skipped_api_error=%d",
+            agency, fetched_for_agency, skipped_by_type, skipped_by_dedup, skipped_by_api_error
+        )
 
     # Load remaining documents
     if batch:
@@ -442,31 +449,28 @@ def fetch_and_load_incrementally(test_mode: bool = False, cutoff_year: int = 201
     return total_loaded
 
 
-def fetch_federal_register_docs(test_mode: bool = False, cutoff_year: int = 2016) -> List[dict]:
+def fetch_federal_register_docs(test_mode: bool = False, cutoff_year: int = 2018) -> List[dict]:
     """
-    Fetches Federal Register documents using Layer 2 (term-based server-side search) and Layer 3 (safety filter).
-
-    Layer 2: Uses FR API's conditions[term] for server-side filtering across multiple tariff-specific search terms
-    Layer 3: Applies Python safety filter checking document title and abstract for tariff keywords
+    Fetches Federal Register documents using FR API term filtering.
 
     test_mode=True  → 1 page (up to 20 docs) from USTR only, no search terms
-    test_mode=False → all agencies, all search terms, all pages (documents from cutoff_year onwards, default: 2016-2026)
-    cutoff_year     → only fetch documents published in cutoff_year or later (default: 2016 — sweet spot for coverage)
+    test_mode=False → all agencies, all search terms, all pages (documents from cutoff_year onwards, default: 2018+)
+    cutoff_year     → only fetch documents published in cutoff_year or later (default: 2018)
 
     Returns List[dict] matching FEDERAL_REGISTER_NOTICES schema, deduplicated by document_number.
     """
     agencies = TEST_AGENCIES if test_mode else ALL_AGENCIES
     max_pages = 1 if test_mode else None
-    search_terms = [] if test_mode else TARIFF_SEARCH_TERMS
+    search_terms = [None]  # Always fetch without search terms
 
     logger.info(
         "fetch_federal_register_docs test_mode=%s agencies=%s cutoff_year=%d search_terms=%d",
         test_mode, agencies, cutoff_year, len(search_terms)
     )
 
-    # Layer 2 + Layer 3: Fetch with each term, deduplicate, apply safety filter
+    # Fetch with each term and deduplicate by document_number.
     docs_by_number = {}  # {document_number: doc_dict} for deduplication
-    skipped_by_filter = 0
+    skipped_by_type = 0
     skipped_by_empty = 0
     skipped_by_no_xml = 0
 
@@ -476,61 +480,66 @@ def fetch_federal_register_docs(test_mode: bool = False, cutoff_year: int = 2016
 
     for search_term in search_terms:
         logger.info("Fetching with search_term=%s", search_term)
-        for page_results in _iter_pages(agencies, max_pages=max_pages, cutoff_year=cutoff_year, search_term=search_term):
-            for item in page_results:
-                document_number = item.get("document_number", "")
-                if not document_number or document_number in docs_by_number:
-                    # Already processed or no document number
-                    continue
+        try:
+            page_iter = _iter_pages(agencies, max_pages=max_pages, cutoff_year=cutoff_year, search_term=None)
+            for page_results in page_iter:
+                for item in page_results:
+                    document_number = item.get("document_number", "")
+                    if not document_number or document_number in docs_by_number:
+                        # Already processed or no document number
+                        continue
 
-                # Layer 3: Safety filter — check title/abstract for tariff keywords
-                if not _is_tariff_relevant(item):
-                    logger.debug("Filtered by safety check: %s (title: %s)", document_number, item.get("title", "")[:60])
-                    skipped_by_filter += 1
-                    continue
+                    document_type = (item.get("type") or "").strip()
+                    if document_type not in ALLOWED_DOC_TYPES:
+                        logger.debug("Filtered by type: %s type=%s", document_number, document_type)
+                        skipped_by_type += 1
+                        continue
 
-                html_url = item.get("html_url", "")
-                xml_url = item.get("full_text_xml_url", "")
-                publication_date = item.get("publication_date", "")
+                    html_url = item.get("html_url", "")
+                    xml_url = item.get("full_text_xml_url", "")
+                    publication_date = item.get("publication_date", "")
 
-                if not xml_url:
-                    logger.debug("No xml_url for %s — skipping", document_number)
-                    skipped_by_no_xml += 1
-                    continue
+                    if not xml_url:
+                        logger.debug("No xml_url for %s — skipping", document_number)
+                        skipped_by_no_xml += 1
+                        continue
 
-                full_text, s3_key = _fetch_full_text(xml_url, document_number, publication_date)
-                if not full_text.strip():
-                    logger.debug("Skipping empty doc %s", document_number)
-                    skipped_by_empty += 1
-                    continue
+                    full_text, s3_key = _fetch_full_text(xml_url, document_number, publication_date)
+                    if not full_text.strip():
+                        logger.debug("Skipping empty doc %s", document_number)
+                        skipped_by_empty += 1
+                        continue
 
-                # Normalise agency_names to a plain list of strings
-                raw_agencies = item.get("agencies") or []
-                agency_names = [
-                    a.get("raw_name") or a.get("name") or ""
-                    for a in raw_agencies
-                    if isinstance(a, dict)
-                ]
+                    # Normalise agency_names to a plain list of strings
+                    raw_agencies = item.get("agencies") or []
+                    agency_names = [
+                        a.get("raw_name") or a.get("name") or ""
+                        for a in raw_agencies
+                        if isinstance(a, dict)
+                    ]
 
-                docs_by_number[document_number] = {
-                    "document_number": document_number,
-                    "title": item.get("title", ""),
-                    "publication_date": publication_date,  # "YYYY-MM-DD"
-                    "html_url": html_url,
-                    "body_html_url": item.get("full_text_xml_url", ""),
-                    "document_type": item.get("type", ""),
-                    "agency_names": agency_names,
-                    "char_count": len(full_text),
-                    "chunk_count": 0,       # updated later by chunker
-                    "s3_key": s3_key,       # raw XML stored in S3
-                    "raw_json": item,       # store full API response
-                    "processing_status": "downloaded",  # Mark as downloaded
-                }
+                    docs_by_number[document_number] = {
+                        "document_number": document_number,
+                        "title": item.get("title", ""),
+                        "publication_date": publication_date,  # "YYYY-MM-DD"
+                        "html_url": html_url,
+                        "body_html_url": item.get("full_text_xml_url", ""),
+                        "document_type": item.get("type", ""),
+                        "agency_names": agency_names,
+                        "char_count": len(full_text),
+                        "chunk_count": 0,       # updated later by chunker
+                        "s3_key": s3_key,       # raw XML stored in S3
+                        "raw_json": item,       # store full API response
+                        "processing_status": "downloaded",  # Mark as downloaded
+                    }
+        except requests.RequestException as exc:
+            logger.error("Skipping bulk fetch due to FR API error: %s", exc)
+            continue
 
     docs = list(docs_by_number.values())
     logger.info(
-        "fetch done total=%d skipped_by_filter=%d skipped_by_empty=%d skipped_by_no_xml=%d",
-        len(docs), skipped_by_filter, skipped_by_empty, skipped_by_no_xml
+        "fetch done total=%d skipped_by_type=%d skipped_by_empty=%d skipped_by_no_xml=%d",
+        len(docs), skipped_by_type, skipped_by_empty, skipped_by_no_xml
     )
     return docs
 
