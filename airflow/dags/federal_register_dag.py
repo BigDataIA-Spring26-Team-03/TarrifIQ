@@ -2,12 +2,12 @@
 Daily Federal Register ingestion pipeline:
 1. Fetch & store raw → S3 + Snowflake (DOWNLOADED)
 2. Parse documents → sections + hash (PARSED)
-3. Chunk semantically → section-aware chunks (CHUNKED)
-4. Extract HTS codes → NOTICE_HTS_CODES + CHUNKS (HTS_EXTRACTED)
+3. Extract HTS codes → NOTICE_HTS_CODES (HTS_EXTRACTED)
+4. Chunk semantically → section-aware chunks (CHUNKED)
 
 processing_status flow:
-  downloaded → parsed → chunked → hts_extracted
-                              ↘ hts_extraction_failed (on error)
+  downloaded → parsed → hts_extracted → chunked
+                    ↘ hts_extraction_failed (on error)
 
 Env FR_PIPELINE_MAX_DOCS: when set to a positive integer (e.g. 10), caps all stages for trial runs:
   fetch (new loads), parse, chunk, HTS extraction. Omit or set 0 for no limit.
@@ -199,7 +199,7 @@ def _task_parse_documents(shard_id: int = 0, total_shards: int = 1) -> None:
 
 def _task_chunk_documents(shard_id: int = 0, total_shards: int = 1) -> None:
     """
-    Task 3: Load parsed docs from S3, run semantic chunking, update chunk_count.
+    Task 3: Load HTS-extracted docs from S3, run semantic chunking, update chunk_count.
     """
     from ingestion.connection import get_snowflake_conn
     from ingestion.html_parser import ParsedFRDocument, extract_fr_sections
@@ -230,7 +230,7 @@ def _task_chunk_documents(shard_id: int = 0, total_shards: int = 1) -> None:
             SELECT document_number, document_type, title, agency_names, publication_date,
                    content_hash, s3_key
             FROM FEDERAL_REGISTER_NOTICES
-            WHERE processing_status = 'parsed'
+            WHERE processing_status IN ('parsed', 'hts_extracted', 'hts_extraction_failed')
               AND YEAR(publication_date) >= 2018
               AND MOD(ABS(HASH(document_number)), %s) = %s
             ORDER BY publication_date DESC
@@ -340,45 +340,32 @@ def _task_chunk_documents(shard_id: int = 0, total_shards: int = 1) -> None:
 
 def _task_extract_hts_codes(shard_id: int = 0, total_shards: int = 1) -> None:
     """
-    Task 4: HTS extraction for chunked documents — NOTICE_HTS_CODES + CHUNKS.hts_*.
+    Task 4: HTS extraction for parsed documents — NOTICE_HTS_CODES.
     """
     from ingestion.connection import get_snowflake_conn
-    from ingestion.hts_extractor import (
-        run_extraction_pipeline,
-        update_chunks_with_hts,
-        write_notice_hts_codes,
-        validate_hts_codes,
-    )
-
-    logger.debug(
-        "hts_extractor exports: %s, %s",
-        write_notice_hts_codes.__name__,
-        validate_hts_codes.__name__,
-    )
+    from ingestion.federal_register_client import S3_BUCKET, _get_s3_client, _parse_xml_to_text
+    from ingestion.hts_extractor import run_extraction_pipeline
 
     conn = get_snowflake_conn()
     cur = conn.cursor()
+    s3_client = _get_s3_client()
 
     try:
         cur.execute(
             """
-            SELECT DISTINCT document_number
-            FROM CHUNKS
-            WHERE document_number IN (
-                SELECT document_number
-                FROM FEDERAL_REGISTER_NOTICES
-                WHERE processing_status = 'chunked'
-            )
+            SELECT document_number, title, agency_names, raw_json, s3_key
+            FROM FEDERAL_REGISTER_NOTICES
+            WHERE processing_status = 'parsed'
               AND MOD(ABS(HASH(document_number)), %s) = %s
-            ORDER BY document_number
+            ORDER BY publication_date DESC
             """
             ,
             (total_shards, shard_id),
         )
-        doc_numbers = [row[0] for row in cur.fetchall()]
+        docs = cur.fetchall()
         cap = _fr_pipeline_max_docs()
-        total_eligible = len(doc_numbers)
-        if cap is not None and len(doc_numbers) > cap:
+        total_eligible = len(docs)
+        if cap is not None and len(docs) > cap:
             logger.info(
                 "hts_extraction shard=%s/%s: limiting run to %d of %d eligible documents "
                 "(unset FR_PIPELINE_MAX_DOCS or set 0 to process all)",
@@ -386,68 +373,62 @@ def _task_extract_hts_codes(shard_id: int = 0, total_shards: int = 1) -> None:
                 cap,
                 total_eligible,
             )
-            doc_numbers = doc_numbers[:cap]
+            docs = docs[:cap]
         else:
             logger.info(
                 "hts_extraction shard=%s/%s: processing %d eligible documents (no cap)",
                 shard_id, total_shards,
-                len(doc_numbers),
+                len(docs),
             )
 
         total_extracted = 0
         total_verified = 0
         failed = 0
 
-        for doc_number in doc_numbers:
+        for doc_number, title, agency_names_raw, raw_json, s3_key in docs:
             try:
-                cur.execute(
-                    """
-                    SELECT chunk_id, chunk_index, chunk_text, section
-                    FROM CHUNKS
-                    WHERE document_number = %s
-                    ORDER BY chunk_index
-                    """,
-                    (doc_number,),
-                )
-                rows = cur.fetchall()
-
-                if not rows:
+                if not s3_key:
+                    logger.warning("hts_extraction skip doc=%s reason=missing_s3_key", doc_number)
                     continue
 
-                full_text = " ".join(row[2] for row in rows)
+                s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+                xml_content = s3_obj["Body"].read()
+                full_text = _parse_xml_to_text(xml_content)
+                if not full_text.strip():
+                    logger.warning("hts_extraction skip doc=%s reason=empty_text", doc_number)
+                    continue
 
-                summary = run_extraction_pipeline(doc_number, full_text, conn)
+                agency = ""
+                if isinstance(agency_names_raw, list) and agency_names_raw:
+                    agency = str(agency_names_raw[0])
+                elif isinstance(agency_names_raw, str):
+                    try:
+                        parsed = json.loads(agency_names_raw)
+                        if isinstance(parsed, list) and parsed:
+                            agency = str(parsed[0])
+                        else:
+                            agency = agency_names_raw
+                    except Exception:
+                        agency = agency_names_raw
+
+                docket_number = None
+                if isinstance(raw_json, dict):
+                    docket_number = (
+                        raw_json.get("docket_id")
+                        or raw_json.get("docket_number")
+                        or raw_json.get("regulation_id_number")
+                    )
+
+                summary = run_extraction_pipeline(
+                    doc_number,
+                    full_text,
+                    conn,
+                    title=str(title or ""),
+                    agency=agency,
+                    docket_number=str(docket_number) if docket_number else None,
+                )
                 total_extracted += summary.get("total_extracted", 0)
                 total_verified += summary.get("verified", 0)
-
-                chunks = [
-                    {
-                        "chunk_id": row[0],
-                        "document_number": doc_number,
-                        "chunk_index": row[1],
-                        "chunk_text": row[2],
-                        "section": row[3],
-                        "hts_code": None,
-                        "hts_chapter": None,
-                    }
-                    for row in rows
-                ]
-                updated_chunks = update_chunks_with_hts(chunks, full_text)
-
-                for chunk in updated_chunks:
-                    if chunk.get("hts_code"):
-                        cur.execute(
-                            """
-                            UPDATE CHUNKS
-                            SET hts_code = %s, hts_chapter = %s
-                            WHERE chunk_id = %s
-                            """,
-                            (
-                                chunk["hts_code"],
-                                chunk["hts_chapter"],
-                                chunk["chunk_id"],
-                            ),
-                        )
 
                 cur.execute(
                     """
@@ -505,7 +486,7 @@ DEFAULT_ARGS = {
 with DAG(
     dag_id="federal_register_ingest",
     default_args=DEFAULT_ARGS,
-    description="Daily Federal Register ingestion: fetch → parse → chunk → hts",
+    description="Daily Federal Register ingestion: fetch → parse → hts → chunk",
     schedule_interval="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -540,11 +521,11 @@ with DAG(
             task_id=f"extract_hts_codes_task_shard_{shard_id}",
             python_callable=_task_extract_hts_codes,
             op_kwargs={"shard_id": shard_id, "total_shards": shard_count},
-            doc="Extract HTS codes to NOTICE_HTS_CODES and update CHUNKS",
+            doc="Extract HTS codes to NOTICE_HTS_CODES",
         )
         parse_tasks.append(parse_t)
         chunk_tasks.append(chunk_t)
         extract_tasks.append(extract_t)
 
-        # Per-shard pipeline: parse → chunk → extract
-        task_fetch >> parse_t >> chunk_t >> extract_t
+        # Per-shard pipeline: parse → extract → chunk
+        task_fetch >> parse_t >> extract_t >> chunk_t
