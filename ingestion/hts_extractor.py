@@ -43,6 +43,7 @@ _EXTERNAL_REF_PATTERNS: list[tuple[str, str, str]] = [
 ]
 
 _AD_CVD_DOCKET_RE = re.compile(r"\b[AC]-\d{3}-\d{3}\b")
+_HTS_DOTTED_PATTERN = re.compile(r"\b\d{4}\.\d{2}(?:\.\d{2,4})?\b")
 
 
 def _digits_only(s: str) -> str:
@@ -52,6 +53,38 @@ def _digits_only(s: str) -> str:
 def _hts_chapter_from_code(hts_code: str) -> str | None:
     d = _digits_only(hts_code)
     return d[:2] if len(d) >= 2 else None
+
+
+def _sentence_for_match(text: str, start: int, end: int) -> str:
+    """Return fixed-width context: 150 chars before and after match."""
+    left = max(0, start - 150)
+    right = min(len(text), end + 150)
+    return text[left:right].strip()[:500]
+
+
+def extract_hts_codes_precise(document_number: str, text: str) -> list[dict[str, Any]]:
+    """PoC-style direct extraction with first-hit sentence snippets."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    records: list[dict[str, Any]] = []
+    for m in _HTS_DOTTED_PATTERN.finditer(text):
+        code = m.group(0)
+        if code in seen:
+            continue
+        seen.add(code)
+        records.append(
+            {
+                "document_number": document_number,
+                "hts_code": code,
+                "hts_chapter": _hts_chapter_from_code(code),
+                "context_snippet": _sentence_for_match(text, m.start(), m.end()),
+                "match_status": "UNVERIFIED",
+                "hs_level": None,
+                "raw_match": code,
+            }
+        )
+    return records
 
 
 def extract_hts_entities(text: str) -> List[dict]:
@@ -474,8 +507,7 @@ def run_extraction_pipeline(
             agency = agency or a
             docket_number = docket_number or d
 
-        entities = extract_hts_entities(text or "")
-        records = _to_code_records(document_number, text or "", entities)
+        records = extract_hts_codes_precise(document_number, text or "")
         product_info = extract_product_and_country(title)
 
         if not records:
