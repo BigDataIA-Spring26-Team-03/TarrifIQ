@@ -166,10 +166,10 @@ class TestParsedFRDocument:
             agency_names=["Test"],
             publication_date="2024-01-15",
             full_text="Content",
-            source_s3_key="s3://bucket/federal-register/2024/01/2024-1234.xml",
+            source_s3_key="s3://bucket/raw/federal-register/2024/01/2024-1234.xml",
         )
 
-        assert doc.source_s3_key == "s3://bucket/federal-register/2024/01/2024-1234.xml"
+        assert doc.source_s3_key == "s3://bucket/raw/federal-register/2024/01/2024-1234.xml"
 
     def test_word_count_calculation(self):
         """Test that word count is calculated correctly."""

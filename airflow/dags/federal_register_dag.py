@@ -3,12 +3,21 @@ Daily Federal Register ingestion pipeline:
 1. Fetch & store raw → S3 + Snowflake (DOWNLOADED)
 2. Parse documents → sections + hash (PARSED)
 3. Chunk semantically → section-aware chunks (CHUNKED)
+4. Extract HTS codes → NOTICE_HTS_CODES + CHUNKS (HTS_EXTRACTED)
+
+processing_status flow:
+  downloaded → parsed → chunked → hts_extracted
+                              ↘ hts_extraction_failed (on error)
+
+Env FR_PIPELINE_MAX_DOCS: when set to a positive integer (e.g. 10), caps all stages for trial runs:
+  fetch (new loads), parse, chunk, HTS extraction. Omit or set 0 for no limit.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -16,49 +25,110 @@ from airflow.operators.python import PythonOperator
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_SQL_CAP = 1000
+_DEFAULT_PARALLEL_SHARDS = 4
+
+
+def _fr_pipeline_max_docs() -> int | None:
+    """Positive cap from FR_PIPELINE_MAX_DOCS, or None if unlimited."""
+    raw = os.environ.get("FR_PIPELINE_MAX_DOCS", "").strip()
+    if raw == "" or raw == "0":
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def _fr_sql_row_limit(cap: int | None) -> int:
+    """Snowflake LIMIT for parse/chunk tasks (never above _DEFAULT_SQL_CAP)."""
+    if cap is None:
+        return _DEFAULT_SQL_CAP
+    return min(_DEFAULT_SQL_CAP, cap)
+
+
+def _parallel_shard_count() -> int:
+    """
+    Number of parallel shard lanes for parse/chunk/extract.
+    Set FR_PIPELINE_PARALLEL_SHARDS in env; defaults to 4.
+    """
+    raw = os.environ.get("FR_PIPELINE_PARALLEL_SHARDS", str(_DEFAULT_PARALLEL_SHARDS)).strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_PARALLEL_SHARDS
+    if n < 1:
+        return 1
+    return min(n, 16)
+
 
 def _task_fetch_and_store_raw() -> None:
     """Task 1: Fetch documents from FR API incrementally, store raw XML in S3, load to Snowflake in batches."""
     from ingestion.federal_register_client import fetch_and_load_incrementally
 
     try:
-        logger.info("Task 1: Starting incremental fetch from FR API (cutoff_year=2016)")
-        loaded = fetch_and_load_incrementally(test_mode=False, cutoff_year=2016, batch_size=50)
+        cap = _fr_pipeline_max_docs()
+        logger.info(
+            "Task 1: Starting incremental fetch from FR API (cutoff_year=2018, FR_PIPELINE_MAX_DOCS=%s)",
+            cap or "unlimited",
+        )
+        loaded = fetch_and_load_incrementally(
+            test_mode=False,
+            cutoff_year=2018,
+            batch_size=50,
+            max_documents=cap,
+        )
         logger.info(f"Task 1 complete: fetched and loaded {loaded} documents to Snowflake")
     except Exception as exc:
         logger.error(f"Task 1 FAILED: {str(exc)}", exc_info=True)
         raise
 
 
-def _task_parse_documents() -> None:
+def _task_parse_documents(shard_id: int = 0, total_shards: int = 1) -> None:
     """
     Task 2: Load raw XML from S3, parse sections, compute content hash, update status.
     """
     from ingestion.connection import get_snowflake_conn
     from ingestion.html_parser import parse_fr_document
-    from ingestion.federal_register_client import _parse_xml_to_text, _get_s3_client
+    from ingestion.federal_register_client import (
+        S3_BUCKET,
+        _get_s3_client,
+        _parse_xml_to_text,
+    )
     import json
 
     conn = get_snowflake_conn()
     cur = conn.cursor()
 
     try:
-        # Fetch documents that are ready for parsing (PENDING or DOWNLOADED status) from 2016 onwards
+        row_limit = _fr_sql_row_limit(_fr_pipeline_max_docs())
+        logger.info(
+            "Task 2: parse row limit=%s shard=%s/%s",
+            row_limit, shard_id, total_shards,
+        )
         cur.execute(
-            """
+            f"""
             SELECT document_number, document_type, title, agency_names, publication_date,
                    s3_key
             FROM FEDERAL_REGISTER_NOTICES
             WHERE (processing_status IS NULL OR processing_status = 'pending' OR processing_status = 'downloaded')
-              AND YEAR(publication_date) >= 2016
+              AND YEAR(publication_date) >= 2018
+              AND MOD(ABS(HASH(document_number)), %s) = %s
             ORDER BY publication_date DESC
-            LIMIT 1000
+            LIMIT {row_limit}
             """
+            ,
+            (total_shards, shard_id),
         )
         rows = cur.fetchall()
 
         if not rows:
-            logger.info("Task 2: No documents to parse")
+            logger.info("Task 2: No documents to parse for shard=%s/%s", shard_id, total_shards)
+            return
+
+        if not S3_BUCKET:
+            logger.error("Task 2: S3_BUCKET is not set — cannot fetch raw XML from S3")
             return
 
         s3_client = _get_s3_client()
@@ -76,7 +146,7 @@ def _task_parse_documents() -> None:
                     continue
 
                 try:
-                    s3_obj = s3_client.get_object(Bucket="tariffiq-raw-docs", Key=s3_key)
+                    s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                     xml_content = s3_obj["Body"].read()
                     full_text = _parse_xml_to_text(xml_content)
                 except Exception as e:
@@ -120,14 +190,14 @@ def _task_parse_documents() -> None:
                 )
 
         conn.commit()
-        logger.info(f"Task 2 complete: parsed {parsed_count} documents")
+        logger.info("Task 2 complete: parsed %d documents shard=%s/%s", parsed_count, shard_id, total_shards)
 
     finally:
         cur.close()
         conn.close()
 
 
-def _task_chunk_documents() -> None:
+def _task_chunk_documents(shard_id: int = 0, total_shards: int = 1) -> None:
     """
     Task 3: Load parsed docs from S3, run semantic chunking, update chunk_count.
     """
@@ -135,7 +205,11 @@ def _task_chunk_documents() -> None:
     from ingestion.html_parser import ParsedFRDocument, extract_fr_sections
     from ingestion.chunker import SemanticFRChunker
     from ingestion.embedder import Embedder
-    from ingestion.federal_register_client import _parse_xml_to_text, _get_s3_client
+    from ingestion.federal_register_client import (
+        S3_BUCKET,
+        _get_s3_client,
+        _parse_xml_to_text,
+    )
     import json
 
     embedder = Embedder()
@@ -146,22 +220,33 @@ def _task_chunk_documents() -> None:
     cur = conn.cursor()
 
     try:
-        # Fetch documents ready for chunking (PARSED status) from 2016 onwards
+        row_limit = _fr_sql_row_limit(_fr_pipeline_max_docs())
+        logger.info(
+            "Task 3: chunk row limit=%s shard=%s/%s",
+            row_limit, shard_id, total_shards,
+        )
         cur.execute(
-            """
+            f"""
             SELECT document_number, document_type, title, agency_names, publication_date,
                    content_hash, s3_key
             FROM FEDERAL_REGISTER_NOTICES
             WHERE processing_status = 'parsed'
-              AND YEAR(publication_date) >= 2016
+              AND YEAR(publication_date) >= 2018
+              AND MOD(ABS(HASH(document_number)), %s) = %s
             ORDER BY publication_date DESC
-            LIMIT 1000
+            LIMIT {row_limit}
             """
+            ,
+            (total_shards, shard_id),
         )
         rows = cur.fetchall()
 
         if not rows:
-            logger.info("Task 3: No documents to chunk")
+            logger.info("Task 3: No documents to chunk for shard=%s/%s", shard_id, total_shards)
+            return
+
+        if not S3_BUCKET:
+            logger.error("Task 3: S3_BUCKET is not set — cannot fetch raw XML from S3")
             return
 
         chunked_count = 0
@@ -178,7 +263,7 @@ def _task_chunk_documents() -> None:
                     continue
 
                 try:
-                    s3_obj = s3_client.get_object(Bucket="tariffiq-raw-docs", Key=s3_key)
+                    s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                     xml_content = s3_obj["Body"].read()
                     full_text = _parse_xml_to_text(xml_content)
                 except Exception as e:
@@ -246,7 +331,163 @@ def _task_chunk_documents() -> None:
                 )
 
         conn.commit()
-        logger.info(f"Task 3 complete: chunked {chunked_count} documents")
+        logger.info("Task 3 complete: chunked %d documents shard=%s/%s", chunked_count, shard_id, total_shards)
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _task_extract_hts_codes(shard_id: int = 0, total_shards: int = 1) -> None:
+    """
+    Task 4: HTS extraction for chunked documents — NOTICE_HTS_CODES + CHUNKS.hts_*.
+    """
+    from ingestion.connection import get_snowflake_conn
+    from ingestion.hts_extractor import (
+        run_extraction_pipeline,
+        update_chunks_with_hts,
+        write_notice_hts_codes,
+        validate_hts_codes,
+    )
+
+    logger.debug(
+        "hts_extractor exports: %s, %s",
+        write_notice_hts_codes.__name__,
+        validate_hts_codes.__name__,
+    )
+
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT document_number
+            FROM CHUNKS
+            WHERE document_number IN (
+                SELECT document_number
+                FROM FEDERAL_REGISTER_NOTICES
+                WHERE processing_status = 'chunked'
+            )
+              AND MOD(ABS(HASH(document_number)), %s) = %s
+            ORDER BY document_number
+            """
+            ,
+            (total_shards, shard_id),
+        )
+        doc_numbers = [row[0] for row in cur.fetchall()]
+        cap = _fr_pipeline_max_docs()
+        total_eligible = len(doc_numbers)
+        if cap is not None and len(doc_numbers) > cap:
+            logger.info(
+                "hts_extraction shard=%s/%s: limiting run to %d of %d eligible documents "
+                "(unset FR_PIPELINE_MAX_DOCS or set 0 to process all)",
+                shard_id, total_shards,
+                cap,
+                total_eligible,
+            )
+            doc_numbers = doc_numbers[:cap]
+        else:
+            logger.info(
+                "hts_extraction shard=%s/%s: processing %d eligible documents (no cap)",
+                shard_id, total_shards,
+                len(doc_numbers),
+            )
+
+        total_extracted = 0
+        total_verified = 0
+        failed = 0
+
+        for doc_number in doc_numbers:
+            try:
+                cur.execute(
+                    """
+                    SELECT chunk_id, chunk_index, chunk_text, section
+                    FROM CHUNKS
+                    WHERE document_number = %s
+                    ORDER BY chunk_index
+                    """,
+                    (doc_number,),
+                )
+                rows = cur.fetchall()
+
+                if not rows:
+                    continue
+
+                full_text = " ".join(row[2] for row in rows)
+
+                summary = run_extraction_pipeline(doc_number, full_text, conn)
+                total_extracted += summary.get("total_extracted", 0)
+                total_verified += summary.get("verified", 0)
+
+                chunks = [
+                    {
+                        "chunk_id": row[0],
+                        "document_number": doc_number,
+                        "chunk_index": row[1],
+                        "chunk_text": row[2],
+                        "section": row[3],
+                        "hts_code": None,
+                        "hts_chapter": None,
+                    }
+                    for row in rows
+                ]
+                updated_chunks = update_chunks_with_hts(chunks, full_text)
+
+                for chunk in updated_chunks:
+                    if chunk.get("hts_code"):
+                        cur.execute(
+                            """
+                            UPDATE CHUNKS
+                            SET hts_code = %s, hts_chapter = %s
+                            WHERE chunk_id = %s
+                            """,
+                            (
+                                chunk["hts_code"],
+                                chunk["hts_chapter"],
+                                chunk["chunk_id"],
+                            ),
+                        )
+
+                cur.execute(
+                    """
+                    UPDATE FEDERAL_REGISTER_NOTICES
+                    SET processing_status = 'hts_extracted'
+                    WHERE document_number = %s
+                    """,
+                    (doc_number,),
+                )
+
+                conn.commit()
+                logger.info(
+                    "hts_extracted doc=%s extracted=%d verified=%d",
+                    doc_number,
+                    summary.get("total_extracted", 0),
+                    summary.get("verified", 0),
+                )
+
+            except Exception as e:
+                failed += 1
+                logger.error("hts_extraction_failed doc=%s error=%s", doc_number, e)
+                cur.execute(
+                    """
+                    UPDATE FEDERAL_REGISTER_NOTICES
+                    SET processing_status = 'hts_extraction_failed',
+                        processing_error = %s
+                    WHERE document_number = %s
+                    """,
+                    (str(e)[:500], doc_number),
+                )
+                conn.commit()
+                continue
+
+        logger.info(
+            "hts_extraction complete shard=%s/%s total_extracted=%d total_verified=%d failed=%d",
+            shard_id, total_shards,
+            total_extracted,
+            total_verified,
+            failed,
+        )
 
     finally:
         cur.close()
@@ -264,12 +505,13 @@ DEFAULT_ARGS = {
 with DAG(
     dag_id="federal_register_ingest",
     default_args=DEFAULT_ARGS,
-    description="Daily Federal Register ingestion: fetch → parse → chunk",
+    description="Daily Federal Register ingestion: fetch → parse → chunk → hts",
     schedule_interval="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=["tariffiq", "ingestion"],
 ) as dag:
+    shard_count = _parallel_shard_count()
 
     task_fetch = PythonOperator(
         task_id="fetch_and_store_raw",
@@ -277,17 +519,32 @@ with DAG(
         doc="Fetch documents from FR API, store raw XML in S3, insert into Snowflake",
     )
 
-    task_parse = PythonOperator(
-        task_id="parse_documents",
-        python_callable=_task_parse_documents,
-        doc="Parse documents into sections, compute content hash",
-    )
+    parse_tasks = []
+    chunk_tasks = []
+    extract_tasks = []
 
-    task_chunk = PythonOperator(
-        task_id="chunk_documents",
-        python_callable=_task_chunk_documents,
-        doc="Semantic chunking with section awareness",
-    )
+    for shard_id in range(shard_count):
+        parse_t = PythonOperator(
+            task_id=f"parse_documents_shard_{shard_id}",
+            python_callable=_task_parse_documents,
+            op_kwargs={"shard_id": shard_id, "total_shards": shard_count},
+            doc="Parse documents into sections, compute content hash",
+        )
+        chunk_t = PythonOperator(
+            task_id=f"chunk_documents_shard_{shard_id}",
+            python_callable=_task_chunk_documents,
+            op_kwargs={"shard_id": shard_id, "total_shards": shard_count},
+            doc="Semantic chunking with section awareness",
+        )
+        extract_t = PythonOperator(
+            task_id=f"extract_hts_codes_task_shard_{shard_id}",
+            python_callable=_task_extract_hts_codes,
+            op_kwargs={"shard_id": shard_id, "total_shards": shard_count},
+            doc="Extract HTS codes to NOTICE_HTS_CODES and update CHUNKS",
+        )
+        parse_tasks.append(parse_t)
+        chunk_tasks.append(chunk_t)
+        extract_tasks.append(extract_t)
 
-    # Pipeline: fetch → parse → chunk
-    task_fetch >> task_parse >> task_chunk
+        # Per-shard pipeline: parse → chunk → extract
+        task_fetch >> parse_t >> chunk_t >> extract_t

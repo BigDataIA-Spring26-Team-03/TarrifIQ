@@ -13,7 +13,7 @@ from ingestion.connection import get_snowflake_conn
 from ingestion.html_parser import ParsedFRDocument, extract_fr_sections, parse_fr_document
 from ingestion.chunker import SemanticFRChunker
 from ingestion.embedder import Embedder
-from ingestion.federal_register_client import _parse_xml_to_text, _get_s3_client
+from ingestion.federal_register_client import S3_BUCKET, _get_s3_client, _parse_xml_to_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +42,10 @@ def task_2_parse_documents():
             logger.info("Task 2: No documents to parse")
             return 0
 
+        if not S3_BUCKET:
+            logger.error("Task 2: S3_BUCKET is not set")
+            return 0
+
         s3_client = _get_s3_client()
         parsed_count = 0
         for row in rows:
@@ -56,7 +60,7 @@ def task_2_parse_documents():
                     continue
 
                 try:
-                    s3_obj = s3_client.get_object(Bucket="tariffiq-raw-docs", Key=s3_key)
+                    s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                     xml_content = s3_obj["Body"].read()
                     full_text = _parse_xml_to_text(xml_content)
                 except Exception as e:
@@ -127,6 +131,10 @@ def task_3_chunk_documents():
             logger.info("Task 3: No documents to chunk")
             return 0
 
+        if not S3_BUCKET:
+            logger.error("Task 3: S3_BUCKET is not set")
+            return 0
+
         chunked_count = 0
         for row in rows:
             document_number, document_type, title, agency_names_json, publication_date, content_hash, s3_key = row
@@ -140,7 +148,7 @@ def task_3_chunk_documents():
                     continue
 
                 try:
-                    s3_obj = s3_client.get_object(Bucket="tariffiq-raw-docs", Key=s3_key)
+                    s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                     xml_content = s3_obj["Body"].read()
                     full_text = _parse_xml_to_text(xml_content)
                 except Exception as e:
