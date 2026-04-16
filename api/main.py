@@ -1,34 +1,41 @@
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import boto3
+import redis as redis_lib
 import structlog
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from chromadb import HttpClient as ChromaHttpClient
 
-from api.schemas import HealthResponse, QueryRequest, CitedTariffResponse
+from api.schemas import HealthResponse, ServiceHealth
 from api.tools.resolve_hts_rate import router as resolve_hts_rate_router
-from api.tools.lookup_product_alias import router as lookup_product_alias_router
-from api.tools.log_hitl_record import router as log_hitl_record_router
-from api.tools.trade_flow import router as trade_flow_router
-from ingestion.chroma_loader import load_federal_register_to_chroma
-from agents.graph import run_pipeline
+from api.tools.hts_search import router as hts_search_router
+from api.tools.hts_chapter import router as hts_chapter_router
+from api.tools.search_policy_vector import router as search_policy_router
+from api.tools.search_hts_vector import router as search_hts_vector_router
+from services.chromadb_init import initialize_chromadb
 
 logger = structlog.get_logger()
 
-
-def rebuild_on_startup() -> None:
-    logger.info("chromadb_rebuild_started")
-    try:
-        total = load_federal_register_to_chroma()
-        logger.info("chromadb_rebuild_complete", total_chunks=total)
-    except Exception as e:
-        logger.error("chromadb_rebuild_failed", error=str(e))
+tags_metadata = [
+    {"name": "Core", "description": "Health check endpoint"},
+    {"name": "HTS & Rates", "description": "HTS code lookup and search"},
+    {"name": "Vector Search", "description": "ChromaDB semantic search for policies and HTS"},
+]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    rebuild_on_startup()
+    # Initialize ChromaDB on startup
+    try:
+        logger.info("Initializing ChromaDB...")
+        initialize_chromadb()
+        logger.info("ChromaDB initialized successfully")
+    except Exception as e:
+        logger.error("ChromaDB initialization failed", error=str(e))
     yield
 
 
@@ -37,6 +44,7 @@ app = FastAPI(
     description="Conversational US Import Tariff Intelligence Platform",
     version="0.1.0",
     lifespan=lifespan,
+    openapi_tags=tags_metadata,
 )
 
 app.add_middleware(
@@ -47,71 +55,85 @@ app.add_middleware(
 )
 
 # --- Tool routers ---
-app.include_router(resolve_hts_rate_router, prefix="/tools")
-app.include_router(lookup_product_alias_router, prefix="/tools")
-app.include_router(log_hitl_record_router, prefix="/tools")
-app.include_router(trade_flow_router, prefix="/tools")
-
-# --- Stub routers for remaining tool endpoints ---
-from fastapi import APIRouter
-
-stubs = APIRouter()
-
-@stubs.get("/tools/search_policy")
-async def search_policy_stub():
-    return {"status": "ok", "message": "stub — not implemented yet"}
-
-@stubs.get("/tools/classify_query")
-async def classify_query_stub():
-    return {"status": "ok", "message": "stub — not implemented yet"}
-
-@stubs.post("/tools/synthesize")
-async def synthesize_stub():
-    return {"status": "ok", "message": "stub — not implemented yet"}
-
-@stubs.get("/tools/fta_rates")
-async def fta_rates_stub():
-    return {"status": "ok", "message": "stub — not implemented yet"}
-
-app.include_router(stubs)
+app.include_router(resolve_hts_rate_router, prefix="/tools", tags=["HTS & Rates"])
+app.include_router(hts_search_router, prefix="/tools", tags=["HTS & Rates"])
+app.include_router(hts_chapter_router, prefix="/tools", tags=["HTS & Rates"])
+app.include_router(search_policy_router, prefix="/tools", tags=["Vector Search"])
+app.include_router(search_hts_vector_router, prefix="/tools", tags=["Vector Search"])
 
 
 # --- Health check ---
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, tags=["Core"])
 async def health():
-    return HealthResponse(
-        status="ok",
-        timestamp=datetime.now(timezone.utc),
-    )
+    services: dict = {}
 
-
-# --- Query endpoint ---
-@app.post("/query", response_model=dict)
-async def query(request: QueryRequest):
-    logger.info("query_received", query=request.query)
+    # --- Snowflake ---
+    t0 = time.monotonic()
     try:
-        result = run_pipeline(request.query)
-        return {
-            "status": "ok",
-            "query": request.query,
-            "product": result.get("product"),
-            "country": result.get("country"),
-            "hts_code": result.get("hts_code"),
-            "hts_description": result.get("hts_description"),
-            "classification_confidence": result.get("classification_confidence"),
-            "total_duty": result.get("total_duty"),
-            "base_rate": result.get("base_rate"),
-            "adder_rate": result.get("adder_rate"),
-            "policy_summary": result.get("policy_summary"),
-            "import_value_usd": result.get("import_value_usd"),
-            "trade_period": result.get("trade_period"),
-            "trade_suppressed": result.get("trade_suppressed"),
-            "final_response": result.get("final_response"),
-            "citations": result.get("citations"),
-            "hitl_required": result.get("hitl_required"),
-            "hitl_reason": result.get("hitl_reason"),
-            "error": result.get("error"),
-        }
+        import snowflake.connector
+        conn = snowflake.connector.connect(
+            user=os.environ["SNOWFLAKE_USER"],
+            password=os.environ["SNOWFLAKE_PASSWORD"],
+            account=os.environ["SNOWFLAKE_ACCOUNT"],
+            warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+            database=os.environ["SNOWFLAKE_DATABASE"],
+            schema=os.environ["SNOWFLAKE_SCHEMA"],
+        )
+        conn.cursor().execute("SELECT 1")
+        conn.close()
+        services["snowflake"] = ServiceHealth(
+            status="ok", latency_ms=round((time.monotonic() - t0) * 1000, 1)
+        )
     except Exception as e:
-        logger.error("query_pipeline_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        services["snowflake"] = ServiceHealth(status="error", error=str(e))
+
+    # --- Redis ---
+    t0 = time.monotonic()
+    try:
+        r = redis_lib.Redis(
+            host=os.environ.get("REDIS_HOST", "redis"),
+            port=int(os.environ.get("REDIS_PORT", 6379)),
+        )
+        r.ping()
+        services["redis"] = ServiceHealth(
+            status="ok", latency_ms=round((time.monotonic() - t0) * 1000, 1)
+        )
+    except Exception as e:
+        services["redis"] = ServiceHealth(status="error", error=str(e))
+
+    # --- S3 ---
+    t0 = time.monotonic()
+    try:
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        s3.head_bucket(Bucket=os.environ.get("S3_BUCKET", "tariffiq-raw"))
+        services["s3"] = ServiceHealth(
+            status="ok", latency_ms=round((time.monotonic() - t0) * 1000, 1)
+        )
+    except Exception as e:
+        services["s3"] = ServiceHealth(status="error", error=str(e))
+
+    # --- ChromaDB ---
+    t0 = time.monotonic()
+    try:
+        chroma = ChromaHttpClient(
+            host=os.environ.get("CHROMA_HOST", "chromadb"),
+            port=int(os.environ.get("CHROMA_PORT", 8000)),
+        )
+        chroma.list_collections()
+        services["chromadb"] = ServiceHealth(
+            status="ok", latency_ms=round((time.monotonic() - t0) * 1000, 1)
+        )
+    except Exception as e:
+        services["chromadb"] = ServiceHealth(status="error", error=str(e))
+
+    overall = "ok" if all(s.status == "ok" for s in services.values()) else "degraded"
+    return HealthResponse(
+        status=overall,
+        timestamp=datetime.now(timezone.utc),
+        services=services,
+    )

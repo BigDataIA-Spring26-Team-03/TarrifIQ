@@ -77,6 +77,13 @@ class QueryRequest(BaseModel):
     query: str
 
 
+class ServiceHealth(BaseModel):
+    status: str
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     status: str
     timestamp: datetime
+    services: Dict[str, ServiceHealth]
