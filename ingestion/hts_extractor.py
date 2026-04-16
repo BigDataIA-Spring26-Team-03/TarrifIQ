@@ -56,10 +56,10 @@ def _hts_chapter_from_code(hts_code: str) -> str | None:
 
 
 def _sentence_for_match(text: str, start: int, end: int) -> str:
-    """Return fixed-width context: 150 chars before and after match."""
-    left = max(0, start - 150)
-    right = min(len(text), end + 150)
-    return text[left:right].strip()[:500]
+    """Return fixed-width context: 500 chars before and after match."""
+    left = max(0, start - 500)
+    right = min(len(text), end + 500)
+    return text[left:right].strip()[:2000]
 
 
 def extract_hts_codes_precise(document_number: str, text: str) -> list[dict[str, Any]]:
@@ -245,8 +245,9 @@ def _to_code_records(document_number: str, text: str, entities: list[dict]) -> l
             n = len(_digits_only(code))
             if n in (2, 4, 6, 8, 10):
                 level = f"HS{n}"
-        s = max(0, int(e.get("start_char", 0)) - 75)
-        ee = min(len(text), int(e.get("end_char", 0)) + 75)
+        # Capture 500 chars before and 500 chars after the match
+        s = max(0, int(e.get("start_char", 0)) - 500)
+        ee = min(len(text), int(e.get("end_char", 0)) + 500)
         ctx = (text[s:ee] if text else "").replace("\n", " ").strip()
         records.append(
             {
@@ -592,6 +593,117 @@ def run_extraction_pipeline(
         }
 
 
+def run_cbp_extraction_pipeline(
+    document_number: str,
+    text: str,
+    conn,
+    title: str = "",
+) -> dict[str, Any]:
+    """Direct HTS extraction for CBP notices (simpler than Federal Register — no docket resolution)."""
+    try:
+        # Extract HTS codes with context snippets
+        records = extract_hts_codes_precise(document_number, text or "")
+        product_info = extract_product_and_country(title)
+
+        if not records:
+            # No HTS codes found — still log product info if available
+            status = "PRODUCT_NAME_ONLY" if product_info.get("product_name") else "NO_HTS_FOUND"
+            records = [
+                {
+                    "document_number": document_number,
+                    "hts_code": None,
+                    "hts_chapter": None,
+                    "context_snippet": (
+                        f"Product: {product_info.get('product_name')} | "
+                        f"Countries: {product_info.get('countries')}"
+                    ),
+                    "match_status": status,
+                    "hs_level": None,
+                    "raw_match": None,
+                }
+            ]
+
+        # Validate HTS codes against HTS_CODES table
+        validated = validate_hts_codes(records, conn)
+
+        # Write to CBP_NOTICE_HTS_CODES
+        written = _write_cbp_notice_records(conn, validated)
+
+        return {
+            "document_number": document_number,
+            "total_extracted": len([c for c in validated if c.get("hts_code") and not str(c.get("hts_code")).startswith("__")]),
+            "verified": len([c for c in validated if c.get("match_status") == "VERIFIED"]),
+            "unverified": len([c for c in validated if c.get("match_status") == "UNVERIFIED"]),
+            "chapter99": len([c for c in validated if c.get("match_status") == "CHAPTER_99"]),
+            "product_name": product_info.get("product_name"),
+            "countries": product_info.get("countries"),
+            "notice_rows_written": written,
+        }
+    except Exception as e:
+        logger.error("run_cbp_extraction_pipeline_failed doc=%s err=%s", document_number, e)
+        return {
+            "document_number": document_number,
+            "total_extracted": 0,
+            "verified": 0,
+            "unverified": 0,
+            "chapter99": 0,
+            "product_name": None,
+            "countries": [],
+            "notice_rows_written": 0,
+            "error": str(e),
+        }
+
+
+def _write_cbp_notice_records(conn, records: list[dict]) -> int:
+    """Write HTS code records to CBP_NOTICE_HTS_CODES table."""
+    if not records:
+        return 0
+    cur = conn.cursor()
+    written = 0
+    try:
+        for rec in records:
+            status = rec.get("match_status") or "UNVERIFIED"
+            code = (rec.get("hts_code") or "").strip()
+            if not code:
+                # CBP_NOTICE_HTS_CODES requires non-null hts_code; store a status marker row.
+                code = f"__{status}__"
+            chapter = rec.get("hts_chapter") or _hts_chapter_from_code(code) or ""
+            context = (rec.get("context_snippet") or "")[:2000]
+
+            # MERGE into CBP_NOTICE_HTS_CODES with context_snippet
+            cur.execute(
+                """
+                MERGE INTO CBP_NOTICE_HTS_CODES AS t
+                USING (SELECT %s AS document_number, %s AS hts_code) AS s
+                ON t.document_number = s.document_number AND t.hts_code = s.hts_code
+                WHEN MATCHED THEN UPDATE SET
+                    t.hts_chapter = %s,
+                    t.context_snippet = %s,
+                    t.match_status = %s
+                WHEN NOT MATCHED THEN INSERT
+                    (document_number, hts_code, hts_chapter, context_snippet, match_status)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    rec.get("document_number"),
+                    code,
+                    chapter,
+                    context,
+                    status,
+                    rec.get("document_number"),
+                    code,
+                    chapter,
+                    context,
+                    status,
+                ),
+            )
+            written += 1
+        conn.commit()
+    finally:
+        cur.close()
+    return written
+
+
 __all__ = [
     "extract_hts_entities",
     "detect_external_reference",
@@ -600,5 +712,6 @@ __all__ = [
     "validate_hts_codes",
     "update_chunks_with_hts",
     "run_extraction_pipeline",
+    "run_cbp_extraction_pipeline",
     "write_notice_hts_codes",
 ]
