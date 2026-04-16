@@ -14,17 +14,28 @@ from api.schemas import HealthResponse, ServiceHealth
 from api.tools.resolve_hts_rate import router as resolve_hts_rate_router
 from api.tools.hts_search import router as hts_search_router
 from api.tools.hts_chapter import router as hts_chapter_router
+from api.tools.search_policy_vector import router as search_policy_router
+from api.tools.search_hts_vector import router as search_hts_vector_router
+from services.chromadb_init import initialize_chromadb
 
 logger = structlog.get_logger()
 
 tags_metadata = [
     {"name": "Core", "description": "Health check endpoint"},
     {"name": "HTS & Rates", "description": "HTS code lookup and search"},
+    {"name": "Vector Search", "description": "ChromaDB semantic search for policies and HTS"},
 ]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize ChromaDB on startup
+    try:
+        logger.info("Initializing ChromaDB...")
+        initialize_chromadb()
+        logger.info("ChromaDB initialized successfully")
+    except Exception as e:
+        logger.error("ChromaDB initialization failed", error=str(e))
     yield
 
 
@@ -47,6 +58,8 @@ app.add_middleware(
 app.include_router(resolve_hts_rate_router, prefix="/tools", tags=["HTS & Rates"])
 app.include_router(hts_search_router, prefix="/tools", tags=["HTS & Rates"])
 app.include_router(hts_chapter_router, prefix="/tools", tags=["HTS & Rates"])
+app.include_router(search_policy_router, prefix="/tools", tags=["Vector Search"])
+app.include_router(search_hts_vector_router, prefix="/tools", tags=["Vector Search"])
 
 
 # --- Health check ---
