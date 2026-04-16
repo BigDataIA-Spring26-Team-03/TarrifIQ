@@ -15,6 +15,11 @@ Safety:
   - No hardcoded product mappings anywhere
 
 Triggers HITL if final confidence < 0.80.
+
+IMPROVEMENT: After a successful pipeline run (hitl_required=False, rate found),
+_write_alias_feedback() writes the confirmed product → hts_code mapping to
+PRODUCT_ALIASES. This makes the system self-improving — repeated queries for
+the same product bypass all 4 layers and resolve instantly via Layer 1.
 """
 
 import json
@@ -409,10 +414,113 @@ def _verify_hts_exists(hts_code: str) -> bool:
         conn.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENT: Self-improving alias write-back
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_alias_feedback(
+    product: str,
+    hts_code: str,
+    confidence: float,
+    rate_was_found: bool,
+) -> None:
+    """
+    Write confirmed product → hts_code mapping to PRODUCT_ALIASES so future
+    queries for the same product hit Layer 1 instantly instead of going through
+    all four layers again.
+
+    Only called when:
+      - hitl_required is False (classification confidence >= 0.80)
+      - rate_was_found is True (Rate Agent found a real Snowflake record)
+
+    Both conditions together mean the full pipeline verified this mapping end-
+    to-end — the HTS code is correct AND it has a real rate. Safe to cache.
+
+    Confidence stored is the classification confidence, capped at 0.95 (we
+    never claim alias certainty higher than a direct alias lookup would give).
+    """
+    if not rate_was_found:
+        logger.debug(
+            "alias_feedback_skipped product=%s hts=%s reason=no_rate_found",
+            product, hts_code,
+        )
+        return
+
+    stored_confidence = min(confidence, 0.95)
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    try:
+        # Check if alias already exists to avoid duplicate writes
+        cur.execute(
+            """
+            SELECT hts_code, confidence
+            FROM TARIFFIQ.RAW.PRODUCT_ALIASES
+            WHERE LOWER(alias) = LOWER(%s)
+            LIMIT 1
+            """,
+            (product.strip(),),
+        )
+        existing = cur.fetchone()
+
+        if existing:
+            existing_hts, existing_conf = existing
+            if existing_hts == hts_code:
+                # Same mapping — update confidence if ours is higher
+                if stored_confidence > float(existing_conf or 0):
+                    cur.execute(
+                        """
+                        UPDATE TARIFFIQ.RAW.PRODUCT_ALIASES
+                        SET confidence = %s, updated_at = CURRENT_TIMESTAMP()
+                        WHERE LOWER(alias) = LOWER(%s)
+                        """,
+                        (stored_confidence, product.strip()),
+                    )
+                    logger.info(
+                        "alias_feedback_updated product=%s hts=%s conf=%.2f",
+                        product, hts_code, stored_confidence,
+                    )
+            else:
+                # Different HTS code for same alias — this is a conflict.
+                # Do NOT overwrite; let HITL resolve. Log for visibility.
+                logger.warning(
+                    "alias_feedback_conflict product=%s existing_hts=%s new_hts=%s — skipping write",
+                    product, existing_hts, hts_code,
+                )
+            return
+
+        # New alias — insert it
+        cur.execute(
+            """
+            INSERT INTO TARIFFIQ.RAW.PRODUCT_ALIASES (alias, hts_code, confidence, created_at, updated_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+            """,
+            (product.strip(), hts_code, stored_confidence),
+        )
+        logger.info(
+            "alias_feedback_written product=%s hts=%s conf=%.2f",
+            product, hts_code, stored_confidence,
+        )
+
+    except Exception as e:
+        # Write-back failure must never crash the pipeline
+        logger.error(
+            "alias_feedback_error product=%s hts=%s error=%s",
+            product, hts_code, e,
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+
 def run_classification_agent(state: TariffState) -> Dict[str, Any]:
     """
     Resolve HTS code using 4-layer lookup with LLM-assisted translation.
     No hardcoded product mappings.
+
+    After a fully verified pipeline run, writes the confirmed alias to
+    PRODUCT_ALIASES for self-improvement. The caller (pipeline orchestrator)
+    is responsible for calling _write_alias_feedback() once the Rate Agent
+    confirms a rate was found — see run_classification_agent_with_feedback().
     """
     product = state.get("product")
     if not product or not product.strip():
@@ -501,4 +609,31 @@ def run_classification_agent(state: TariffState) -> Dict[str, Any]:
         "classification_confidence": confidence,
         "hitl_required": hitl_required,
         "hitl_reason": "low_confidence" if hitl_required else None,
+        # Carry product forward so the pipeline orchestrator can call
+        # _write_alias_feedback() once the Rate Agent result is known.
+        "_product_for_feedback": product,
     }
+
+
+def maybe_write_alias_feedback(classification_result: Dict[str, Any], rate_found: bool) -> None:
+    """
+    Called by the pipeline orchestrator AFTER the Rate Agent completes.
+    Writes alias to PRODUCT_ALIASES only when both conditions are met:
+      1. Classification resolved without HITL (confidence >= 0.80)
+      2. Rate Agent found a verified Snowflake record (rate_found=True)
+
+    Usage in pipeline orchestrator (e.g. graph.py or pipeline.py):
+        classification_out = run_classification_agent(state)
+        state.update(classification_out)
+        rate_out = run_rate_agent(state)
+        state.update(rate_out)
+        rate_found = rate_out.get("rate_record_id") is not None
+        maybe_write_alias_feedback(classification_out, rate_found)
+    """
+    if classification_result.get("hitl_required"):
+        return
+    product = classification_result.get("_product_for_feedback")
+    hts_code = classification_result.get("hts_code")
+    confidence = classification_result.get("classification_confidence", 0.0)
+    if product and hts_code:
+        _write_alias_feedback(product, hts_code, confidence, rate_found)

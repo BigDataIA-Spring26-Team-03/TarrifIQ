@@ -3,15 +3,25 @@ Policy Agent — TariffIQ Pipeline Step 4
 
 Retrieves relevant Federal Register policy context using:
   1. HyDE: Generate hypothetical FR sentence, embed as query vector
-  2. Dense retrieval: ChromaDB vector search filtered to HTS chapter
+  2. Dense retrieval: ChromaDB vector search filtered to confirmed HTS code
+     (falls back to chapter-level filter if code-level yields no results)
   3. BM25: Keyword retrieval over same chunks
   4. RRF: Reciprocal Rank Fusion to merge results
   5. LiteLLM: Synthesize policy summary with FR document citations
+
+IMPROVEMENT: Dense retrieval now filters ChromaDB to chunks from notices
+that mention the EXACT confirmed HTS code (via NOTICE_HTS_CODES join),
+instead of just the 2-digit chapter. This dramatically improves precision —
+e.g. for 8541.43.00 (solar cells) you no longer surface irrelevant notices
+about other Chapter 85 products like semiconductors or motors.
+
+Fallback chain:
+  exact hts_code filter → chapter filter → unfiltered
 """
 
 import logging
 import os
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 import litellm
 from rank_bm25 import BM25Okapi
@@ -28,8 +38,9 @@ TOP_K = 5
 RRF_K = 60
 
 HYDE_PROMPT = """Write one sentence that would appear in a US Federal Register tariff notice
-about the following product and HTS chapter. Be specific about tariff rates and policy context.
+about the following product and HTS code. Be specific about tariff rates and policy context.
 Product: {product}
+HTS Code: {hts_code}
 HTS Chapter: {hts_chapter}"""
 
 POLICY_SYSTEM_PROMPT = """You are a US trade policy analyst.
@@ -45,14 +56,89 @@ def _get_chroma_client() -> chromadb.HttpClient:
     return chromadb.HttpClient(host=host, port=port)
 
 
-def _fetch_chunks_for_chapter(hts_chapter: str) -> List[Dict[str, Any]]:
+def _fetch_doc_numbers_for_hts_code(hts_code: str) -> Set[str]:
     """
-    Fetch all chunks for a given HTS chapter from Snowflake CHUNKS table.
-    Used as the BM25 corpus.
+    Fetch all FR document numbers that reference the exact HTS code.
+    Used to pre-filter ChromaDB to only relevant notices.
+
+    This is the key precision improvement: instead of filtering by chapter
+    (e.g. '85' → all Chapter 85 products), we filter by exact HTS code
+    (e.g. '8541.43.00' → only solar cell notices).
+    """
+    if not hts_code:
+        return set()
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT document_number
+            FROM TARIFFIQ.RAW.NOTICE_HTS_CODES
+            WHERE hts_code = %s
+            """,
+            (hts_code,),
+        )
+        rows = cur.fetchall()
+        doc_numbers = {r[0] for r in rows if r[0]}
+        logger.info(
+            "policy_agent_hts_doc_filter hts=%s matched_notices=%d",
+            hts_code, len(doc_numbers),
+        )
+        return doc_numbers
+    except Exception as e:
+        logger.warning("policy_agent_hts_doc_filter_error hts=%s error=%s", hts_code, e)
+        return set()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _fetch_chunks_for_hts_code(hts_code: str, hts_chapter: str) -> List[Dict[str, Any]]:
+    """
+    Fetch chunks for BM25 corpus. Tries exact HTS code first via NOTICE_HTS_CODES
+    join, falls back to chapter-level if fewer than 10 chunks found.
+
+    Exact-code join ensures BM25 corpus is as relevant as ChromaDB filter.
     """
     conn = get_snowflake_conn()
     cur = conn.cursor()
     try:
+        # Try exact HTS code
+        cur.execute(
+            """
+            SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
+                   f.title, f.publication_date::VARCHAR
+            FROM TARIFFIQ.RAW.CHUNKS c
+            INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
+                ON c.document_number = n.document_number
+            LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                ON c.document_number = f.document_number
+            WHERE n.hts_code = %s
+              AND c.chunk_text IS NOT NULL
+            LIMIT 200
+            """,
+            (hts_code,),
+        )
+        rows = cur.fetchall()
+
+        if len(rows) >= 10:
+            logger.info(
+                "policy_agent_bm25_corpus hts_code=%s chunks=%d source=exact_code",
+                hts_code, len(rows),
+            )
+            return [
+                {
+                    "chunk_id": r[0],
+                    "chunk_text": r[1],
+                    "document_number": r[2],
+                    "section": r[3],
+                    "title": r[4] or "",
+                    "publication_date": r[5] or "",
+                }
+                for r in rows
+            ]
+
+        # Fallback to chapter
         cur.execute(
             """
             SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
@@ -69,6 +155,10 @@ def _fetch_chunks_for_chapter(hts_chapter: str) -> List[Dict[str, Any]]:
             (hts_chapter,),
         )
         rows = cur.fetchall()
+        logger.info(
+            "policy_agent_bm25_corpus hts_chapter=%s chunks=%d source=chapter_fallback",
+            hts_chapter, len(rows),
+        )
         return [
             {
                 "chunk_id": r[0],
@@ -85,8 +175,11 @@ def _fetch_chunks_for_chapter(hts_chapter: str) -> List[Dict[str, Any]]:
         conn.close()
 
 
-def _hyde_query(product: str, hts_chapter: str) -> str:
-    """Generate hypothetical FR sentence for better query embedding."""
+def _hyde_query(product: str, hts_code: str, hts_chapter: str) -> str:
+    """
+    Generate hypothetical FR sentence for better query embedding.
+    Now includes full HTS code in the prompt for specificity.
+    """
     try:
         response = litellm.completion(
             model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
@@ -94,7 +187,9 @@ def _hyde_query(product: str, hts_chapter: str) -> str:
                 {
                     "role": "user",
                     "content": HYDE_PROMPT.format(
-                        product=product, hts_chapter=hts_chapter
+                        product=product,
+                        hts_code=hts_code or f"chapter {hts_chapter}",
+                        hts_chapter=hts_chapter,
                     ),
                 }
             ],
@@ -104,53 +199,99 @@ def _hyde_query(product: str, hts_chapter: str) -> str:
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.warning("hyde_generation_failed error=%s", e)
-        return f"{product} tariff chapter {hts_chapter} Federal Register notice"
+        return f"{product} HTS {hts_code} tariff Federal Register notice"
 
 
 def _dense_retrieval(
-    query_text: str, hts_chapter: str, embedder: Embedder
+    query_text: str,
+    hts_code: str,
+    hts_chapter: str,
+    doc_numbers_for_hts: Set[str],
+    embedder: Embedder,
 ) -> List[Dict[str, Any]]:
-    """Dense vector retrieval from ChromaDB filtered to HTS chapter."""
+    """
+    Dense vector retrieval from ChromaDB.
+
+    Filter priority:
+      1. Filter by exact document_number set (notices that cite this HTS code)
+      2. Fall back to chapter-level filter
+      3. Fall back to unfiltered
+
+    The document_number set comes from NOTICE_HTS_CODES in Snowflake, so
+    we're guaranteed to only surface chunks from notices that actually
+    reference this specific HTS code.
+    """
     try:
         query_vec = embedder.embed_batch([query_text])[0]
         chroma = _get_chroma_client()
         collection = chroma.get_collection("federal_register")
 
-        # Try chapter-filtered retrieval first
-        where_filter = {"hts_chapter": {"$eq": hts_chapter}} if hts_chapter else None
-
-        results = collection.query(
-            query_embeddings=[query_vec],
-            n_results=TOP_K,
-            where=where_filter if where_filter else None,
-            include=["documents", "metadatas", "distances"],
-        )
-
-        # If no results with chapter filter, broaden
-        if not results["ids"][0] and where_filter:
+        # Attempt 1: filter by exact HTS-linked document numbers
+        if doc_numbers_for_hts:
+            doc_list = list(doc_numbers_for_hts)
+            # ChromaDB $in filter — only works if collection metadata has document_number
+            where_filter = {"document_number": {"$in": doc_list}}
             results = collection.query(
                 query_embeddings=[query_vec],
                 n_results=TOP_K,
+                where=where_filter,
                 include=["documents", "metadatas", "distances"],
             )
+            if results["ids"][0]:
+                logger.info(
+                    "dense_retrieval_source=hts_code_filter hts=%s chunks=%d",
+                    hts_code, len(results["ids"][0]),
+                )
+                return _format_chroma_results(results)
 
-        chunks = []
-        for i, doc_id in enumerate(results["ids"][0]):
-            chunks.append(
-                {
-                    "chunk_id": doc_id,
-                    "chunk_text": results["documents"][0][i],
-                    "document_number": results["metadatas"][0][i].get("document_number", ""),
-                    "title": results["metadatas"][0][i].get("title", ""),
-                    "publication_date": results["metadatas"][0][i].get("publication_date", ""),
-                    "distance": results["distances"][0][i],
-                }
+        # Attempt 2: chapter filter
+        if hts_chapter:
+            where_filter = {"hts_chapter": {"$eq": hts_chapter}}
+            results = collection.query(
+                query_embeddings=[query_vec],
+                n_results=TOP_K,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"],
             )
-        return chunks
+            if results["ids"][0]:
+                logger.info(
+                    "dense_retrieval_source=chapter_filter chapter=%s chunks=%d",
+                    hts_chapter, len(results["ids"][0]),
+                )
+                return _format_chroma_results(results)
+
+        # Attempt 3: unfiltered
+        results = collection.query(
+            query_embeddings=[query_vec],
+            n_results=TOP_K,
+            include=["documents", "metadatas", "distances"],
+        )
+        logger.info(
+            "dense_retrieval_source=unfiltered chunks=%d",
+            len(results["ids"][0]),
+        )
+        return _format_chroma_results(results)
 
     except Exception as e:
         logger.warning("dense_retrieval_failed error=%s", e)
         return []
+
+
+def _format_chroma_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert raw ChromaDB query results to chunk dicts."""
+    chunks = []
+    for i, doc_id in enumerate(results["ids"][0]):
+        chunks.append(
+            {
+                "chunk_id": doc_id,
+                "chunk_text": results["documents"][0][i],
+                "document_number": results["metadatas"][0][i].get("document_number", ""),
+                "title": results["metadatas"][0][i].get("title", ""),
+                "publication_date": results["metadatas"][0][i].get("publication_date", ""),
+                "distance": results["distances"][0][i],
+            }
+        )
+    return chunks
 
 
 def _bm25_retrieval(query_text: str, corpus: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -208,28 +349,34 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     hts_chapter = hts_code[:2] if hts_code else ""
     query = state.get("query", "")
 
-    logger.info("policy_agent_start product=%s chapter=%s", product, hts_chapter)
+    logger.info("policy_agent_start product=%s hts_code=%s chapter=%s", product, hts_code, hts_chapter)
 
     embedder = Embedder()
 
-    # Step 1 — HyDE
-    hyde_query = _hyde_query(product, hts_chapter)
+    # Pre-fetch document numbers for this exact HTS code from Snowflake
+    # This is what enables precise filtering in ChromaDB
+    doc_numbers_for_hts = _fetch_doc_numbers_for_hts_code(hts_code)
+
+    # Step 1 — HyDE (now includes full HTS code in prompt)
+    hyde_query = _hyde_query(product, hts_code, hts_chapter)
     logger.info("policy_agent_hyde query=%s", hyde_query)
 
-    # Step 2 — Dense retrieval
-    dense_results = _dense_retrieval(hyde_query, hts_chapter, embedder)
+    # Step 2 — Dense retrieval (HTS-code-filtered → chapter → unfiltered)
+    dense_results = _dense_retrieval(
+        hyde_query, hts_code, hts_chapter, doc_numbers_for_hts, embedder
+    )
 
-    # Step 3 — BM25 retrieval
-    corpus = _fetch_chunks_for_chapter(hts_chapter)
+    # Step 3 — BM25 retrieval (also HTS-code-level corpus)
+    corpus = _fetch_chunks_for_hts_code(hts_code, hts_chapter)
     if not corpus:
         corpus = dense_results  # fallback to dense results as corpus
-    bm25_results = _bm25_retrieval(f"{product} {hts_chapter} tariff", corpus)
+    bm25_results = _bm25_retrieval(f"{product} {hts_code} tariff", corpus)
 
     # Step 4 — RRF fusion
     fused = _rrf_fusion(dense_results, bm25_results)
 
     if not fused:
-        logger.warning("policy_agent_no_chunks product=%s", product)
+        logger.warning("policy_agent_no_chunks product=%s hts=%s", product, hts_code)
         return {
             "policy_chunks": [],
             "policy_summary": "No Federal Register policy context found for this product.",
@@ -261,7 +408,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
         logger.error("policy_llm_failed error=%s", e)
         summary = "Policy synthesis failed. See raw chunks for context."
 
-    logger.info("policy_agent_done chunks=%d", len(fused))
+    logger.info("policy_agent_done chunks=%d hts_filtered=%s", len(fused), bool(doc_numbers_for_hts))
 
     return {
         "policy_chunks": fused,
