@@ -1,14 +1,24 @@
 import os
-from datetime import datetime, timezone
+import re
+from typing import Optional
 
 import snowflake.connector
 import structlog
 from fastapi import APIRouter, HTTPException
-
-from api.schemas import VerificationReceipt, TariffCalculation, RateReconciliation
+from pydantic import BaseModel
 
 logger = structlog.get_logger()
 router = APIRouter()
+
+
+class HTSRateResponse(BaseModel):
+    hts_code: str
+    description: str
+    general_rate: str
+    special_rate: Optional[str] = None
+    other_rate: Optional[str] = None
+    chapter: str
+    is_chapter99: bool
 
 
 def get_snowflake_conn():
@@ -22,132 +32,92 @@ def get_snowflake_conn():
     )
 
 
-def resolve_total_duty(hts_code: str) -> VerificationReceipt:
+def normalize_hts_code(code: str) -> str:
+    """Normalize HTS code to standard format with dots (8 or 10 digits)."""
+    # Remove all non-digit characters
+    digits = re.sub(r'\D', '', code)
+
+    if len(digits) == 4:  # Chapter only (e.g., "8517")
+        return digits
+    elif len(digits) == 6:  # Heading (e.g., "851713")
+        return f"{digits[:4]}.{digits[4:]}"
+    elif len(digits) == 8:  # 8-digit (e.g., "85171300")
+        return f"{digits[:4]}.{digits[4:6]}.{digits[6:]}"
+    elif len(digits) == 10:  # 10-digit (e.g., "8517130000")
+        return f"{digits[:4]}.{digits[4:6]}.{digits[6:8]}.{digits[8:]}"
+    else:
+        return code  # Return as-is if format unclear
+
+
+@router.get("/rate", response_model=HTSRateResponse)
+async def resolve_hts_rate(hts_code: str):
     """
-    Looks up the base MFN rate for an HTS code from HTS_CODES table.
-    Looks up any Chapter 99 adder from NOTICE_HTS_CODES + FEDERAL_REGISTER_NOTICES.
-    Returns a VerificationReceipt with full provenance.
+    GET /tools/rate?hts_code=8517.13.00
+
+    Look up HTS code rate information. Handles multiple formats:
+    - 8517.13.00 (8 digit with dots)
+    - 8517.13.00.00 (10 digit with dots)
+    - 851713 (6 digits, no dots)
+    - 8517 (4 digits, chapter only)
     """
+    logger.info("resolve_hts_rate_called", hts_code=hts_code)
+
+    normalized = normalize_hts_code(hts_code)
     conn = get_snowflake_conn()
-    now = datetime.now(timezone.utc)
 
     try:
         cur = conn.cursor()
 
-        # Step 1 — Get base rate from HTS_CODES
+        # Try exact match first
         cur.execute(
             """
-            SELECT hts_code, general_rate, description
+            SELECT hts_code, description, general_rate, special_rate, other_rate, is_chapter99
             FROM HTS_CODES
             WHERE hts_code = %s
             LIMIT 1
             """,
-            (hts_code,),
+            (normalized,),
         )
         row = cur.fetchone()
+
+        # Fallback: LIKE query if exact match fails
+        if not row:
+            cur.execute(
+                """
+                SELECT hts_code, description, general_rate, special_rate, other_rate, is_chapter99
+                FROM HTS_CODES
+                WHERE hts_code LIKE %s
+                LIMIT 1
+                """,
+                (f"{normalized}%",),
+            )
+            row = cur.fetchone()
+
         if not row:
             raise HTTPException(
                 status_code=404,
-                detail=f"HTS code {hts_code} not found in HTS_CODES table",
+                detail=f"HTS code {hts_code} not found"
             )
 
-        db_hts_code, general_rate_str, description = row
-
-        # Parse base rate — handle "Free", percentages, per-unit rates
-        base_rate = 0.0
-        if general_rate_str and general_rate_str.strip().lower() not in ("", "free"):
-            try:
-                base_rate = float(
-                    general_rate_str.strip().replace("%", "").split()[0]
-                )
-            except (ValueError, IndexError):
-                base_rate = 0.0
-
-        base_calc = TariffCalculation(
-            component="Base MFN Rate",
-            rate=base_rate,
-            source_description=description or "",
-            record_id=db_hts_code,
-            fetched_from="TARIFFIQ.RAW.HTS_CODES",
-            fetched_at=now,
-        )
-
-        # Step 2 — Check NOTICE_HTS_CODES for any Chapter 99 adder
-        cur.execute(
-            """
-            SELECT n.document_number, n.context_snippet, f.title
-            FROM NOTICE_HTS_CODES n
-            LEFT JOIN FEDERAL_REGISTER_NOTICES f
-                ON n.document_number = f.document_number
-            WHERE n.hts_code = %s
-            LIMIT 1
-            """,
-            (hts_code,),
-        )
-        notice_row = cur.fetchone()
-
-        adder_rate = 0.0
-        if notice_row:
-            doc_number, snippet, title = notice_row
-            # Parse adder rate from snippet — look for percentage pattern
-            import re
-            match = re.search(r"(\d+(?:\.\d+)?)\s*%", snippet or "")
-            if match:
-                adder_rate = float(match.group(1))
-
-            adder_calc = TariffCalculation(
-                component="Section 301 / IEEPA Adder",
-                rate=adder_rate,
-                source_description=title or snippet or "",
-                record_id=doc_number,
-                fetched_from="TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES",
-                fetched_at=now,
-            )
-        else:
-            adder_calc = TariffCalculation(
-                component="Section 301 / IEEPA Adder",
-                rate=0.0,
-                source_description="No additional tariff notice found for this HTS code",
-                record_id="NONE",
-                fetched_from="TARIFFIQ.RAW.NOTICE_HTS_CODES",
-                fetched_at=now,
-            )
-
-        # Step 3 — Calculate total and verify
-        total = round(base_rate + adder_rate, 4)
-        expected = round(base_rate + adder_rate, 4)
-        reconciliation = RateReconciliation(
-            calculation=f"{base_rate} + {adder_rate} = {total}",
-            check_passed=(total == expected),
-        )
+        db_code, description, general_rate, special_rate, other_rate, is_chapter99 = row
+        chapter = db_code[:4]
 
         logger.info(
-            "resolve_total_duty_complete",
-            hts_code=hts_code,
-            base_rate=base_rate,
-            adder_rate=adder_rate,
-            total=total,
+            "resolve_hts_rate_found",
+            hts_code=db_code,
+            description=description,
+            general_rate=general_rate,
         )
 
-        return VerificationReceipt(
-            hts_code=hts_code,
-            base_rate=base_rate,
-            base_rate_source=base_calc,
-            adder_rate=adder_rate,
-            adder_source=adder_calc,
-            total_duty=total,
-            rate_reconciliation=reconciliation,
+        return HTSRateResponse(
+            hts_code=db_code,
+            description=description,
+            general_rate=general_rate or "Not specified",
+            special_rate=special_rate,
+            other_rate=other_rate,
+            chapter=chapter,
+            is_chapter99=is_chapter99 or False,
         )
 
     finally:
         conn.close()
-
-
-@router.get("/rate", response_model=VerificationReceipt)
-async def get_hts_rate(hts_code: str):
-    """
-    GET /tools/rate?hts_code=8471.30.01.00
-    Returns full VerificationReceipt with base rate, adder, total, and provenance.
-    """
-    logger.info("resolve_hts_rate_called", hts_code=hts_code)
-    return resolve_total_duty(hts_code)  
