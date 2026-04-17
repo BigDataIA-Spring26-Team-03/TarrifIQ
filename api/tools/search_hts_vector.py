@@ -1,5 +1,6 @@
 """
 Vector search for HTS descriptions in ChromaDB.
+Uses HybridRetriever for dense search across HTS descriptions.
 """
 
 from typing import List, Optional
@@ -7,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import structlog
 
-from services.chromadb_init import search_hts
+from services.retrieval.hybrid import HybridRetriever
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -58,10 +59,11 @@ async def search_hts_vector(
         )
 
     try:
-        results = search_hts(
+        retriever = HybridRetriever()
+        results = retriever.search_hts(
             query=query,
             chapter=chapter,
-            limit=limit
+            top_k=limit
         )
 
         logger.info(
@@ -70,7 +72,18 @@ async def search_hts_vector(
             result_count=len(results)
         )
 
-        return [HTSSearchVectorResult(**r) for r in results]
+        # Map HybridRetriever response to HTSSearchVectorResult
+        mapped_results = []
+        for r in results:
+            mapped_results.append(HTSSearchVectorResult(
+                hts_code=r["hts_code"],
+                description=r["description"],
+                general_rate=r["general_rate"],
+                chapter=r["chapter"],
+                distance=r["score"]
+            ))
+
+        return mapped_results
 
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

@@ -29,6 +29,8 @@ import chromadb
 from ingestion.connection import get_snowflake_conn
 from ingestion.embedder import Embedder
 from agents.state import TariffState
+from services.retrieval.hybrid import HybridRetriever
+from services.llm.router import get_router, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -282,65 +284,105 @@ def _rrf_fusion(
     return [chunk_map[cid] for cid in sorted_ids[:TOP_K]]
 
 
-def run_policy_agent(state: TariffState) -> Dict[str, Any]:
+async def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     """
-    Retrieve policy context from USTR/CBP/ITC and synthesize with LLM.
+    Retrieve policy context from USTR/CBP/ITC using HyDE + HybridRetriever.
+
+    Flow:
+      1. HyDE: Generate hypothetical FR excerpt from product/country/HTS
+      2. HybridRetriever.search_policy(): Dense + Sparse + RRF on enhanced query
+      3. ModelRouter.complete(): Synthesize summary with citations
     """
     product = state.get("product") or state.get("query", "")
     hts_code = state.get("hts_code") or ""
     hts_chapter = hts_code[:2] if hts_code else ""
+    country = state.get("country")
     query = state.get("query", "")
 
-    logger.info("policy_agent_start product=%s hts_code=%s chapter=%s", product, hts_code, hts_chapter)
+    logger.info(
+        "policy_agent_start",
+        product=product,
+        hts_code=hts_code,
+        chapter=hts_chapter,
+        country=country
+    )
 
-    embedder = Embedder()
-    doc_numbers_for_hts = _fetch_doc_numbers_for_hts_code(hts_code)
+    # Step 1: HyDE query enhancement
+    try:
+        from services.retrieval.hyde import get_enhancer
+        enhancer = get_enhancer()
+        enhanced_query = await enhancer.enhance(
+            query=query,
+            product=product,
+            country=country or "unknown",
+            hts_chapter=hts_chapter
+        )
+        logger.info(
+            "policy_agent_hyde",
+            original_len=len(query),
+            enhanced_len=len(enhanced_query)
+        )
+    except Exception as e:
+        logger.warning("policy_agent_hyde_failed error=%s using original query", e)
+        enhanced_query = query
 
-    hyde_query = _hyde_query(product, hts_code, hts_chapter)
-    logger.info("policy_agent_hyde query=%s", hyde_query)
+    # Step 2: HybridRetriever search with optional HTS chapter filter
+    try:
+        retriever = HybridRetriever()
+        results = retriever.search_policy(
+            query=enhanced_query,
+            hts_chapter=hts_chapter if hts_chapter else None,
+            source=None,
+            top_k=5
+        )
 
-    dense_results = _dense_retrieval(hyde_query, hts_code, hts_chapter, doc_numbers_for_hts, embedder)
+        if not results:
+            logger.warning("policy_agent_no_results product=%s hts=%s", product, hts_code)
+            return {
+                "policy_chunks": [],
+                "policy_summary": "No policy context found for this product.",
+            }
 
-    corpus = _fetch_chunks_for_hts_code(hts_code, hts_chapter)
-    if not corpus:
-        corpus = dense_results
-    bm25_results = _bm25_retrieval(f"{product} {hts_code} tariff", corpus)
+        logger.info(
+            "policy_agent_retrieval",
+            result_count=len(results),
+            retrieval_method=results[0].get("retrieval_method", "unknown")
+        )
 
-    fused = _rrf_fusion(dense_results, bm25_results)
-
-    if not fused:
-        logger.warning("policy_agent_no_chunks product=%s hts=%s", product, hts_code)
+    except Exception as e:
+        logger.error("policy_agent_retrieval_failed error=%s", e)
         return {
             "policy_chunks": [],
-            "policy_summary": "No policy context found for this product.",
+            "policy_summary": "Policy retrieval failed.",
         }
 
+    # Step 3: Format context and generate summary with ModelRouter
     context_block = "\n\n".join([
-        f"[{c.get('source', 'USTR').upper()} | {c.get('document_number', 'UNKNOWN')}] {c['chunk_text']}"
-        for c in fused
+        f"[{r.get('source', 'USTR').upper()} | {r.get('document_number', 'UNKNOWN')}] {r['chunk_text']}"
+        for r in results
     ])
 
     try:
-        response = litellm.completion(
-            model=os.environ["LLM_MODEL"],  # no default — must be set in .env
+        router = get_router()
+        response = await router.complete(
+            task=TaskType.POLICY_ANALYSIS,
             messages=[
-                {"role": "system", "content": POLICY_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"Question: {query}\n\nDocument excerpts:\n{context_block}",
                 },
             ],
-            temperature=0.1,
-            max_tokens=500,
         )
         summary = response.choices[0].message.content.strip()
+        logger.info("policy_agent_synthesis_success", summary_len=len(summary))
+
     except Exception as e:
-        logger.error("policy_llm_failed error=%s", e)
+        logger.error("policy_agent_synthesis_failed error=%s", e)
         summary = "Policy synthesis failed. See raw chunks for context."
 
-    logger.info("policy_agent_done chunks=%d hts_filtered=%s", len(fused), bool(doc_numbers_for_hts))
+    logger.info("policy_agent_done", chunk_count=len(results))
 
     return {
-        "policy_chunks": fused,
+        "policy_chunks": results,
         "policy_summary": summary,
     }
