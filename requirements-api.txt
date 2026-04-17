@@ -1,10 +1,34 @@
-# Minimal deps for the FastAPI service only (keeps Docker image small).
-# Full stack: see requirements.txt
+# FastAPI service dependencies
+# Includes: Snowflake, FastAPI, LangGraph agents, ChromaDB search, LLM calls, caching, AWS S3
 
-snowflake-connector-python==3.7.0
+# Web framework
 fastapi==0.100.1
 uvicorn==0.30.1
 httpx==0.27.0
+
+# Configuration & Logging
 pydantic==2.7.1
 structlog==24.1.0
 python-dotenv==1.0.1
+
+# Databases & Data
+snowflake-connector-python==3.7.0
+chromadb==0.4.24
+redis==5.0.4
+
+# LLM & Agents
+langgraph==0.1.5
+langchain==0.2.5
+langchain-anthropic==0.1.15
+langchain-openai==0.1.8
+litellm==1.40.0  # Model router for cost-optimized LLM calls
+
+# Embeddings & Search
+sentence-transformers==3.0.1
+rank-bm25==0.2.2
+
+# AWS (for S3 health checks)
+boto3==1.34.69
+
+# Utilities
+requests==2.32.3

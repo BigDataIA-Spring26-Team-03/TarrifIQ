@@ -36,8 +36,8 @@ def rate_node(state: TariffState) -> Dict[str, Any]:
     return result
 
 
-def policy_node(state: TariffState) -> Dict[str, Any]:
-    return run_policy_agent(state)
+async def policy_node(state: TariffState) -> Dict[str, Any]:
+    return await run_policy_agent(state)
 
 
 def trade_node(state: TariffState) -> Dict[str, Any]:
