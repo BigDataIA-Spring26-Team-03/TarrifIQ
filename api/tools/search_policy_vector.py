@@ -1,5 +1,6 @@
 """
 Vector search for policy notices in ChromaDB.
+Uses HybridRetriever for dense + sparse + RRF fusion search.
 """
 
 from typing import List, Optional
@@ -7,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import structlog
 
-from services.chromadb_init import search_policy
+from services.retrieval.hybrid import HybridRetriever
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -20,7 +21,8 @@ class PolicySearchResult(BaseModel):
     source: str  # "USTR", "CBP", or "USITC"
     hts_chapter: str
     hts_code: str
-    distance: float
+    score: float
+    retrieval_method: str
 
 
 @router.post("/search/policy", response_model=List[PolicySearchResult])
@@ -62,17 +64,19 @@ async def search_policy_notices(
         )
 
     try:
-        results = search_policy(
+        retriever = HybridRetriever()
+        results = retriever.search_policy(
             query=query,
             hts_chapter=hts_chapter,
             source=source,
-            limit=limit
+            top_k=limit
         )
 
         logger.info(
             "search_policy_notices_complete",
             query=query,
-            result_count=len(results)
+            result_count=len(results),
+            retrieval_method="hybrid_rrf"
         )
 
         return [PolicySearchResult(**r) for r in results]
