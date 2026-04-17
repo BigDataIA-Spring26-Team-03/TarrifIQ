@@ -5,7 +5,7 @@ Four-layer HTS code resolution:
   Layer 0: LLM translates common product name to HTS technical terminology + heading hint
   Layer 1: Exact alias lookup in PRODUCT_ALIASES (Snowflake) — confidence 0.95
   Layer 2: Keyword search using technical terms against HTS_CODES — confidence 0.75-0.85
-  Layer 3: Semantic search via ChromaDB federal_register collection — confidence 0.50-0.70
+  Layer 3: Semantic search via ChromaDB policy_notices collection — confidence 0.50-0.70
 
 Safety:
   - Parameterized queries only (no SQL injection)
@@ -15,13 +15,17 @@ Safety:
   - No hardcoded product mappings anywhere
 
 Triggers HITL if final confidence < 0.80.
+
+IMPROVEMENT: After a successful pipeline run (hitl_required=False, rate found),
+_write_alias_feedback() writes the confirmed product -> hts_code mapping to
+PRODUCT_ALIASES. This makes the system self-improving — repeated queries for
+the same product bypass all 4 layers and resolve instantly via Layer 1.
 """
 
 import json
 import logging
 import os
 import re
-import time
 from typing import Dict, Any, Optional, Tuple, List
 
 import chromadb
@@ -67,8 +71,8 @@ Rules:
 
 
 def _get_chroma_client() -> chromadb.HttpClient:
-    host = os.environ.get("CHROMADB_HOST", "chromadb")
-    port = int(os.environ.get("CHROMADB_PORT", 8000))
+    host = os.environ.get("CHROMADB_HOST", os.environ.get("CHROMA_HOST", "chromadb"))
+    port = int(os.environ.get("CHROMADB_PORT", os.environ.get("CHROMA_PORT", 8000)))
     return chromadb.HttpClient(host=host, port=port)
 
 
@@ -89,7 +93,7 @@ def _layer0_llm_translate(product: str) -> Tuple[List[str], Optional[str], Optio
     """
     try:
         response = litellm.completion(
-            model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
+            model=os.environ["LLM_MODEL"],  # no default — must be set in .env
             messages=[
                 {
                     "role": "user",
@@ -183,16 +187,13 @@ def _layer2_keyword_search(
     conn = get_snowflake_conn()
     cur = conn.cursor()
     try:
-        # When we have a specific heading, use it directly
         if hts_heading:
             n = len(hts_heading)
             if n == 6:
-                # 6-digit: format as XXXX.XX for Snowflake
                 formatted = f"{hts_heading[:4]}.{hts_heading[4:]}"
                 left_filter = "LEFT(hts_code, 7) = %s"
                 filter_val = formatted
             else:
-                # 4-digit heading
                 left_filter = "LEFT(hts_code, 4) = %s"
                 filter_val = hts_heading
 
@@ -219,7 +220,6 @@ def _layer2_keyword_search(
                 )
                 return hts_code, description, 0.85
 
-        # Fallback: keyword search
         search_terms = technical_terms if technical_terms else [
             w for w in re.sub(r"[^a-zA-Z0-9 ]", " ", product.lower()).split()
             if len(w) > 3
@@ -309,7 +309,7 @@ def _layer2_keyword_search(
 
 def _layer3_semantic_search(product: str, technical_terms: List[str]) -> Optional[Tuple[str, str, float]]:
     """
-    Layer 3: Semantic search via ChromaDB using enriched query.
+    Layer 3: Semantic search via ChromaDB policy_notices collection (USTR + CBP + ITC chunks).
     """
     try:
         query_text = product
@@ -320,7 +320,8 @@ def _layer3_semantic_search(product: str, technical_terms: List[str]) -> Optiona
         query_vec = embedder.embed_batch([query_text])[0]
 
         chroma = _get_chroma_client()
-        collection = chroma.get_collection("federal_register")
+
+        collection = chroma.get_collection("policy_notices")
 
         results = collection.query(
             query_embeddings=[query_vec],
@@ -344,7 +345,7 @@ def _layer3_semantic_search(product: str, technical_terms: List[str]) -> Optiona
                 continue
 
             hts_code = _normalize_hts_code(hts_code)
-            title = meta.get("title", "")
+            title = meta.get("title", "") or meta.get("document_number", "")
 
             logger.info(
                 "classification_layer3_hit product=%s hts=%s conf=%.2f",
@@ -409,10 +410,93 @@ def _verify_hts_exists(hts_code: str) -> bool:
         conn.close()
 
 
+def _write_alias_feedback(
+    product: str,
+    hts_code: str,
+    confidence: float,
+    rate_was_found: bool,
+) -> None:
+    """
+    Write confirmed product -> hts_code mapping to PRODUCT_ALIASES.
+
+    Only called when:
+      - hitl_required is False (classification confidence >= 0.80)
+      - rate_was_found is True (Rate Agent found a real Snowflake record)
+
+    Both conditions together mean the full pipeline verified this mapping
+    end-to-end. Confidence capped at 0.95.
+    """
+    if not rate_was_found:
+        logger.debug(
+            "alias_feedback_skipped product=%s hts=%s reason=no_rate_found",
+            product, hts_code,
+        )
+        return
+
+    stored_confidence = min(confidence, 0.95)
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT hts_code, confidence
+            FROM TARIFFIQ.RAW.PRODUCT_ALIASES
+            WHERE LOWER(alias) = LOWER(%s)
+            LIMIT 1
+            """,
+            (product.strip(),),
+        )
+        existing = cur.fetchone()
+
+        if existing:
+            existing_hts, existing_conf = existing
+            if existing_hts == hts_code:
+                if stored_confidence > float(existing_conf or 0):
+                    cur.execute(
+                        """
+                        UPDATE TARIFFIQ.RAW.PRODUCT_ALIASES
+                        SET confidence = %s, updated_at = CURRENT_TIMESTAMP()
+                        WHERE LOWER(alias) = LOWER(%s)
+                        """,
+                        (stored_confidence, product.strip()),
+                    )
+                    logger.info(
+                        "alias_feedback_updated product=%s hts=%s conf=%.2f",
+                        product, hts_code, stored_confidence,
+                    )
+            else:
+                logger.warning(
+                    "alias_feedback_conflict product=%s existing_hts=%s new_hts=%s — skipping",
+                    product, existing_hts, hts_code,
+                )
+            return
+
+        cur.execute(
+            """
+            INSERT INTO TARIFFIQ.RAW.PRODUCT_ALIASES (alias, hts_code, confidence, created_at, updated_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+            """,
+            (product.strip(), hts_code, stored_confidence),
+        )
+        logger.info(
+            "alias_feedback_written product=%s hts=%s conf=%.2f",
+            product, hts_code, stored_confidence,
+        )
+
+    except Exception as e:
+        logger.error(
+            "alias_feedback_error product=%s hts=%s error=%s",
+            product, hts_code, e,
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+
 def run_classification_agent(state: TariffState) -> Dict[str, Any]:
     """
     Resolve HTS code using 4-layer lookup with LLM-assisted translation.
-    No hardcoded product mappings.
+    No hardcoded product mappings — all lookups against real Snowflake data.
     """
     product = state.get("product")
     if not product or not product.strip():
@@ -465,7 +549,7 @@ def run_classification_agent(state: TariffState) -> Dict[str, Any]:
             "hitl_reason": "low_confidence",
         }
 
-    # Final validation
+    # Final validation — verify HTS code exists in Snowflake
     if not _verify_hts_exists(hts_code):
         parts = hts_code.split(".")
         found = False
@@ -501,4 +585,21 @@ def run_classification_agent(state: TariffState) -> Dict[str, Any]:
         "classification_confidence": confidence,
         "hitl_required": hitl_required,
         "hitl_reason": "low_confidence" if hitl_required else None,
+        "_product_for_feedback": product,
     }
+
+
+def maybe_write_alias_feedback(classification_result: Dict[str, Any], rate_found: bool) -> None:
+    """
+    Called by graph.py rate_node after Rate Agent completes.
+    Writes alias to PRODUCT_ALIASES only when:
+      1. Classification confidence >= 0.80 (no HITL)
+      2. Rate Agent found a verified Snowflake record
+    """
+    if classification_result.get("hitl_required"):
+        return
+    product = classification_result.get("_product_for_feedback")
+    hts_code = classification_result.get("hts_code")
+    confidence = classification_result.get("classification_confidence", 0.0)
+    if product and hts_code:
+        _write_alias_feedback(product, hts_code, confidence, rate_found)

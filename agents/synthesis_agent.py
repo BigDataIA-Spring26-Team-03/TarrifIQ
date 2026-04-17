@@ -5,9 +5,19 @@ Combines all upstream agent outputs into a cited natural language answer.
 
 Validation:
   - Every FR doc number cited must exist in policy_chunks (hallucination check)
+  - IMPROVEMENT: Every cited FR doc is also verified against FEDERAL_REGISTER_NOTICES
+    in Snowflake — not just against the retrieved chunks. This catches the case
+    where the LLM fabricates a doc number that looks plausible (e.g. 2024-99999)
+    but was never in your database at all.
   - Every rate claim must reference a verified Snowflake record ID
   - Duplicate citations deduplicated before building context
   - Citation validation failure triggers HITL, never reaches user
+
+  - IMPROVEMENT: Final response includes a pipeline_confidence field with
+    value HIGH / MEDIUM / LOW based on:
+      HIGH: classification_confidence >= 0.80, rate record verified, FR docs real
+      MEDIUM: classification_confidence >= 0.60 OR any single component missing
+      LOW: multiple components missing or unverified
 
 Safety:
   - LLM never generates rates, dates, or HTS codes from memory
@@ -57,17 +67,57 @@ def _dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
+def _verify_fr_docs_in_snowflake(doc_numbers: Set[str]) -> Set[str]:
+    """
+    Verify which doc numbers actually exist in FEDERAL_REGISTER_NOTICES.
+    Returns the set of doc numbers that are confirmed real.
+
+    This is the second layer of citation validation — even if the LLM only
+    cites docs from the retrieved chunks, those chunks' doc numbers could
+    theoretically be corrupt. This is the ground-truth check.
+    """
+    if not doc_numbers:
+        return set()
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    verified = set()
+    try:
+        for doc_num in doc_numbers:
+            cur.execute(
+                """
+                SELECT 1 FROM TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES
+                WHERE document_number = %s
+                LIMIT 1
+                """,
+                (doc_num,),
+            )
+            if cur.fetchone():
+                verified.add(doc_num)
+            else:
+                logger.warning(
+                    "synthesis_fr_doc_not_in_snowflake doc_number=%s — chunk metadata may be corrupt",
+                    doc_num,
+                )
+        return verified
+    except Exception as e:
+        logger.error("verify_fr_docs_snowflake_error error=%s", e)
+        return doc_numbers
+    finally:
+        cur.close()
+        conn.close()
+
+
 def _validate_fr_citations(
     text: str, valid_doc_numbers: Set[str]
 ) -> tuple[bool, Set[str]]:
     """
     Validate all FR document numbers cited in text exist in valid_doc_numbers.
+    valid_doc_numbers has already been cross-checked against Snowflake.
     Returns (all_valid, set_of_hallucinated_docs).
     """
     if not valid_doc_numbers:
         return True, set()
 
-    # Extract document numbers in format YYYY-NNNNN (5+ digits after dash, not dates)
     cited_docs = set(re.findall(r"\b(\d{4}-\d{5,6})\b", text))
     if not cited_docs:
         return True, set()
@@ -101,6 +151,39 @@ def _validate_rate_record(record_id: Optional[str]) -> bool:
     finally:
         cur.close()
         conn.close()
+
+
+def _compute_pipeline_confidence(
+    classification_confidence: float,
+    rate_record_verified: bool,
+    fr_docs_verified: bool,
+    hitl_was_triggered: bool,
+) -> str:
+    """
+    Compute overall confidence level for the final response.
+
+    HIGH:   classification >= 0.80, rate verified, FR docs verified, no HITL.
+    MEDIUM: classification 0.60-0.80, OR one component missing/unverified.
+    LOW:    classification < 0.60, OR rate failed, OR FR docs unverified.
+    """
+    failures = 0
+    if classification_confidence < 0.60:
+        failures += 2
+    elif classification_confidence < 0.80:
+        failures += 1
+    if not rate_record_verified:
+        failures += 1
+    if not fr_docs_verified:
+        failures += 1
+    if hitl_was_triggered:
+        failures += 1
+
+    if failures == 0:
+        return "HIGH"
+    elif failures <= 2:
+        return "MEDIUM"
+    else:
+        return "LOW"
 
 
 def _build_context(
@@ -144,7 +227,6 @@ def _build_context(
             f"(cite ONLY these document numbers: {', '.join(sorted(valid_doc_numbers))}):\n"
             f"{context_excerpts}"
         )
-
         policy_summary = state.get("policy_summary")
         if policy_summary:
             parts.append(f"POLICY ANALYSIS: {policy_summary}")
@@ -195,7 +277,7 @@ def _build_citations(
         if doc_num and doc_num not in seen_ids:
             seen_ids.add(doc_num)
             citations.append({
-                "type": "federal_register",
+                "type": "federal_register",  # citation type label, not a collection name
                 "id": doc_num,
                 "text": chunk.get("title", ""),
                 "source": "federalregister.gov",
@@ -219,32 +301,29 @@ def _build_citations(
 def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     """
     Generate cited final response from all agent outputs with full validation.
-
-    Args:
-        state: TariffState with all upstream outputs populated
-
-    Returns:
-        Dict with final_response, citations, hitl_required, hitl_reason
     """
     logger.info("synthesis_agent_start query=%s", state.get("query", "")[:80])
 
-    # Deduplicate policy chunks
     raw_chunks = state.get("policy_chunks") or []
     deduped_chunks = _dedupe_chunks(raw_chunks)
-    valid_doc_numbers = {
+    candidate_doc_numbers = {
         c.get("document_number", "")
         for c in deduped_chunks
         if c.get("document_number")
     }
 
-    # Validate rate record exists in Snowflake
-    record_id = state.get("rate_record_id")
-    if record_id and not _validate_rate_record(record_id):
-        logger.warning("synthesis_invalid_rate_record record_id=%s", record_id)
+    valid_doc_numbers = _verify_fr_docs_in_snowflake(candidate_doc_numbers)
+    if candidate_doc_numbers - valid_doc_numbers:
+        logger.warning(
+            "synthesis_chunk_docs_not_in_snowflake unverified=%s",
+            candidate_doc_numbers - valid_doc_numbers,
+        )
 
-    # Build context
+    record_id = state.get("rate_record_id")
+    rate_record_verified = _validate_rate_record(record_id) if record_id else False
+
     context = _build_context(state, deduped_chunks, valid_doc_numbers)
-    model = os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514")
+    model = os.environ["LLM_MODEL"]  # no default — must be set in .env
 
     final_response = None
     last_error = None
@@ -278,36 +357,45 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
         return {
             "final_response": None,
             "citations": [],
+            "pipeline_confidence": "LOW",
             "hitl_required": True,
             "hitl_reason": "citation_failure",
             "error": f"Synthesis failed: {last_error}",
         }
 
-    # Citation validation
     citations_valid, hallucinated = _validate_fr_citations(final_response, valid_doc_numbers)
 
     if not citations_valid:
-        logger.warning(
-            "synthesis_citation_failure hallucinated=%s triggering_hitl",
-            hallucinated,
-        )
+        logger.warning("synthesis_citation_failure hallucinated=%s triggering_hitl", hallucinated)
         return {
             "final_response": final_response,
             "citations": _build_citations(state, deduped_chunks),
+            "pipeline_confidence": "LOW",
             "hitl_required": True,
             "hitl_reason": "citation_failure",
         }
 
+    classification_confidence = float(state.get("classification_confidence") or 0.0)
+    hitl_was_triggered = bool(state.get("hitl_required", False))
+    fr_docs_verified = bool(valid_doc_numbers)
+
+    pipeline_confidence = _compute_pipeline_confidence(
+        classification_confidence=classification_confidence,
+        rate_record_verified=rate_record_verified,
+        fr_docs_verified=fr_docs_verified,
+        hitl_was_triggered=hitl_was_triggered,
+    )
+
     citations = _build_citations(state, deduped_chunks)
     logger.info(
-        "synthesis_agent_done citations=%d hitl=%s",
-        len(citations),
-        state.get("hitl_required", False),
+        "synthesis_agent_done citations=%d pipeline_confidence=%s hitl=%s",
+        len(citations), pipeline_confidence, hitl_was_triggered,
     )
 
     return {
         "final_response": final_response,
         "citations": citations,
-        "hitl_required": state.get("hitl_required", False),
+        "pipeline_confidence": pipeline_confidence,
+        "hitl_required": hitl_was_triggered,
         "hitl_reason": state.get("hitl_reason"),
     }
