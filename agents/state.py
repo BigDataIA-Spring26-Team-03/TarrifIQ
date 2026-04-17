@@ -1,6 +1,5 @@
 """
 LangGraph state definition for TariffIQ six-agent pipeline.
-
 Flow: Query -> Classification -> Rate -> Policy -> Trade -> Synthesis
 HITL triggers: classification confidence < 0.80, citation validation failure
 """
@@ -9,42 +8,43 @@ from typing import TypedDict, Optional, List, Dict, Any
 
 
 class TariffState(TypedDict):
-    # --- Input ---
-    query: str                          # raw user query
+    # Input
+    query: str
 
-    # --- Query Agent output ---
-    product: Optional[str]              # extracted product name
-    country: Optional[str]              # extracted country name
+    # Query Agent
+    product: Optional[str]
+    country: Optional[str]
 
-    # --- Classification Agent output ---
-    hts_code: Optional[str]             # resolved HTS code e.g. "8471.30"
-    hts_description: Optional[str]      # HTS description from Snowflake
-    classification_confidence: Optional[float]  # 0.0 - 1.0
+    # Classification Agent
+    hts_code: Optional[str]
+    hts_description: Optional[str]
+    classification_confidence: Optional[float]
 
-    # --- Rate Agent output ---
-    base_rate: Optional[float]          # MFN base rate %
-    adder_rate: Optional[float]         # Section 301 / IEEPA adder %
-    total_duty: Optional[float]         # base + adder
-    rate_record_id: Optional[str]       # Snowflake record ID for citation
+    # Rate Agent
+    base_rate: Optional[float]
+    adder_rate: Optional[float]
+    total_duty: Optional[float]
+    rate_record_id: Optional[str]
 
-    # --- Policy Agent output ---
-    policy_chunks: Optional[List[Dict[str, Any]]]   # retrieved FR chunks with doc numbers
-    policy_summary: Optional[str]                   # LLM-generated policy context
+    # Policy Agent
+    policy_chunks: Optional[List[Dict[str, Any]]]
+    policy_summary: Optional[str]
 
-    # --- Trade Agent output ---
-    import_value_usd: Optional[float]   # Census Bureau import value
-    import_quantity: Optional[float]    # Census Bureau import quantity
-    trade_period: Optional[str]         # e.g. "2024-12"
-    trade_country_code: Optional[str]   # Census country code
-    trade_suppressed: Optional[bool]    # True if Census returned no data
+    # Trade Agent
+    import_value_usd: Optional[float]
+    import_quantity: Optional[float]
+    trade_period: Optional[str]
+    trade_country_code: Optional[str]
+    trade_suppressed: Optional[bool]
 
-    # --- Synthesis Agent output ---
-    final_response: Optional[str]       # cited natural language answer
-    citations: Optional[List[Dict[str, Any]]]  # list of {type, id, text}
+    # Synthesis Agent
+    final_response: Optional[str]
+    citations: Optional[List[Dict[str, Any]]]
+    pipeline_confidence: Optional[str]  # "HIGH" | "MEDIUM" | "LOW"
 
-    # --- HITL control ---
+    # HITL
     hitl_required: Optional[bool]
-    hitl_reason: Optional[str]          # "low_confidence" | "citation_failure"
+    hitl_reason: Optional[str]  # "low_confidence" | "citation_failure"
 
-    # --- Pipeline control ---
-    error: Optional[str]                # set if any agent fails hard
+    # Pipeline
+    error: Optional[str]
