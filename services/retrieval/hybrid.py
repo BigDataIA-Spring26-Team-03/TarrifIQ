@@ -11,14 +11,14 @@ Collections:
 
 import os
 import re
-import logging
+import structlog
 from typing import Optional, List, Dict
 from collections import defaultdict
 
 import chromadb
 from rank_bm25 import BM25Okapi
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 def get_chroma_client() -> chromadb.HttpClient:
@@ -126,7 +126,7 @@ class HybridRetriever:
                 self.bm25 = None
 
         except Exception as e:
-            logger.error("Error loading BM25 corpus: %s", e)
+            logger.error("Error loading BM25 corpus", error=str(e))
             self.bm25 = None
 
     def search_policy(
@@ -208,7 +208,7 @@ class HybridRetriever:
         try:
             collection = self.chroma.get_collection("policy_notices")
         except Exception as e:
-            logger.error("Failed to get policy_notices collection: %s", e)
+            logger.error("Failed to get policy_notices collection", error=str(e))
             return []
 
         # Build where filter
@@ -255,7 +255,7 @@ class HybridRetriever:
             return formatted
 
         except Exception as e:
-            logger.error("Dense search error: %s", e)
+            logger.error("Dense search error", error=str(e))
             return []
 
     def _sparse_search_policy(
@@ -323,7 +323,7 @@ class HybridRetriever:
             return formatted
 
         except Exception as e:
-            logger.error("Sparse search error: %s", e)
+            logger.error("Sparse search error", error=str(e))
             return []
 
     def search_hts(
@@ -386,8 +386,24 @@ class HybridRetriever:
             return formatted
 
         except Exception as e:
-            logger.error("HTS search error: %s", e)
+            logger.error("HTS search error", error=str(e))
             return []
+
+
+# ── Singleton ──────────────────────────────────────────────────────────────────
+# _reload_bm25() fetches ALL documents from ChromaDB and builds a BM25 index
+# in memory on instantiation (can take several seconds on first call).
+# Always use get_retriever() so this happens once at startup, not per query.
+
+_retriever_instance = None
+
+
+def get_retriever() -> "HybridRetriever":
+    """Get or create singleton HybridRetriever instance."""
+    global _retriever_instance
+    if _retriever_instance is None:
+        _retriever_instance = HybridRetriever()
+    return _retriever_instance
 
 
 if __name__ == "__main__":

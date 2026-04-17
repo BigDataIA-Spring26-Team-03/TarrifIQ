@@ -20,10 +20,10 @@ Result: ChromaDB returns much more relevant policy documents.
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------

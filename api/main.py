@@ -14,6 +14,7 @@ Vaishnavi's pipeline endpoint:
 Startup: initialize_chromadb() with skip-if-populated (no delete-rebuild).
 """
 
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -34,6 +35,18 @@ from api.tools.search_policy_vector import router as search_policy_router
 from api.tools.search_hts_vector import router as search_hts_vector_router
 from services.chromadb_init import initialize_chromadb
 from agents.graph import run_pipeline
+
+# Configure structlog so keyword-arg logging works consistently
+# across router.py, main.py, and any other structlog callers.
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.PrintLoggerFactory(),
+)
 
 logger = structlog.get_logger()
 
@@ -125,9 +138,28 @@ async def health():
     return HealthResponse(status=overall, timestamp=datetime.now(timezone.utc), services=services)
 
 
+def _sanitize_chunks(chunks) -> list:
+    if not chunks:
+        return []
+    out = []
+    for c in chunks:
+        safe = {}
+        for k, v in c.items():
+            if k == "chunk_text":
+                safe[k] = str(v)[:500] if v else ""
+            elif hasattr(v, "item"):
+                safe[k] = float(v)
+            elif v is None or isinstance(v, (str, int, bool, float)):
+                safe[k] = v
+            else:
+                safe[k] = str(v)
+        out.append(safe)
+    return out
+
+
 @app.post("/query", response_model=dict, tags=["Core"])
 async def query(request: QueryRequest):
-    """Full LangGraph 6-agent pipeline: query → classify → rate → policy → trade → synthesize."""
+    """Full LangGraph pipeline: query → classify → base_rate → policy → adder_rate → trade → synthesize."""
     logger.info("query_received", query=request.query)
     try:
         result = run_pipeline(request.query)
@@ -139,15 +171,25 @@ async def query(request: QueryRequest):
             "hts_code": result.get("hts_code"),
             "hts_description": result.get("hts_description"),
             "classification_confidence": result.get("classification_confidence"),
-            "total_duty": result.get("total_duty"),
             "base_rate": result.get("base_rate"),
+            "mfn_rate": result.get("mfn_rate"),
+            "fta_rate": result.get("fta_rate"),
+            "fta_program": result.get("fta_program"),
+            "fta_applied": result.get("fta_applied"),
+            "hts_footnotes": result.get("hts_footnotes"),
             "adder_rate": result.get("adder_rate"),
+            "adder_doc": result.get("adder_doc"),
+            "adder_method": result.get("adder_method"),
+            "total_duty": result.get("total_duty"),
             "policy_summary": result.get("policy_summary"),
-            "policy_chunks": result.get("policy_chunks", []),
+            "policy_chunks": _sanitize_chunks(result.get("policy_chunks")),
+            "policy_chunks_count": len(result.get("policy_chunks") or []),
             "pipeline_confidence": result.get("pipeline_confidence"),
             "import_value_usd": result.get("import_value_usd"),
             "trade_period": result.get("trade_period"),
             "trade_suppressed": result.get("trade_suppressed"),
+            "trade_trend_pct": result.get("trade_trend_pct"),
+            "trade_trend_label": result.get("trade_trend_label"),
             "final_response": result.get("final_response"),
             "citations": result.get("citations"),
             "hitl_required": result.get("hitl_required"),
@@ -155,5 +197,7 @@ async def query(request: QueryRequest):
             "error": result.get("error"),
         }
     except Exception as e:
-        logger.error("query_pipeline_failed", error=str(e))
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("query_pipeline_failed", error=str(e), traceback=tb)
         raise HTTPException(status_code=500, detail=str(e))
