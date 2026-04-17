@@ -1,401 +1,377 @@
 """
-Synthesis Agent — TariffIQ Pipeline Step 6
+Synthesis Agent — Pipeline Step 7
 
 Combines all upstream agent outputs into a cited natural language answer.
+LLM call via ModelRouter(TaskType.ANSWER_SYNTHESIS).
+All validation via tools.py.
 
-Validation:
-  - Every FR doc number cited must exist in policy_chunks (hallucination check)
-  - IMPROVEMENT: Every cited FR doc is also verified against FEDERAL_REGISTER_NOTICES
-    in Snowflake — not just against the retrieved chunks. This catches the case
-    where the LLM fabricates a doc number that looks plausible (e.g. 2024-99999)
-    but was never in your database at all.
-  - Every rate claim must reference a verified Snowflake record ID
-  - Duplicate citations deduplicated before building context
-  - Citation validation failure triggers HITL, never reaches user
+Citation validation (two layers):
+  1. Every FR doc number cited must be in policy_chunks + adder_doc set
+  2. Every doc verified against Snowflake via tools.verify_fr_doc()
 
-  - IMPROVEMENT: Final response includes a pipeline_confidence field with
-    value HIGH / MEDIUM / LOW based on:
-      HIGH: classification_confidence >= 0.80, rate record verified, FR docs real
-      MEDIUM: classification_confidence >= 0.60 OR any single component missing
-      LOW: multiple components missing or unverified
+Rate record validation: tools.hts_verify() confirms rate_record_id exists.
 
-Safety:
-  - LLM never generates rates, dates, or HTS codes from memory
-  - Structured context block enforces citation grounding
-  - Retry logic for LLM failures
+Trade trend: trade_trend_label included in context + census citation.
+
+Adder provenance: adder_doc cited as dedicated "adder_source" entry.
+
+FTA awareness: if base_rate_agent applied an FTA rate (USMCA, KORUS, etc.),
+the context block says so explicitly so the LLM can report the correct rate.
+
+Pipeline confidence: HIGH / MEDIUM / LOW based on component verification.
 """
 
+import asyncio
 import logging
 import os
 import re
 import time
 from typing import Dict, Any, List, Optional, Set
 
-import litellm
-
-from ingestion.connection import get_snowflake_conn
 from agents.state import TariffState
+from agents import tools
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 RETRY_DELAY = 1.0
 
-SYSTEM_PROMPT = """You are a trade sourcing analyst generating a concise, factual sourcing brief.
+SYNTHESIS_CONTEXT_TEMPLATE = """
+USER QUERY: {query}
+PRODUCT: {product}
+COUNTRY OF ORIGIN: {country}
 
-STRICT RULES:
-1. Every tariff rate claim MUST reference the Snowflake record ID in brackets, e.g. [HTS 8542.31.00]
-2. Every policy claim MUST cite a Federal Register document number in parentheses, e.g. (2025-23912)
-3. Every trade volume claim MUST reference "Census Bureau {period}"
-4. NEVER generate tariff rates, HTS codes, dates, or policy facts from memory
-5. If data is missing or suppressed, say so explicitly — do not guess
-6. Be concise: 200-300 words maximum
-7. Structure: Product & Classification | Tariff Rate | Policy Context | Trade Volume"""
+HTS CLASSIFICATION: {hts_code} — {hts_description} (confidence: {confidence})
+
+VERIFIED DUTY RATE [HTS {record_id}]:
+  {rate_line}
+  Section 301/IEEPA:     {adder_rate:.2f}% {adder_source}
+  Total effective duty:  {total_duty:.2f}%
+{footnote_line}
+FEDERAL REGISTER POLICY EXCERPTS
+(cite ONLY these document numbers: {valid_docs}):
+{policy_excerpts}
+
+POLICY ANALYSIS: {policy_summary}
+
+TRADE VOLUME [Census Bureau {period}]: {trade_line}
+"""
 
 
 def _dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Deduplicate policy chunks by document_number, keeping first occurrence."""
-    seen: Set[str] = set()
-    deduped = []
-    for chunk in chunks:
-        doc_num = chunk.get("document_number", "")
-        if doc_num and doc_num not in seen:
-            seen.add(doc_num)
-            deduped.append(chunk)
-        elif not doc_num:
-            deduped.append(chunk)
-    return deduped
+    # Keep ALL chunks for LLM context — different chunks from same doc
+    # have different text. Deduplication only happens in _build_citations().
+    return chunks if chunks else []
 
 
-def _verify_fr_docs_in_snowflake(doc_numbers: Set[str]) -> Set[str]:
+def _verify_docs(candidates: Set[str]) -> Set[str]:
     """
-    Verify which doc numbers actually exist in FEDERAL_REGISTER_NOTICES.
-    Returns the set of doc numbers that are confirmed real.
-
-    This is the second layer of citation validation — even if the LLM only
-    cites docs from the retrieved chunks, those chunks' doc numbers could
-    theoretically be corrupt. This is the ground-truth check.
+    Verify doc numbers against all three source tables:
+    FEDERAL_REGISTER_NOTICES (USTR), CBP_FEDERAL_REGISTER_NOTICES, ITC_DOCUMENTS.
+    Uses tools.verify_fr_doc() which checks USTR + CBP.
+    Also checks ITC_DOCUMENTS for USITC notices.
     """
-    if not doc_numbers:
+    if not candidates:
         return set()
-    conn = get_snowflake_conn()
-    cur = conn.cursor()
     verified = set()
-    try:
-        for doc_num in doc_numbers:
-            cur.execute(
-                """
-                SELECT 1 FROM TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES
-                WHERE document_number = %s
-                LIMIT 1
-                """,
-                (doc_num,),
-            )
-            if cur.fetchone():
-                verified.add(doc_num)
-            else:
-                logger.warning(
-                    "synthesis_fr_doc_not_in_snowflake doc_number=%s — chunk metadata may be corrupt",
-                    doc_num,
-                )
-        return verified
-    except Exception as e:
-        logger.error("verify_fr_docs_snowflake_error error=%s", e)
-        return doc_numbers
-    finally:
-        cur.close()
-        conn.close()
+    for doc in candidates:
+        if tools.verify_fr_doc(doc):
+            verified.add(doc)
+        elif tools.verify_itc_doc(doc):
+            verified.add(doc)
+    return verified
 
 
-def _validate_fr_citations(
-    text: str, valid_doc_numbers: Set[str]
-) -> tuple[bool, Set[str]]:
-    """
-    Validate all FR document numbers cited in text exist in valid_doc_numbers.
-    valid_doc_numbers has already been cross-checked against Snowflake.
-    Returns (all_valid, set_of_hallucinated_docs).
-    """
-    if not valid_doc_numbers:
+def _validate_citations(text: str, valid_docs: Set[str]) -> tuple[bool, Set[str]]:
+    if not valid_docs:
         return True, set()
-
-    cited_docs = set(re.findall(r"\b(\d{4}-\d{5,6})\b", text))
-    if not cited_docs:
+    cited = set(re.findall(r"\b(\d{4}-\d{5,6})\b", text))
+    if not cited:
         return True, set()
-
-    hallucinated = cited_docs - valid_doc_numbers
+    hallucinated = cited - valid_docs
     if hallucinated:
-        logger.warning(
-            "citation_hallucination cited=%s valid=%s hallucinated=%s",
-            cited_docs, valid_doc_numbers, hallucinated,
-        )
+        logger.warning("synthesis_hallucination cited=%s hallucinated=%s", cited, hallucinated)
         return False, hallucinated
-
     return True, set()
 
 
-def _validate_rate_record(record_id: Optional[str]) -> bool:
-    """Verify rate record ID exists in Snowflake HTS_CODES."""
-    if not record_id:
-        return True
-    conn = get_snowflake_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code = %s LIMIT 1",
-            (record_id,),
-        )
-        return cur.fetchone() is not None
-    except Exception as e:
-        logger.error("validate_rate_record_error record_id=%s error=%s", record_id, e)
-        return False
-    finally:
-        cur.close()
-        conn.close()
-
-
-def _compute_pipeline_confidence(
+def _compute_confidence(
     classification_confidence: float,
-    rate_record_verified: bool,
+    rate_verified: bool,
+    adder_doc_verified: bool,
     fr_docs_verified: bool,
     hitl_was_triggered: bool,
 ) -> str:
-    """
-    Compute overall confidence level for the final response.
-
-    HIGH:   classification >= 0.80, rate verified, FR docs verified, no HITL.
-    MEDIUM: classification 0.60-0.80, OR one component missing/unverified.
-    LOW:    classification < 0.60, OR rate failed, OR FR docs unverified.
-    """
     failures = 0
     if classification_confidence < 0.60:
         failures += 2
     elif classification_confidence < 0.80:
         failures += 1
-    if not rate_record_verified:
+    if not rate_verified:
+        failures += 1
+    if not adder_doc_verified:
         failures += 1
     if not fr_docs_verified:
         failures += 1
     if hitl_was_triggered:
         failures += 1
-
     if failures == 0:
         return "HIGH"
     elif failures <= 2:
         return "MEDIUM"
+    return "LOW"
+
+
+def _build_context(state: TariffState, deduped: List[Dict], valid_docs: Set[str]) -> str:
+    hts_code = state.get("hts_code") or "Unknown"
+    record_id = state.get("rate_record_id") or hts_code
+    base_rate = state.get("base_rate") or 0.0
+    adder_rate = state.get("adder_rate") or 0.0
+    total_duty = state.get("total_duty") or 0.0
+    adder_doc = state.get("adder_doc")
+
+    adder_source = f"(sourced from {adder_doc})" if adder_doc else "(source: not identified)"
+
+    fta_applied = state.get("fta_applied", False)
+    fta_program = state.get("fta_program")
+    mfn_rate = state.get("mfn_rate") or base_rate
+    hts_footnotes = state.get("hts_footnotes") or []
+
+    if fta_applied and fta_program:
+        rate_line = f"{fta_program} preferential rate {base_rate:.2f}% (MFN would be {mfn_rate:.2f}%)"
     else:
-        return "LOW"
+        rate_line = f"Base MFN {base_rate:.2f}%"
 
+    footnote_line = ("HTS FOOTNOTES: " + "; ".join(hts_footnotes[:3]) + "\n") if hts_footnotes else ""
 
-def _build_context(
-    state: TariffState,
-    deduped_chunks: List[Dict[str, Any]],
-    valid_doc_numbers: Set[str],
-) -> str:
-    """Build structured context block for LLM synthesis."""
-    parts = []
-
-    parts.append(f"USER QUERY: {state.get('query', '')}")
-    parts.append(f"PRODUCT: {state.get('product', 'Unknown')}")
-    parts.append(f"COUNTRY OF ORIGIN: {state.get('country', 'Not specified')}")
-
-    hts_code = state.get("hts_code")
-    if hts_code:
-        parts.append(
-            f"HTS CLASSIFICATION: {hts_code} — {state.get('hts_description', 'No description')} "
-            f"(confidence: {(state.get('classification_confidence') or 0):.0%})"
+    if deduped:
+        excerpts = "\n".join(
+            f"[{c.get('document_number', 'UNKNOWN')}] {c.get('chunk_text', '')[:300]}"
+            for c in deduped[:5]
         )
-
-    record_id = state.get("rate_record_id")
-    total_duty = state.get("total_duty")
-    if total_duty is not None and record_id:
-        parts.append(
-            f"VERIFIED DUTY RATE [HTS {record_id}]: "
-            f"Base {state.get('base_rate', 0):.2f}% + "
-            f"Section 301/IEEPA Adder {state.get('adder_rate', 0):.2f}% = "
-            f"Total {total_duty:.2f}%"
-        )
-    elif total_duty is None:
-        parts.append("DUTY RATE: Not available — rate lookup failed")
-
-    if deduped_chunks:
-        context_excerpts = "\n".join([
-            f"[{c.get('document_number', 'UNKNOWN')}] {c['chunk_text'][:300]}"
-            for c in deduped_chunks[:5]
-        ])
-        parts.append(
-            f"FEDERAL REGISTER POLICY EXCERPTS "
-            f"(cite ONLY these document numbers: {', '.join(sorted(valid_doc_numbers))}):\n"
-            f"{context_excerpts}"
-        )
-        policy_summary = state.get("policy_summary")
-        if policy_summary:
-            parts.append(f"POLICY ANALYSIS: {policy_summary}")
     else:
-        parts.append("FEDERAL REGISTER POLICY: No relevant policy documents found")
+        excerpts = "No relevant policy documents found."
 
     trade_suppressed = state.get("trade_suppressed")
     import_value = state.get("import_value_usd")
     period = state.get("trade_period", "")
+    trend_label = state.get("trade_trend_label")
+
     if trade_suppressed is False and import_value is not None:
-        parts.append(
-            f"TRADE VOLUME [Census Bureau {period}]: "
-            f"${import_value:,.0f} USD imports in {period}"
-        )
+        trade_line = f"${import_value:,.0f} USD"
+        if trend_label:
+            trade_line += f" | {trend_label}"
     elif trade_suppressed is False:
-        parts.append(f"TRADE VOLUME [Census Bureau {period}]: Data available but value suppressed")
+        trade_line = "Value suppressed by Census Bureau"
     else:
-        parts.append("TRADE VOLUME: Data not available from Census Bureau")
+        trade_line = "Not available from Census Bureau"
 
-    return "\n\n".join(parts)
+    return SYNTHESIS_CONTEXT_TEMPLATE.format(
+        query=state.get("query", ""),
+        product=state.get("product", "Unknown"),
+        country=state.get("country", "Not specified"),
+        hts_code=hts_code,
+        hts_description=state.get("hts_description", ""),
+        confidence=f"{(state.get('classification_confidence') or 0):.0%}",
+        record_id=record_id,
+        rate_line=rate_line,
+        base_rate=base_rate,
+        adder_rate=adder_rate,
+        adder_source=adder_source,
+        total_duty=total_duty,
+        footnote_line=footnote_line,
+        valid_docs=", ".join(sorted(valid_docs)) if valid_docs else "none",
+        policy_excerpts=excerpts,
+        policy_summary=state.get("policy_summary", ""),
+        period=period,
+        trade_line=trade_line,
+    )
 
 
-def _build_citations(
-    state: TariffState,
-    deduped_chunks: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Build deduplicated structured citations list."""
+# Agency metadata for citation enrichment
+_SOURCE_AGENCY_MAP = {
+    "USTR":  {"agency": "Office of the U.S. Trade Representative", "agency_short": "USTR"},
+    "CBP":   {"agency": "U.S. Customs and Border Protection",       "agency_short": "CBP"},
+    "USITC": {"agency": "U.S. International Trade Commission",      "agency_short": "USITC"},
+    "ITC":   {"agency": "U.S. International Trade Commission",      "agency_short": "USITC"},
+}
+
+
+def _fr_url(doc_number: str) -> str:
+    return f"https://www.federalregister.gov/documents/{doc_number}"
+
+
+def _build_citations(state: TariffState, deduped: List[Dict], valid_docs: Set[str]) -> List[Dict[str, Any]]:
     citations = []
-    seen_ids: Set[str] = set()
+    seen: Set[str] = set()
 
     record_id = state.get("rate_record_id")
-    if record_id and record_id not in seen_ids:
-        seen_ids.add(record_id)
+    if record_id and record_id not in seen:
+        seen.add(record_id)
+        fta_applied = state.get("fta_applied", False)
+        fta_program = state.get("fta_program")
+        rate_text = (
+            f"HTS {state.get('hts_code')} — "
+            f"{fta_program + ' rate' if fta_applied and fta_program else 'base MFN'} "
+            f"{state.get('base_rate', 0):.2f}% + "
+            f"adder {state.get('adder_rate', 0):.2f}% = "
+            f"total {state.get('total_duty', 0):.2f}%"
+        )
         citations.append({
             "type": "snowflake_hts",
             "id": record_id,
-            "text": (
-                f"HTS {state.get('hts_code')} — "
-                f"base rate {state.get('base_rate', 0):.2f}% + "
-                f"adder {state.get('adder_rate', 0):.2f}% = "
-                f"total {state.get('total_duty', 0):.2f}%"
-            ),
+            "agency": "USITC",
+            "agency_short": "USITC",
+            "text": rate_text,
             "source": "TARIFFIQ.RAW.HTS_CODES",
+            "url": None,
         })
 
-    for chunk in deduped_chunks:
-        doc_num = chunk.get("document_number")
-        if doc_num and doc_num not in seen_ids:
-            seen_ids.add(doc_num)
+    adder_doc = state.get("adder_doc")
+    if adder_doc and adder_doc not in seen and adder_doc in valid_docs:
+        seen.add(adder_doc)
+        citations.append({
+            "type": "adder_source",
+            "id": adder_doc,
+            "agency": "Office of the U.S. Trade Representative",
+            "agency_short": "USTR",
+            "text": f"Section 301/IEEPA adder rate — method: {state.get('adder_method', 'unknown')}",
+            "source": "federalregister.gov",
+            "url": _fr_url(adder_doc),
+        })
+
+    # Dedup by doc number here (not in _dedupe_chunks)
+    for chunk in deduped:
+        doc = chunk.get("document_number")
+        if doc and doc not in seen and doc in valid_docs:
+            seen.add(doc)
+            src = chunk.get("source", "USTR").upper()
+            agency_meta = _SOURCE_AGENCY_MAP.get(src, {"agency": src, "agency_short": src})
+            chunk_text = chunk.get("chunk_text", "") or ""
+            text = chunk_text[:120].strip() if chunk_text else ""
             citations.append({
-                "type": "federal_register",  # citation type label, not a collection name
-                "id": doc_num,
-                "text": chunk.get("title", ""),
-                "source": "federalregister.gov",
+                "type": "federal_register",
+                "id": doc,
+                "agency": agency_meta["agency"],
+                "agency_short": agency_meta["agency_short"],
+                "text": text,
+                "source": f"TARIFFIQ.RAW.{'CBP_' if src == 'CBP' else ''}FEDERAL_REGISTER_NOTICES",
+                "url": _fr_url(doc),
             })
 
     if not state.get("trade_suppressed") and state.get("import_value_usd") is not None:
         period = state.get("trade_period", "")
-        census_id = f"census_{period}"
-        if census_id not in seen_ids:
-            seen_ids.add(census_id)
+        cid = f"census_{period}"
+        if cid not in seen:
+            seen.add(cid)
+            trend = state.get("trade_trend_label")
+            text = f"US imports {period} — ${state.get('import_value_usd', 0):,.0f} USD"
+            if trend:
+                text += f" ({trend})"
             citations.append({
                 "type": "census_bureau",
-                "id": census_id,
-                "text": f"US imports {period} — ${state.get('import_value_usd', 0):,.0f} USD",
+                "id": cid,
+                "agency": "U.S. Census Bureau",
+                "agency_short": "Census",
+                "text": text,
                 "source": "api.census.gov",
+                "url": "https://www.census.gov/foreign-trade/",
             })
 
     return citations
 
 
 def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
-    """
-    Generate cited final response from all agent outputs with full validation.
-    """
     logger.info("synthesis_agent_start query=%s", state.get("query", "")[:80])
 
     raw_chunks = state.get("policy_chunks") or []
-    deduped_chunks = _dedupe_chunks(raw_chunks)
-    candidate_doc_numbers = {
-        c.get("document_number", "")
-        for c in deduped_chunks
-        if c.get("document_number")
+    deduped = _dedupe_chunks(raw_chunks)
+
+    # Candidate docs: policy chunks + adder_doc
+    candidate_docs: Set[str] = {
+        c.get("document_number", "") for c in deduped if c.get("document_number")
     }
+    adder_doc = state.get("adder_doc")
+    if adder_doc:
+        candidate_docs.add(adder_doc)
 
-    valid_doc_numbers = _verify_fr_docs_in_snowflake(candidate_doc_numbers)
-    if candidate_doc_numbers - valid_doc_numbers:
-        logger.warning(
-            "synthesis_chunk_docs_not_in_snowflake unverified=%s",
-            candidate_doc_numbers - valid_doc_numbers,
-        )
+    # Verify all docs against Snowflake
+    valid_docs = _verify_docs(candidate_docs)
+    if candidate_docs - valid_docs:
+        logger.warning("synthesis_unverified_docs=%s", candidate_docs - valid_docs)
 
+    # Verify rate record
     record_id = state.get("rate_record_id")
-    rate_record_verified = _validate_rate_record(record_id) if record_id else False
+    rate_verified = tools.hts_verify(record_id) if record_id else False
+    adder_doc_verified = adder_doc in valid_docs if adder_doc else True
 
-    context = _build_context(state, deduped_chunks, valid_doc_numbers)
-    model = os.environ["LLM_MODEL"]  # no default — must be set in .env
+    context = _build_context(state, deduped, valid_docs)
+
+    # LLM call via ModelRouter — ANSWER_SYNTHESIS (claude-haiku)
+    from services.llm.router import get_router, TaskType
+    router = get_router()
 
     final_response = None
     last_error = None
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = litellm.completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": context},
-                ],
-                temperature=0.1,
-                max_tokens=600,
-            )
-            final_response = response.choices[0].message.content.strip()
+            loop = asyncio.new_event_loop()
+            try:
+                resp = loop.run_until_complete(
+                    router.complete(
+                        task=TaskType.ANSWER_SYNTHESIS,
+                        messages=[{"role": "user", "content": context}],
+                    )
+                )
+            finally:
+                loop.close()
+            final_response = resp.choices[0].message.content.strip()
             break
-
-        except litellm.exceptions.RateLimitError:
-            logger.warning("synthesis_rate_limit attempt=%d", attempt + 1)
-            last_error = "LLM rate limit"
-            time.sleep(RETRY_DELAY * (attempt + 1))
+        except RuntimeError as e:
+            last_error = str(e)
+            logger.error("synthesis_router_failed error=%s", e)
+            break
         except Exception as e:
-            logger.error("synthesis_llm_error attempt=%d error=%s", attempt + 1, e)
             last_error = str(e)
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY)
 
     if not final_response:
-        logger.error("synthesis_all_retries_failed error=%s", last_error)
         return {
             "final_response": None,
             "citations": [],
             "pipeline_confidence": "LOW",
             "hitl_required": True,
             "hitl_reason": "citation_failure",
-            "error": f"Synthesis failed: {last_error}",
+            "error": f"Synthesis LLM failed: {last_error}",
         }
 
-    citations_valid, hallucinated = _validate_fr_citations(final_response, valid_doc_numbers)
-
+    citations_valid, hallucinated = _validate_citations(final_response, valid_docs)
     if not citations_valid:
-        logger.warning("synthesis_citation_failure hallucinated=%s triggering_hitl", hallucinated)
+        logger.warning("synthesis_citation_failure hallucinated=%s", hallucinated)
         return {
             "final_response": final_response,
-            "citations": _build_citations(state, deduped_chunks),
+            "citations": _build_citations(state, deduped, valid_docs),
             "pipeline_confidence": "LOW",
             "hitl_required": True,
             "hitl_reason": "citation_failure",
         }
 
-    classification_confidence = float(state.get("classification_confidence") or 0.0)
-    hitl_was_triggered = bool(state.get("hitl_required", False))
-    fr_docs_verified = bool(valid_doc_numbers)
-
-    pipeline_confidence = _compute_pipeline_confidence(
-        classification_confidence=classification_confidence,
-        rate_record_verified=rate_record_verified,
-        fr_docs_verified=fr_docs_verified,
-        hitl_was_triggered=hitl_was_triggered,
+    conf = _compute_confidence(
+        classification_confidence=float(state.get("classification_confidence") or 0.0),
+        rate_verified=rate_verified,
+        adder_doc_verified=adder_doc_verified,
+        fr_docs_verified=bool(valid_docs),
+        hitl_was_triggered=bool(state.get("hitl_required", False)),
     )
-
-    citations = _build_citations(state, deduped_chunks)
-    logger.info(
-        "synthesis_agent_done citations=%d pipeline_confidence=%s hitl=%s",
-        len(citations), pipeline_confidence, hitl_was_triggered,
-    )
+    citations = _build_citations(state, deduped, valid_docs)
+    logger.info("synthesis_agent_done citations=%d confidence=%s", len(citations), conf)
 
     return {
         "final_response": final_response,
         "citations": citations,
-        "pipeline_confidence": pipeline_confidence,
-        "hitl_required": hitl_was_triggered,
+        "pipeline_confidence": conf,
+        "hitl_required": bool(state.get("hitl_required", False)),
         "hitl_reason": state.get("hitl_reason"),
     }
