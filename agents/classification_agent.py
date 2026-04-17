@@ -309,49 +309,44 @@ def _layer2_keyword_search(
 
 def _layer3_semantic_search(product: str, technical_terms: List[str]) -> Optional[Tuple[str, str, float]]:
     """
-    Layer 3: Semantic search via ChromaDB policy_notices collection (USTR + CBP + ITC chunks).
+    Layer 3: Semantic search via HybridRetriever on hts_descriptions collection.
+    Uses hybrid dense + sparse + RRF fusion for better relevance.
     """
     try:
+        from services.retrieval.hybrid import HybridRetriever
+
         query_text = product
         if technical_terms:
             query_text = f"{product} {' '.join(technical_terms[:3])}"
 
-        embedder = Embedder()
-        query_vec = embedder.embed_batch([query_text])[0]
+        retriever = HybridRetriever()
+        results = retriever.search_hts(query=query_text, top_k=5)
 
-        chroma = _get_chroma_client()
-
-        collection = chroma.get_collection("policy_notices")
-
-        results = collection.query(
-            query_embeddings=[query_vec],
-            n_results=5,
-            include=["documents", "metadatas", "distances"],
-        )
-
-        if not results["ids"][0]:
+        if not results:
             return None
 
-        for i, meta in enumerate(results["metadatas"][0]):
-            hts_code = (meta.get("hts_code") or "").strip()
+        for result in results:
+            hts_code = (result.get("hts_code") or "").strip()
             if not hts_code or not _is_valid_hts_code(hts_code):
                 continue
 
-            distance = results["distances"][0][i]
-            similarity = max(0.0, 1.0 - distance)
-            confidence = round(similarity * 0.70, 2)
+            # HybridRetriever returns 'score' field
+            score = result.get("score", 1.0)
+            # Convert distance/score to confidence (0.50-0.70 range for Layer 3)
+            similarity = max(0.0, 1.0 - score) if score > 1.0 else score
+            confidence = round(0.50 + (similarity * 0.20), 2)
 
             if confidence < 0.40:
                 continue
 
             hts_code = _normalize_hts_code(hts_code)
-            title = meta.get("title", "") or meta.get("document_number", "")
+            description = result.get("description", "")
 
             logger.info(
-                "classification_layer3_hit product=%s hts=%s conf=%.2f",
-                product, hts_code, confidence,
+                "classification_layer3_hit product=%s hts=%s conf=%.2f retrieval_method=%s",
+                product, hts_code, confidence, result.get("retrieval_method", "hybrid"),
             )
-            return hts_code, title, confidence
+            return hts_code, description, confidence
 
         return None
 
