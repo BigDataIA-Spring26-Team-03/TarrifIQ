@@ -1,21 +1,29 @@
 """
 Policy Agent — TariffIQ Pipeline Step 4
 
-Retrieves relevant Federal Register policy context using:
+Retrieves relevant policy context from USTR + CBP + ITC documents using:
   1. HyDE: Generate hypothetical FR sentence, embed as query vector
-  2. Dense retrieval: ChromaDB vector search filtered to HTS chapter
-  3. BM25: Keyword retrieval over same chunks
+  2. Dense retrieval: ChromaDB vector search on policy_notices collection
+     filtered to confirmed HTS code (falls back to chapter → unfiltered)
+  3. BM25: Keyword retrieval over same chunks from Snowflake
   4. RRF: Reciprocal Rank Fusion to merge results
-  5. LiteLLM: Synthesize policy summary with FR document citations
+  5. LiteLLM: Synthesize policy summary with document citations
+
+Dense retrieval filters ChromaDB to chunks from notices that mention the
+EXACT confirmed HTS code (via NOTICE_HTS_CODES join), instead of just the
+2-digit chapter. This dramatically improves precision.
+
+Fallback chain: exact hts_code filter → chapter filter → unfiltered
+
+Collection: policy_notices (USTR + CBP + ITC chunks via Ayush's chromadb_init.py)
 """
 
 import logging
 import os
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 import litellm
 from rank_bm25 import BM25Okapi
-
 import chromadb
 
 from ingestion.connection import get_snowflake_conn
@@ -28,31 +36,99 @@ TOP_K = 5
 RRF_K = 60
 
 HYDE_PROMPT = """Write one sentence that would appear in a US Federal Register tariff notice
-about the following product and HTS chapter. Be specific about tariff rates and policy context.
+about the following product and HTS code. Be specific about tariff rates and policy context.
 Product: {product}
+HTS Code: {hts_code}
 HTS Chapter: {hts_chapter}"""
 
-POLICY_SYSTEM_PROMPT = """You are a US trade policy analyst.
-Answer the user's question using only the Federal Register excerpts provided.
-Cite the exact document number in parentheses for every factual claim.
-If the context is insufficient, say so explicitly.
-Do not use knowledge of tariff rates or policy outside the provided documents."""
+POLICY_SYSTEM_PROMPT = """You are a US trade policy analyst specializing in import tariffs and customs law.
+Answer the user's question using only the document excerpts provided below.
+These excerpts come from:
+  - USTR Federal Register notices: Section 301, IEEPA, safeguard tariff actions
+  - CBP rulings: Customs classification rulings, country-of-origin determinations
+  - USITC notices: ITC tariff investigations and determinations
+
+Rules:
+1. Cite the exact document number in parentheses for every factual claim
+2. If a CBP ruling addresses country-of-origin, explicitly note it
+3. If context is insufficient, say so explicitly
+4. Do not use knowledge outside the provided documents
+5. Be concise — 3-5 sentences maximum"""
 
 
 def _get_chroma_client() -> chromadb.HttpClient:
-    host = os.environ.get("CHROMADB_HOST", "chromadb")
-    port = int(os.environ.get("CHROMADB_PORT", 8000))
+    # Support both CHROMADB_HOST (our convention) and CHROMA_HOST (Ayush's convention)
+    host = os.environ.get("CHROMADB_HOST", os.environ.get("CHROMA_HOST", "chromadb"))
+    port = int(os.environ.get("CHROMADB_PORT", os.environ.get("CHROMA_PORT", 8000)))
     return chromadb.HttpClient(host=host, port=port)
 
 
-def _fetch_chunks_for_chapter(hts_chapter: str) -> List[Dict[str, Any]]:
+def _fetch_doc_numbers_for_hts_code(hts_code: str) -> Set[str]:
     """
-    Fetch all chunks for a given HTS chapter from Snowflake CHUNKS table.
-    Used as the BM25 corpus.
+    Fetch all FR document numbers that reference the exact HTS code.
+    Used to pre-filter ChromaDB to only relevant notices.
+
+    Filters by exact HTS code (e.g. '8541.43.00' → only solar cell notices)
+    instead of chapter (e.g. '85' → all Chapter 85 products).
+    """
+    if not hts_code:
+        return set()
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT document_number
+            FROM TARIFFIQ.RAW.NOTICE_HTS_CODES
+            WHERE hts_code = %s
+            """,
+            (hts_code,),
+        )
+        doc_numbers = {r[0] for r in cur.fetchall() if r[0]}
+        logger.info(
+            "policy_agent_hts_doc_filter hts=%s matched_notices=%d",
+            hts_code, len(doc_numbers),
+        )
+        return doc_numbers
+    except Exception as e:
+        logger.warning("policy_agent_hts_doc_filter_error hts=%s error=%s", hts_code, e)
+        return set()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _fetch_chunks_for_hts_code(hts_code: str, hts_chapter: str) -> List[Dict[str, Any]]:
+    """
+    Fetch chunks for BM25 corpus from Snowflake CHUNKS table.
+    Tries exact HTS code first, falls back to chapter-level if < 10 chunks found.
     """
     conn = get_snowflake_conn()
     cur = conn.cursor()
     try:
+        cur.execute(
+            """
+            SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
+                   f.title, f.publication_date::VARCHAR
+            FROM TARIFFIQ.RAW.CHUNKS c
+            INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
+                ON c.document_number = n.document_number
+            LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                ON c.document_number = f.document_number
+            WHERE n.hts_code = %s
+              AND c.chunk_text IS NOT NULL
+            LIMIT 200
+            """,
+            (hts_code,),
+        )
+        rows = cur.fetchall()
+
+        if len(rows) >= 10:
+            logger.info("policy_agent_bm25_corpus hts_code=%s chunks=%d source=exact_code", hts_code, len(rows))
+            return [{"chunk_id": r[0], "chunk_text": r[1], "document_number": r[2],
+                     "section": r[3], "title": r[4] or "", "publication_date": r[5] or "",
+                     "source": "USTR"} for r in rows]
+
         cur.execute(
             """
             SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
@@ -69,32 +145,26 @@ def _fetch_chunks_for_chapter(hts_chapter: str) -> List[Dict[str, Any]]:
             (hts_chapter,),
         )
         rows = cur.fetchall()
-        return [
-            {
-                "chunk_id": r[0],
-                "chunk_text": r[1],
-                "document_number": r[2],
-                "section": r[3],
-                "title": r[4] or "",
-                "publication_date": r[5] or "",
-            }
-            for r in rows
-        ]
+        logger.info("policy_agent_bm25_corpus hts_chapter=%s chunks=%d source=chapter_fallback", hts_chapter, len(rows))
+        return [{"chunk_id": r[0], "chunk_text": r[1], "document_number": r[2],
+                 "section": r[3], "title": r[4] or "", "publication_date": r[5] or "",
+                 "source": "USTR"} for r in rows]
     finally:
         cur.close()
         conn.close()
 
 
-def _hyde_query(product: str, hts_chapter: str) -> str:
-    """Generate hypothetical FR sentence for better query embedding."""
+def _hyde_query(product: str, hts_code: str, hts_chapter: str) -> str:
     try:
         response = litellm.completion(
-            model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
+            model=os.environ["LLM_MODEL"],  # no default — must be set in .env
             messages=[
                 {
                     "role": "user",
                     "content": HYDE_PROMPT.format(
-                        product=product, hts_chapter=hts_chapter
+                        product=product,
+                        hts_code=hts_code or f"chapter {hts_chapter}",
+                        hts_chapter=hts_chapter,
                     ),
                 }
             ],
@@ -104,67 +174,90 @@ def _hyde_query(product: str, hts_chapter: str) -> str:
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.warning("hyde_generation_failed error=%s", e)
-        return f"{product} tariff chapter {hts_chapter} Federal Register notice"
+        return f"{product} HTS {hts_code} tariff Federal Register notice"
 
 
 def _dense_retrieval(
-    query_text: str, hts_chapter: str, embedder: Embedder
+    query_text: str,
+    hts_code: str,
+    hts_chapter: str,
+    doc_numbers_for_hts: Set[str],
+    embedder: Embedder,
 ) -> List[Dict[str, Any]]:
-    """Dense vector retrieval from ChromaDB filtered to HTS chapter."""
+    """
+    Dense vector retrieval from ChromaDB policy_notices collection.
+
+    Filter priority:
+      1. Filter by exact document_number set (notices that cite this HTS code)
+      2. Fall back to chapter-level filter
+      3. Fall back to unfiltered
+    """
     try:
         query_vec = embedder.embed_batch([query_text])[0]
         chroma = _get_chroma_client()
-        collection = chroma.get_collection("federal_register")
+        collection = chroma.get_collection("policy_notices")
 
-        # Try chapter-filtered retrieval first
-        where_filter = {"hts_chapter": {"$eq": hts_chapter}} if hts_chapter else None
-
-        results = collection.query(
-            query_embeddings=[query_vec],
-            n_results=TOP_K,
-            where=where_filter if where_filter else None,
-            include=["documents", "metadatas", "distances"],
-        )
-
-        # If no results with chapter filter, broaden
-        if not results["ids"][0] and where_filter:
+        # Attempt 1: filter by exact HTS-linked document numbers
+        if doc_numbers_for_hts:
             results = collection.query(
                 query_embeddings=[query_vec],
                 n_results=TOP_K,
+                where={"document_number": {"$in": list(doc_numbers_for_hts)}},
                 include=["documents", "metadatas", "distances"],
             )
+            if results["ids"][0]:
+                logger.info("dense_retrieval_source=hts_code_filter hts=%s chunks=%d", hts_code, len(results["ids"][0]))
+                return _format_chroma_results(results)
 
-        chunks = []
-        for i, doc_id in enumerate(results["ids"][0]):
-            chunks.append(
-                {
-                    "chunk_id": doc_id,
-                    "chunk_text": results["documents"][0][i],
-                    "document_number": results["metadatas"][0][i].get("document_number", ""),
-                    "title": results["metadatas"][0][i].get("title", ""),
-                    "publication_date": results["metadatas"][0][i].get("publication_date", ""),
-                    "distance": results["distances"][0][i],
-                }
+        # Attempt 2: chapter filter
+        if hts_chapter:
+            results = collection.query(
+                query_embeddings=[query_vec],
+                n_results=TOP_K,
+                where={"hts_chapter": {"$eq": hts_chapter}},
+                include=["documents", "metadatas", "distances"],
             )
-        return chunks
+            if results["ids"][0]:
+                logger.info("dense_retrieval_source=chapter_filter chapter=%s chunks=%d", hts_chapter, len(results["ids"][0]))
+                return _format_chroma_results(results)
+
+        # Attempt 3: unfiltered
+        results = collection.query(
+            query_embeddings=[query_vec],
+            n_results=TOP_K,
+            include=["documents", "metadatas", "distances"],
+        )
+        logger.info("dense_retrieval_source=unfiltered chunks=%d", len(results["ids"][0]))
+        return _format_chroma_results(results)
 
     except Exception as e:
         logger.warning("dense_retrieval_failed error=%s", e)
         return []
 
 
+def _format_chroma_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    chunks = []
+    for i, doc_id in enumerate(results["ids"][0]):
+        meta = results["metadatas"][0][i]
+        chunks.append({
+            "chunk_id": doc_id,
+            "chunk_text": results["documents"][0][i],
+            "document_number": meta.get("document_number", ""),
+            "title": meta.get("title", ""),
+            "publication_date": meta.get("publication_date", ""),
+            "source": meta.get("source", "USTR"),
+            "distance": results["distances"][0][i],
+        })
+    return chunks
+
+
 def _bm25_retrieval(query_text: str, corpus: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """BM25 keyword retrieval over corpus chunks."""
     if not corpus:
         return []
-
-    tokenized_corpus = [c["chunk_text"].lower().split() for c in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
+    tokenized = [c["chunk_text"].lower().split() for c in corpus]
+    bm25 = BM25Okapi(tokenized)
     scores = bm25.get_scores(query_text.lower().split())
-
-    ranked = sorted(
-        zip(scores, corpus), key=lambda x: x[0], reverse=True
-    )
+    ranked = sorted(zip(scores, corpus), key=lambda x: x[0], reverse=True)
     return [c for _, c in ranked[:TOP_K]]
 
 
@@ -172,10 +265,6 @@ def _rrf_fusion(
     dense_results: List[Dict[str, Any]],
     bm25_results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Reciprocal Rank Fusion of dense and BM25 results.
-    RRF score = sum(1 / (k + rank)) across result lists.
-    """
     rrf_scores: Dict[str, float] = {}
     chunk_map: Dict[str, Dict[str, Any]] = {}
 
@@ -195,62 +284,50 @@ def _rrf_fusion(
 
 def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     """
-    Retrieve Federal Register policy context and synthesize with LLM.
-
-    Args:
-        state: TariffState with product, hts_code, query populated
-
-    Returns:
-        Dict with policy_chunks and policy_summary
+    Retrieve policy context from USTR/CBP/ITC and synthesize with LLM.
     """
     product = state.get("product") or state.get("query", "")
     hts_code = state.get("hts_code") or ""
     hts_chapter = hts_code[:2] if hts_code else ""
     query = state.get("query", "")
 
-    logger.info("policy_agent_start product=%s chapter=%s", product, hts_chapter)
+    logger.info("policy_agent_start product=%s hts_code=%s chapter=%s", product, hts_code, hts_chapter)
 
     embedder = Embedder()
+    doc_numbers_for_hts = _fetch_doc_numbers_for_hts_code(hts_code)
 
-    # Step 1 — HyDE
-    hyde_query = _hyde_query(product, hts_chapter)
+    hyde_query = _hyde_query(product, hts_code, hts_chapter)
     logger.info("policy_agent_hyde query=%s", hyde_query)
 
-    # Step 2 — Dense retrieval
-    dense_results = _dense_retrieval(hyde_query, hts_chapter, embedder)
+    dense_results = _dense_retrieval(hyde_query, hts_code, hts_chapter, doc_numbers_for_hts, embedder)
 
-    # Step 3 — BM25 retrieval
-    corpus = _fetch_chunks_for_chapter(hts_chapter)
+    corpus = _fetch_chunks_for_hts_code(hts_code, hts_chapter)
     if not corpus:
-        corpus = dense_results  # fallback to dense results as corpus
-    bm25_results = _bm25_retrieval(f"{product} {hts_chapter} tariff", corpus)
+        corpus = dense_results
+    bm25_results = _bm25_retrieval(f"{product} {hts_code} tariff", corpus)
 
-    # Step 4 — RRF fusion
     fused = _rrf_fusion(dense_results, bm25_results)
 
     if not fused:
-        logger.warning("policy_agent_no_chunks product=%s", product)
+        logger.warning("policy_agent_no_chunks product=%s hts=%s", product, hts_code)
         return {
             "policy_chunks": [],
-            "policy_summary": "No Federal Register policy context found for this product.",
+            "policy_summary": "No policy context found for this product.",
         }
 
-    # Step 5 — LLM synthesis
-    context_block = "\n\n".join(
-        [
-            f"[{c.get('document_number', 'UNKNOWN')}] {c['chunk_text']}"
-            for c in fused
-        ]
-    )
+    context_block = "\n\n".join([
+        f"[{c.get('source', 'USTR').upper()} | {c.get('document_number', 'UNKNOWN')}] {c['chunk_text']}"
+        for c in fused
+    ])
 
     try:
         response = litellm.completion(
-            model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
+            model=os.environ["LLM_MODEL"],  # no default — must be set in .env
             messages=[
                 {"role": "system", "content": POLICY_SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": f"Question: {query}\n\nFederal Register excerpts:\n{context_block}",
+                    "content": f"Question: {query}\n\nDocument excerpts:\n{context_block}",
                 },
             ],
             temperature=0.1,
@@ -261,7 +338,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
         logger.error("policy_llm_failed error=%s", e)
         summary = "Policy synthesis failed. See raw chunks for context."
 
-    logger.info("policy_agent_done chunks=%d", len(fused))
+    logger.info("policy_agent_done chunks=%d hts_filtered=%s", len(fused), bool(doc_numbers_for_hts))
 
     return {
         "policy_chunks": fused,
