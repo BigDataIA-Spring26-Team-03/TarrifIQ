@@ -101,7 +101,6 @@ def _verify_fr_docs_in_snowflake(doc_numbers: Set[str]) -> Set[str]:
         return verified
     except Exception as e:
         logger.error("verify_fr_docs_snowflake_error error=%s", e)
-        # On DB error, trust the chunks rather than blocking everything
         return doc_numbers
     finally:
         cur.close()
@@ -119,7 +118,6 @@ def _validate_fr_citations(
     if not valid_doc_numbers:
         return True, set()
 
-    # Extract document numbers in format YYYY-NNNNN (5+ digits after dash, not dates)
     cited_docs = set(re.findall(r"\b(\d{4}-\d{5,6})\b", text))
     if not cited_docs:
         return True, set()
@@ -162,24 +160,15 @@ def _compute_pipeline_confidence(
     hitl_was_triggered: bool,
 ) -> str:
     """
-    Compute an overall confidence level for the final response.
+    Compute overall confidence level for the final response.
 
-    HIGH:   All three components clean — classification ≥ 0.80, rate verified,
-            FR docs verified in Snowflake, no HITL triggered anywhere.
-
-    MEDIUM: Classification between 0.60-0.80, OR one component is missing/
-            unverified (e.g. no trade data), OR HITL was triggered upstream
-            but pipeline continued.
-
-    LOW:    Classification < 0.60, OR rate lookup failed, OR FR docs could
-            not be verified. User should treat this response with caution.
-
-    This is surfaced in the API response so the Streamlit UI can show a
-    clear confidence badge next to the answer.
+    HIGH:   classification >= 0.80, rate verified, FR docs verified, no HITL.
+    MEDIUM: classification 0.60-0.80, OR one component missing/unverified.
+    LOW:    classification < 0.60, OR rate failed, OR FR docs unverified.
     """
     failures = 0
     if classification_confidence < 0.60:
-        failures += 2  # Serious — wrong HTS code undermines everything
+        failures += 2
     elif classification_confidence < 0.80:
         failures += 1
     if not rate_record_verified:
@@ -238,7 +227,6 @@ def _build_context(
             f"(cite ONLY these document numbers: {', '.join(sorted(valid_doc_numbers))}):\n"
             f"{context_excerpts}"
         )
-
         policy_summary = state.get("policy_summary")
         if policy_summary:
             parts.append(f"POLICY ANALYSIS: {policy_summary}")
@@ -289,7 +277,7 @@ def _build_citations(
         if doc_num and doc_num not in seen_ids:
             seen_ids.add(doc_num)
             citations.append({
-                "type": "federal_register",
+                "type": "federal_register",  # citation type label, not a collection name
                 "id": doc_num,
                 "text": chunk.get("title", ""),
                 "source": "federalregister.gov",
@@ -313,16 +301,9 @@ def _build_citations(
 def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     """
     Generate cited final response from all agent outputs with full validation.
-
-    Args:
-        state: TariffState with all upstream outputs populated
-
-    Returns:
-        Dict with final_response, citations, pipeline_confidence, hitl_required, hitl_reason
     """
     logger.info("synthesis_agent_start query=%s", state.get("query", "")[:80])
 
-    # Deduplicate policy chunks
     raw_chunks = state.get("policy_chunks") or []
     deduped_chunks = _dedupe_chunks(raw_chunks)
     candidate_doc_numbers = {
@@ -331,8 +312,6 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
         if c.get("document_number")
     }
 
-    # IMPROVEMENT: Cross-check chunk doc numbers against Snowflake
-    # valid_doc_numbers only contains docs that actually exist in FEDERAL_REGISTER_NOTICES
     valid_doc_numbers = _verify_fr_docs_in_snowflake(candidate_doc_numbers)
     if candidate_doc_numbers - valid_doc_numbers:
         logger.warning(
@@ -340,13 +319,11 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
             candidate_doc_numbers - valid_doc_numbers,
         )
 
-    # Validate rate record exists in Snowflake
     record_id = state.get("rate_record_id")
     rate_record_verified = _validate_rate_record(record_id) if record_id else False
 
-    # Build context — LLM is told exactly which doc numbers are valid to cite
     context = _build_context(state, deduped_chunks, valid_doc_numbers)
-    model = os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514")
+    model = os.environ["LLM_MODEL"]  # no default — must be set in .env
 
     final_response = None
     last_error = None
@@ -386,14 +363,10 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
             "error": f"Synthesis failed: {last_error}",
         }
 
-    # Citation validation — checked against Snowflake-verified doc numbers
     citations_valid, hallucinated = _validate_fr_citations(final_response, valid_doc_numbers)
 
     if not citations_valid:
-        logger.warning(
-            "synthesis_citation_failure hallucinated=%s triggering_hitl",
-            hallucinated,
-        )
+        logger.warning("synthesis_citation_failure hallucinated=%s triggering_hitl", hallucinated)
         return {
             "final_response": final_response,
             "citations": _build_citations(state, deduped_chunks),
@@ -402,10 +375,9 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
             "hitl_reason": "citation_failure",
         }
 
-    # IMPROVEMENT: Compute overall pipeline confidence
     classification_confidence = float(state.get("classification_confidence") or 0.0)
     hitl_was_triggered = bool(state.get("hitl_required", False))
-    fr_docs_verified = bool(valid_doc_numbers)  # True if at least one FR doc verified
+    fr_docs_verified = bool(valid_doc_numbers)
 
     pipeline_confidence = _compute_pipeline_confidence(
         classification_confidence=classification_confidence,
@@ -417,9 +389,7 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     citations = _build_citations(state, deduped_chunks)
     logger.info(
         "synthesis_agent_done citations=%d pipeline_confidence=%s hitl=%s",
-        len(citations),
-        pipeline_confidence,
-        hitl_was_triggered,
+        len(citations), pipeline_confidence, hitl_was_triggered,
     )
 
     return {
