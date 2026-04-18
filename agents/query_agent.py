@@ -3,14 +3,10 @@ Query Agent — Pipeline Step 1
 
 Parses raw user query → {product, country} using the ModelRouter.
 
-Changes from main:
-  - LLM call goes through ModelRouter(TaskType.QUERY_PARSING) instead of
-    direct litellm.completion(). Gets automatic fallback + budget tracking.
-  - Router system prompt returns country="all" on no match — we normalize
-    that to None so the rest of the pipeline sees null as expected.
-  - Added semantic Redis cache layer (cosine >= 0.92) on top of exact cache.
-  - Ambiguity detection: broad product terms trigger clarification_needed
-    response with HTS subcategory suggestions instead of running the pipeline.
+Ambiguity detection is fully dynamic — no hardcoded product lists.
+Uses SQL lookup against HTS_CODES to determine if a product term
+maps to multiple distinct HTS headings. If so, returns clarification
+with real HTS subcategories from the database.
 """
 
 import asyncio
@@ -43,90 +39,6 @@ TARIFF_SIGNALS = [
     "from", "sourcing", "buy", "purchase", "product", "goods",
     "section 301", "section 232", "ieepa", "trade", "supply chain",
 ]
-
-# Broad product terms that need clarification before classification
-# Maps generic term → list of (display label, suggested query suffix)
-AMBIGUOUS_PRODUCTS: Dict[str, List[Dict[str, str]]] = {
-    "steel": [
-        {"label": "Steel sheets / flat-rolled (HTS 7208)", "query": "flat-rolled steel sheets"},
-        {"label": "Steel wire (HTS 7217)", "query": "steel wire drawn"},
-        {"label": "Steel bars / rods (HTS 7214)", "query": "steel bars and rods"},
-        {"label": "Steel pipes / tubes (HTS 7304)", "query": "steel pipes and tubes"},
-        {"label": "Steel angles / sections (HTS 7216)", "query": "steel structural sections"},
-        {"label": "Stainless steel (HTS 7219)", "query": "stainless steel flat-rolled"},
-    ],
-    "aluminum": [
-        {"label": "Aluminum sheets / plates (HTS 7606)", "query": "aluminum sheets and plates"},
-        {"label": "Aluminum bars / rods (HTS 7604)", "query": "aluminum bars and rods"},
-        {"label": "Aluminum wire (HTS 7605)", "query": "aluminum wire"},
-        {"label": "Aluminum tubes / pipes (HTS 7608)", "query": "aluminum tubes and pipes"},
-        {"label": "Aluminum structures (HTS 7610)", "query": "aluminum structures"},
-    ],
-    "aluminium": [
-        {"label": "Aluminium sheets / plates (HTS 7606)", "query": "aluminium sheets and plates"},
-        {"label": "Aluminium bars / rods (HTS 7604)", "query": "aluminium bars and rods"},
-        {"label": "Aluminium wire (HTS 7605)", "query": "aluminium wire"},
-    ],
-    "clothes": [
-        {"label": "T-shirts / knitted tops (HTS 6109)", "query": "knitted t-shirts cotton"},
-        {"label": "Woven shirts (HTS 6205)", "query": "woven men shirts"},
-        {"label": "Trousers / pants (HTS 6203)", "query": "woven trousers pants"},
-        {"label": "Dresses / skirts (HTS 6204)", "query": "women dresses skirts"},
-        {"label": "Jackets / outerwear (HTS 6201)", "query": "men outerwear jackets"},
-        {"label": "Underwear / socks (HTS 6107)", "query": "knitted underwear socks"},
-    ],
-    "clothing": [
-        {"label": "T-shirts / knitted tops (HTS 6109)", "query": "knitted t-shirts cotton"},
-        {"label": "Woven shirts (HTS 6205)", "query": "woven shirts"},
-        {"label": "Trousers / pants (HTS 6203)", "query": "trousers pants"},
-        {"label": "Outerwear / jackets (HTS 6201)", "query": "outerwear jackets"},
-    ],
-    "apparel": [
-        {"label": "Knitted garments (HTS 6109-6114)", "query": "knitted garments"},
-        {"label": "Woven garments (HTS 6201-6217)", "query": "woven garments"},
-        {"label": "Underwear / hosiery (HTS 6107-6117)", "query": "underwear hosiery"},
-    ],
-    "chemicals": [
-        {"label": "Organic chemicals (HTS 2901-2942)", "query": "organic chemicals"},
-        {"label": "Inorganic chemicals (HTS 2801-2853)", "query": "inorganic chemicals"},
-        {"label": "Plastics / polymers (HTS 3901-3926)", "query": "plastics polymers"},
-        {"label": "Pharmaceutical products (HTS 3001-3006)", "query": "pharmaceutical chemicals"},
-        {"label": "Fertilizers (HTS 3101-3105)", "query": "fertilizers"},
-    ],
-    "machinery": [
-        {"label": "Industrial machines (HTS 8417-8480)", "query": "industrial machinery"},
-        {"label": "Construction equipment (HTS 8425-8430)", "query": "construction machinery"},
-        {"label": "Agricultural machinery (HTS 8432-8436)", "query": "agricultural machinery"},
-        {"label": "Machine tools (HTS 8456-8466)", "query": "machine tools"},
-    ],
-    "plastics": [
-        {"label": "Plastic sheets / film (HTS 3920)", "query": "plastic sheets film"},
-        {"label": "Plastic tubes / pipes (HTS 3917)", "query": "plastic pipes tubes"},
-        {"label": "Plastic containers (HTS 3923)", "query": "plastic containers packaging"},
-        {"label": "Plastic articles (HTS 3926)", "query": "plastic articles"},
-    ],
-    "wood": [
-        {"label": "Lumber / sawn wood (HTS 4407)", "query": "sawn lumber wood"},
-        {"label": "Plywood (HTS 4412)", "query": "plywood wood panels"},
-        {"label": "Wood furniture (HTS 9403)", "query": "wood furniture"},
-        {"label": "Wood flooring (HTS 4418)", "query": "wood flooring"},
-        {"label": "Paper / paperboard (HTS 4801-4823)", "query": "paper paperboard"},
-    ],
-    "electronics": [
-        {"label": "Laptops / computers (HTS 8471)", "query": "laptop computers"},
-        {"label": "Smartphones (HTS 8517)", "query": "smartphones mobile phones"},
-        {"label": "Semiconductors (HTS 8542)", "query": "semiconductors integrated circuits"},
-        {"label": "Displays / monitors (HTS 8528)", "query": "monitors displays"},
-        {"label": "Circuit boards (HTS 8534)", "query": "printed circuit boards"},
-    ],
-    "food": [
-        {"label": "Fresh meat (HTS 0201-0210)", "query": "fresh meat beef pork"},
-        {"label": "Seafood / fish (HTS 0301-0307)", "query": "fresh fish seafood"},
-        {"label": "Dairy products (HTS 0401-0406)", "query": "dairy products cheese"},
-        {"label": "Grains / cereals (HTS 1001-1008)", "query": "grains wheat corn"},
-        {"label": "Processed food (HTS 1601-2106)", "query": "processed food products"},
-    ],
-}
 
 # Abbreviations and technical shortforms only.
 # The LLM handles full product names correctly — we only fix
@@ -264,55 +176,120 @@ def _semantic_set(query: str, result: Dict) -> None:
         logger.debug("semantic_set_failed error=%s", e)
 
 
-# ── Ambiguity detection ────────────────────────────────────────────────────────
+# ── Ambiguity detection — dynamic SQL-based, no hardcoding ───────────────────
 
 def _check_ambiguity(product: str, country: Optional[str]) -> Optional[Dict]:
     """
-    Check if the product is too broad to classify accurately.
-    Returns a clarification_needed dict if ambiguous, else None.
+    Dynamically checks if a product term is too broad by querying HTS_CODES.
 
-    Called after LLM extracts the product name so we check the
-    normalised product string, not the raw query.
+    Logic:
+    - Search HTS_CODES for the product term (limit 30 results)
+    - Count distinct 2-digit chapters in results
+    - If 3+ chapters → show chapter-level suggestions (very broad term)
+    - If 1-2 chapters but 3+ distinct 4-digit headings → show heading-level suggestions
+    - Suggestions use parent heading descriptions for context, not sub-descriptions
+    - Multi-word products (2+ words) skip this check — already specific enough
     """
     if not product:
         return None
 
     product_lower = product.lower().strip()
 
-    # Multi-word products are already specific enough — skip clarification
-    # e.g. "steel wire", "knitted garments", "flat-rolled steel" pass through
+    # Multi-word products are already specific enough
     if len(product_lower.split()) >= 2:
         return None
 
-    # Check direct match first
-    suggestions = AMBIGUOUS_PRODUCTS.get(product_lower)
+    try:
+        rows = tools.hts_keyword_search(product_lower, limit=30)
+    except Exception as e:
+        logger.debug("ambiguity_check_failed product=%s error=%s", product, e)
+        return None
 
-    # Check if any ambiguous key is the entire product string
-    if not suggestions:
-        for key, subs in AMBIGUOUS_PRODUCTS.items():
-            if product_lower == key:
-                suggestions = subs
-                break
+    if not rows:
+        return None
+
+    # Group by chapter and heading
+    chapter_map: Dict[str, list] = {}
+    heading_map: Dict[str, Dict] = {}
+
+    for r in rows:
+        code = r.get("hts_code", "")
+        if not code:
+            continue
+        chapter = code[:2]
+        parts = code.split(".")
+        heading = parts[0]  # 4-digit heading
+
+        if chapter not in chapter_map:
+            chapter_map[chapter] = []
+        chapter_map[chapter].append(r)
+
+        if heading not in heading_map:
+            heading_map[heading] = r
+
+    # Not ambiguous if 1-2 headings
+    if len(heading_map) <= 2:
+        return None
+
+    country_suffix = f" from {country}" if country else ""
+    suggestions = []
+
+    # Build suggestions — use the most specific meaningful description per heading
+    # Strategy: for each heading, find the row with the most descriptive text
+    # that doesn't start with "Of" or "Other" (those are sub-descriptions needing context)
+    seen_headings: Dict[str, Dict] = {}
+    for r in rows:
+        code = r.get("hts_code", "")
+        if not code:
+            continue
+        parts = code.split(".")
+        heading = parts[0]
+        desc = r.get("description", "").strip()
+        if not desc:
+            continue
+        # Prefer descriptions that don't start with relative terms
+        is_relative = desc.lower().startswith(("of ", "other", "not ", "nesoi", "except"))
+        existing = seen_headings.get(heading)
+        if not existing:
+            seen_headings[heading] = {**r, "_is_relative": is_relative}
+        elif is_relative is False and existing.get("_is_relative") is True:
+            # Replace with a more absolute description
+            seen_headings[heading] = {**r, "_is_relative": False}
+
+    for heading, row in list(seen_headings.items())[:6]:
+        # Try parent heading description first for context
+        parent_desc = tools.hts_description(heading)
+        desc = parent_desc if (parent_desc and not parent_desc.lower().startswith(
+            ("of ", "other", "not ", "nesoi"))) else row.get("description", "")
+        desc = desc.strip()
+        # Take first meaningful clause
+        desc_short = re.split(r"[;:]", desc)[0].strip()
+        desc_short = re.sub(r"\s+", " ", desc_short)
+        # Truncate if too long
+        if len(desc_short) > 60:
+            desc_short = desc_short[:57] + "..."
+        if len(desc_short) < 5:
+            continue
+        suggestions.append({
+            "label": f"{desc_short} (HTS {heading})",
+            "query": f"{desc_short.lower()}{country_suffix}",
+        })
 
     if not suggestions:
         return None
 
-    country_suffix = f" from {country}" if country else ""
+    logger.info("query_agent_ambiguous product=%s chapters=%d headings=%d",
+                product, len(chapter_map), len(heading_map))
+
     return {
         "clarification_needed": True,
         "product": product,
         "country": country,
         "message": (
-            f'"{product}" covers many different product types with different HTS codes and tariff rates. '
+            f'"{product}" matches {len(heading_map)} different HTS categories with different tariff rates. '
             f"Which type are you asking about{country_suffix}?"
         ),
-        "suggestions": [
-            {
-                "label": s["label"],
-                "query": f"{s['query']}{country_suffix}",
-            }
-            for s in suggestions
-        ],
+        "suggestions": suggestions,
     }
 
 
@@ -355,10 +332,8 @@ def _norm_product(p: Optional[str]) -> Optional[str]:
     if not p:
         return None
     n = " ".join(p.lower().strip().split())
-    # Exact match first
     if n in PRODUCT_ALIASES:
         return PRODUCT_ALIASES[n]
-    # Whole-word match only — prevents "garments" matching "knitted garments"
     for alias, canonical in PRODUCT_ALIASES.items():
         if re.search(r'\b' + re.escape(alias) + r'\b', n) and canonical:
             return canonical
@@ -440,11 +415,10 @@ def run_query_agent(state: TariffState) -> Dict[str, Any]:
                     time.sleep(delay)
                 continue
 
-            # Ambiguity check — before caching or returning
+            # Dynamic ambiguity check — SQL-based, no hardcoding
             clarification = _check_ambiguity(product, country)
             if clarification:
                 logger.info("query_agent_ambiguous product=%s — requesting clarification", product)
-                # Don't cache clarification responses
                 return clarification
 
             logger.info("query_agent_done product=%s country=%s", product, country)

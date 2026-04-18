@@ -24,7 +24,7 @@ from agents import tools
 
 logger = logging.getLogger(__name__)
 
-HITL_THRESHOLD = 0.80
+HITL_THRESHOLD = 0.65
 
 TRANSLATE_PROMPT = """Given this common product name, return the HTS classification details.
 
