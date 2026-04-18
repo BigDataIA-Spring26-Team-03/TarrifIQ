@@ -163,6 +163,18 @@ async def query(request: QueryRequest):
     logger.info("query_received", query=request.query)
     try:
         result = run_pipeline(request.query)
+
+        # Short-circuit: query agent detected ambiguity
+        if result.get("clarification_needed"):
+            return {
+                "status": "clarification_needed",
+                "query": request.query,
+                "product": result.get("product"),
+                "country": result.get("country"),
+                "message": result.get("clarification_message"),
+                "suggestions": result.get("clarification_suggestions", []),
+            }
+
         return {
             "status": "ok",
             "query": request.query,
