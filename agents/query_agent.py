@@ -9,7 +9,8 @@ Changes from main:
   - Router system prompt returns country="all" on no match — we normalize
     that to None so the rest of the pipeline sees null as expected.
   - Added semantic Redis cache layer (cosine >= 0.92) on top of exact cache.
-  - Extended product + country alias tables.
+  - Ambiguity detection: broad product terms trigger clarification_needed
+    response with HTS subcategory suggestions instead of running the pipeline.
 """
 
 import asyncio
@@ -43,32 +44,103 @@ TARIFF_SIGNALS = [
     "section 301", "section 232", "ieepa", "trade", "supply chain",
 ]
 
+# Broad product terms that need clarification before classification
+# Maps generic term → list of (display label, suggested query suffix)
+AMBIGUOUS_PRODUCTS: Dict[str, List[Dict[str, str]]] = {
+    "steel": [
+        {"label": "Steel sheets / flat-rolled (HTS 7208)", "query": "flat-rolled steel sheets"},
+        {"label": "Steel wire (HTS 7217)", "query": "steel wire drawn"},
+        {"label": "Steel bars / rods (HTS 7214)", "query": "steel bars and rods"},
+        {"label": "Steel pipes / tubes (HTS 7304)", "query": "steel pipes and tubes"},
+        {"label": "Steel angles / sections (HTS 7216)", "query": "steel structural sections"},
+        {"label": "Stainless steel (HTS 7219)", "query": "stainless steel flat-rolled"},
+    ],
+    "aluminum": [
+        {"label": "Aluminum sheets / plates (HTS 7606)", "query": "aluminum sheets and plates"},
+        {"label": "Aluminum bars / rods (HTS 7604)", "query": "aluminum bars and rods"},
+        {"label": "Aluminum wire (HTS 7605)", "query": "aluminum wire"},
+        {"label": "Aluminum tubes / pipes (HTS 7608)", "query": "aluminum tubes and pipes"},
+        {"label": "Aluminum structures (HTS 7610)", "query": "aluminum structures"},
+    ],
+    "aluminium": [
+        {"label": "Aluminium sheets / plates (HTS 7606)", "query": "aluminium sheets and plates"},
+        {"label": "Aluminium bars / rods (HTS 7604)", "query": "aluminium bars and rods"},
+        {"label": "Aluminium wire (HTS 7605)", "query": "aluminium wire"},
+    ],
+    "clothes": [
+        {"label": "T-shirts / knitted tops (HTS 6109)", "query": "knitted t-shirts cotton"},
+        {"label": "Woven shirts (HTS 6205)", "query": "woven men shirts"},
+        {"label": "Trousers / pants (HTS 6203)", "query": "woven trousers pants"},
+        {"label": "Dresses / skirts (HTS 6204)", "query": "women dresses skirts"},
+        {"label": "Jackets / outerwear (HTS 6201)", "query": "men outerwear jackets"},
+        {"label": "Underwear / socks (HTS 6107)", "query": "knitted underwear socks"},
+    ],
+    "clothing": [
+        {"label": "T-shirts / knitted tops (HTS 6109)", "query": "knitted t-shirts cotton"},
+        {"label": "Woven shirts (HTS 6205)", "query": "woven shirts"},
+        {"label": "Trousers / pants (HTS 6203)", "query": "trousers pants"},
+        {"label": "Outerwear / jackets (HTS 6201)", "query": "outerwear jackets"},
+    ],
+    "apparel": [
+        {"label": "Knitted garments (HTS 6109-6114)", "query": "knitted garments"},
+        {"label": "Woven garments (HTS 6201-6217)", "query": "woven garments"},
+        {"label": "Underwear / hosiery (HTS 6107-6117)", "query": "underwear hosiery"},
+    ],
+    "chemicals": [
+        {"label": "Organic chemicals (HTS 2901-2942)", "query": "organic chemicals"},
+        {"label": "Inorganic chemicals (HTS 2801-2853)", "query": "inorganic chemicals"},
+        {"label": "Plastics / polymers (HTS 3901-3926)", "query": "plastics polymers"},
+        {"label": "Pharmaceutical products (HTS 3001-3006)", "query": "pharmaceutical chemicals"},
+        {"label": "Fertilizers (HTS 3101-3105)", "query": "fertilizers"},
+    ],
+    "machinery": [
+        {"label": "Industrial machines (HTS 8417-8480)", "query": "industrial machinery"},
+        {"label": "Construction equipment (HTS 8425-8430)", "query": "construction machinery"},
+        {"label": "Agricultural machinery (HTS 8432-8436)", "query": "agricultural machinery"},
+        {"label": "Machine tools (HTS 8456-8466)", "query": "machine tools"},
+    ],
+    "plastics": [
+        {"label": "Plastic sheets / film (HTS 3920)", "query": "plastic sheets film"},
+        {"label": "Plastic tubes / pipes (HTS 3917)", "query": "plastic pipes tubes"},
+        {"label": "Plastic containers (HTS 3923)", "query": "plastic containers packaging"},
+        {"label": "Plastic articles (HTS 3926)", "query": "plastic articles"},
+    ],
+    "wood": [
+        {"label": "Lumber / sawn wood (HTS 4407)", "query": "sawn lumber wood"},
+        {"label": "Plywood (HTS 4412)", "query": "plywood wood panels"},
+        {"label": "Wood furniture (HTS 9403)", "query": "wood furniture"},
+        {"label": "Wood flooring (HTS 4418)", "query": "wood flooring"},
+        {"label": "Paper / paperboard (HTS 4801-4823)", "query": "paper paperboard"},
+    ],
+    "electronics": [
+        {"label": "Laptops / computers (HTS 8471)", "query": "laptop computers"},
+        {"label": "Smartphones (HTS 8517)", "query": "smartphones mobile phones"},
+        {"label": "Semiconductors (HTS 8542)", "query": "semiconductors integrated circuits"},
+        {"label": "Displays / monitors (HTS 8528)", "query": "monitors displays"},
+        {"label": "Circuit boards (HTS 8534)", "query": "printed circuit boards"},
+    ],
+    "food": [
+        {"label": "Fresh meat (HTS 0201-0210)", "query": "fresh meat beef pork"},
+        {"label": "Seafood / fish (HTS 0301-0307)", "query": "fresh fish seafood"},
+        {"label": "Dairy products (HTS 0401-0406)", "query": "dairy products cheese"},
+        {"label": "Grains / cereals (HTS 1001-1008)", "query": "grains wheat corn"},
+        {"label": "Processed food (HTS 1601-2106)", "query": "processed food products"},
+    ],
+}
+
+# Abbreviations and technical shortforms only.
+# The LLM handles full product names correctly — we only fix
+# things the LLM consistently gets wrong (acronyms, shortforms).
 PRODUCT_ALIASES: Dict[str, str] = {
     "ev": "electric vehicles", "evs": "electric vehicles",
-    "electric car": "electric vehicles", "electric cars": "electric vehicles",
     "bev": "electric vehicles", "phev": "electric vehicles",
-    "chips": "semiconductors", "microchips": "semiconductors",
-    "integrated circuits": "semiconductors", "ics": "semiconductors",
+    "ics": "semiconductors",
     "cpu": "semiconductors", "gpu": "semiconductors",
-    "wafer": "semiconductors", "wafers": "semiconductors",
-    "solar cells": "solar panels", "pv modules": "solar panels",
-    "photovoltaics": "solar panels", "pv panels": "solar panels",
-    "notebook computers": "laptops", "notebooks": "laptops",
-    "portable computers": "laptops",
-    "phones": "smartphones", "mobile phones": "smartphones",
-    "cell phones": "smartphones", "handsets": "smartphones",
-    "lcd": "flat panel displays", "oled displays": "flat panel displays",
-    "flat panel": "flat panel displays",
-    "aluminium": "aluminum", "aluminum products": "aluminum",
-    "steel products": "steel", "flat rolled steel": "steel",
+    "pv": "solar panels",
+    "lcd": "flat panel displays",
     "hrc": "hot-rolled steel", "crc": "cold-rolled steel",
-    "stainless": "stainless steel",
-    "crude": "crude oil", "petroleum": "crude oil",
     "lng": "liquefied natural gas",
-    "clothes": "apparel", "clothing": "apparel", "garments": "apparel",
-    "furniture products": "furniture", "wood furniture": "furniture",
-    "lithium batteries": "lithium-ion batteries",
-    "li-ion": "lithium-ion batteries", "ev batteries": "lithium-ion batteries",
+    "li-ion": "lithium-ion batteries",
 }
 
 COUNTRY_ALIASES: Dict[str, str] = {
@@ -192,6 +264,58 @@ def _semantic_set(query: str, result: Dict) -> None:
         logger.debug("semantic_set_failed error=%s", e)
 
 
+# ── Ambiguity detection ────────────────────────────────────────────────────────
+
+def _check_ambiguity(product: str, country: Optional[str]) -> Optional[Dict]:
+    """
+    Check if the product is too broad to classify accurately.
+    Returns a clarification_needed dict if ambiguous, else None.
+
+    Called after LLM extracts the product name so we check the
+    normalised product string, not the raw query.
+    """
+    if not product:
+        return None
+
+    product_lower = product.lower().strip()
+
+    # Multi-word products are already specific enough — skip clarification
+    # e.g. "steel wire", "knitted garments", "flat-rolled steel" pass through
+    if len(product_lower.split()) >= 2:
+        return None
+
+    # Check direct match first
+    suggestions = AMBIGUOUS_PRODUCTS.get(product_lower)
+
+    # Check if any ambiguous key is the entire product string
+    if not suggestions:
+        for key, subs in AMBIGUOUS_PRODUCTS.items():
+            if product_lower == key:
+                suggestions = subs
+                break
+
+    if not suggestions:
+        return None
+
+    country_suffix = f" from {country}" if country else ""
+    return {
+        "clarification_needed": True,
+        "product": product,
+        "country": country,
+        "message": (
+            f'"{product}" covers many different product types with different HTS codes and tariff rates. '
+            f"Which type are you asking about{country_suffix}?"
+        ),
+        "suggestions": [
+            {
+                "label": s["label"],
+                "query": f"{s['query']}{country_suffix}",
+            }
+            for s in suggestions
+        ],
+    }
+
+
 # ── Validation + normalisation ─────────────────────────────────────────────────
 
 def _validate(query: str):
@@ -231,10 +355,12 @@ def _norm_product(p: Optional[str]) -> Optional[str]:
     if not p:
         return None
     n = " ".join(p.lower().strip().split())
+    # Exact match first
     if n in PRODUCT_ALIASES:
         return PRODUCT_ALIASES[n]
+    # Whole-word match only — prevents "garments" matching "knitted garments"
     for alias, canonical in PRODUCT_ALIASES.items():
-        if alias in n and canonical:
+        if re.search(r'\b' + re.escape(alias) + r'\b', n) and canonical:
             return canonical
     return n or None
 
@@ -285,7 +411,6 @@ def run_query_agent(state: TariffState) -> Dict[str, Any]:
 
     for attempt, delay in enumerate(RETRY_DELAYS[:MAX_RETRIES]):
         try:
-            # Router is async — run it in a new event loop (pipeline is sync)
             loop = asyncio.new_event_loop()
             try:
                 resp = loop.run_until_complete(
@@ -315,6 +440,13 @@ def run_query_agent(state: TariffState) -> Dict[str, Any]:
                     time.sleep(delay)
                 continue
 
+            # Ambiguity check — before caching or returning
+            clarification = _check_ambiguity(product, country)
+            if clarification:
+                logger.info("query_agent_ambiguous product=%s — requesting clarification", product)
+                # Don't cache clarification responses
+                return clarification
+
             logger.info("query_agent_done product=%s country=%s", product, country)
             result = {"product": product, "country": country}
             _exact_set(query, result)
@@ -322,7 +454,6 @@ def run_query_agent(state: TariffState) -> Dict[str, Any]:
             return result
 
         except RuntimeError as e:
-            # Budget exhausted or all models failed
             last_error = str(e)
             logger.error("query_agent_router_failed error=%s", e)
             break

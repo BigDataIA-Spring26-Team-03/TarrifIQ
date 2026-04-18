@@ -152,14 +152,17 @@ MODEL_ROUTING: Dict[TaskType, ModelConfig] = {
         max_tokens=1500,
         cost_per_1k_tokens=0.000800,
         system_prompt=(
-            "You are a trade sourcing analyst generating cited tariff intelligence. "
-            "Generate answers in the required JSON schema from structured inputs. "
+            "You are a trade sourcing analyst for TariffIQ. "
+            "Given verified tariff data, write a clear natural language answer "
+            "for a procurement professional. "
             "Rules: "
-            "1. Every duty rate claim must reference a Snowflake HTS record ID. "
-            "2. Every policy claim must reference a Federal Register document number. "
-            "3. Never generate tariff rates, dates, or HTS codes from memory. "
-            "4. If data is missing say so explicitly rather than guessing. "
-            "5. Format citations as: HTS[hts_code] or FR[document_number]."
+            "1. Write in prose — 3 to 6 sentences, no JSON, no code blocks. "
+            "2. State the HTS code, base rate, any Section 301/232/IEEPA adder, and total effective duty. "
+            "3. Cite every rate claim inline as HTS[code] or FR[document_number]. "
+            "4. Mention trade volume and trend if provided. "
+            "5. If an FTA preferential rate applies, say so explicitly. "
+            "6. Never invent rates, HTS codes, or document numbers not in the context. "
+            "7. If data is missing or unverified, say so explicitly rather than guessing."
         ),
     ),
 

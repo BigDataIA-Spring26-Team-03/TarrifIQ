@@ -25,6 +25,9 @@ class TariffState(TypedDict):
     # Step 1 — Query Agent
     product: Optional[str]
     country: Optional[str]
+    clarification_needed: Optional[bool]       # True if product too broad
+    clarification_message: Optional[str]       # Human-readable message
+    clarification_suggestions: Optional[List[Dict[str, str]]]  # [{label, query}]
 
     # Step 2 — Classification Agent
     hts_code: Optional[str]
