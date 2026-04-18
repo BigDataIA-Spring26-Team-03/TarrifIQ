@@ -15,9 +15,11 @@ Pipeline latency logged in ms on every run.
 
 import logging
 import time
+import uuid
 from typing import Dict, Any
 
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from agents.state import TariffState
 from agents.query_agent import run_query_agent
@@ -35,7 +37,17 @@ logger = logging.getLogger(__name__)
 # ── Node wrappers ──────────────────────────────────────────────────────────────
 
 def query_node(state: TariffState) -> Dict[str, Any]:
-    return run_query_agent(state)
+    result = run_query_agent(state)
+    # If query agent detected ambiguity, mark for short-circuit
+    if result.get("clarification_needed"):
+        return {
+            "clarification_needed": True,
+            "clarification_message": result.get("message"),
+            "clarification_suggestions": result.get("suggestions", []),
+            "product": result.get("product"),
+            "country": result.get("country"),
+        }
+    return result
 
 
 def classification_node(state: TariffState) -> Dict[str, Any]:
@@ -93,6 +105,12 @@ def hitl_node(state: TariffState) -> Dict[str, Any]:
 
 # ── Conditional edges ──────────────────────────────────────────────────────────
 
+def after_query(state: TariffState) -> str:
+    if state.get("clarification_needed"):
+        return "end"
+    return "classify"
+
+
 def after_classification(state: TariffState) -> str:
     if state.get("hitl_required") and state.get("hitl_reason") == "low_confidence":
         return "hitl"
@@ -120,7 +138,10 @@ def build_graph() -> StateGraph:
     wf.add_node("hitl_step",       hitl_node)
 
     wf.set_entry_point("query_step")
-    wf.add_edge("query_step",      "classify_step")
+    wf.add_conditional_edges(
+        "query_step", after_query,
+        {"classify": "classify_step", "end": END},
+    )
     wf.add_conditional_edges(
         "classify_step", after_classification,
         {"base_rate": "base_rate_step", "hitl": "hitl_step"},
@@ -135,7 +156,7 @@ def build_graph() -> StateGraph:
     )
     wf.add_edge("hitl_step", END)
 
-    return wf.compile()
+    return wf.compile(checkpointer=MemorySaver())
 
 
 tariff_graph = build_graph()
@@ -150,6 +171,7 @@ def run_pipeline(query: str) -> Dict[str, Any]:
     initial_state: TariffState = {
         "query": query,
         "product": None, "country": None,
+        "clarification_needed": None, "clarification_message": None, "clarification_suggestions": None,
         "hts_code": None, "hts_description": None, "classification_confidence": None,
         "base_rate": None, "mfn_rate": None, "fta_rate": None, "fta_program": None, "fta_applied": None, "rate_record_id": None, "hts_footnotes": None,
         "policy_chunks": None, "policy_summary": None,
@@ -164,7 +186,8 @@ def run_pipeline(query: str) -> Dict[str, Any]:
         "error": None,
     }
 
-    result = tariff_graph.invoke(initial_state)
+    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    result = tariff_graph.invoke(initial_state, config=config)
     elapsed_ms = round((time.monotonic() - t0) * 1000)
     logger.info("pipeline_done query=%s hitl=%s latency_ms=%d",
                 query[:60], result.get("hitl_required"), elapsed_ms)

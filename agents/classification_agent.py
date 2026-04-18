@@ -98,16 +98,15 @@ def _layer2_keyword(
     hts_chapter: Optional[str],
     hts_heading: Optional[str],
 ) -> Optional[Tuple[str, str, float]]:
-    # Heading-scoped first
+    # Heading-scoped first — use product name and each term separately
+    # to avoid the LIKE filter killing valid results
     if hts_heading:
-        rows = tools.hts_keyword_search(
-            query=" ".join(technical_terms) if technical_terms else product,
-            limit=1, heading_filter=hts_heading,
-        )
-        if rows:
-            r = rows[0]
-            logger.info("classify_layer2_heading product=%s hts=%s", product, r["hts_code"])
-            return r["hts_code"], r["description"], 0.85
+        for q in ([product] + (technical_terms or [])):
+            rows = tools.hts_keyword_search(query=q, limit=1, heading_filter=hts_heading)
+            if rows:
+                r = rows[0]
+                logger.info("classify_layer2_heading product=%s hts=%s query=%s", product, r["hts_code"], q)
+                return r["hts_code"], r["description"], 0.85
 
     # Term-by-term
     search_terms = technical_terms if technical_terms else [

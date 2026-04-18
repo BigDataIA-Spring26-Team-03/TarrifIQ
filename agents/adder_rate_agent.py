@@ -130,6 +130,77 @@ def _regex_fallback(chunks: List[Dict[str, Any]], hts_code: str) -> float:
     return 0.0
 
 
+def _fetch_notice_snippets(hts_code: str, country: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Fetch context snippets directly from NOTICE_HTS_CODES and
+    CBP_NOTICE_HTS_CODES tables for this HTS code.
+    These tables store pre-extracted snippets from FR documents
+    that explicitly mention this HTS code — more targeted than
+    ChromaDB vector search for rate extraction.
+    """
+    snippets = []
+    country_lower = (country or "").lower().strip()
+    is_china = country_lower in ("china", "prc", "people's republic of china")
+
+    try:
+        conn = tools._sf()
+        cur = conn.cursor()
+
+        # Try full code first, then progressively shorter prefixes
+        codes_to_try = [hts_code]
+        parts = hts_code.split(".")
+        while len(parts) > 2:
+            parts = parts[:-1]
+            codes_to_try.append(".".join(parts))
+
+        for table, fr_table in [
+            ("NOTICE_HTS_CODES", "FEDERAL_REGISTER_NOTICES"),
+            ("CBP_NOTICE_HTS_CODES", "CBP_FEDERAL_REGISTER_NOTICES"),
+        ]:
+            for code in codes_to_try:
+                try:
+                    cur.execute(
+                        f"""
+                        SELECT n.document_number, n.context_snippet,
+                               f.title, f.publication_date
+                        FROM TARIFFIQ.RAW.{table} n
+                        LEFT JOIN TARIFFIQ.RAW.{fr_table} f
+                            ON n.document_number = f.document_number
+                        WHERE n.hts_code = %s
+                        ORDER BY f.publication_date DESC NULLS LAST
+                        LIMIT 5
+                        """,
+                        (code,),
+                    )
+                    rows = cur.fetchall()
+                    for doc_num, snippet, title, pub_date in rows:
+                        if not snippet:
+                            continue
+                        # For China-specific notices, filter by country
+                        if title and any(kw in title.lower() for kw in ["china", "chinese"]):
+                            if not is_china:
+                                continue
+                        snippets.append({
+                            "document_number": doc_num,
+                            "chunk_text": snippet,
+                            "source": "CBP" if "CBP" in table else "USTR",
+                            "publication_date": str(pub_date) if pub_date else "",
+                        })
+                    if snippets:
+                        break  # Found results for this code, stop trying shorter prefixes
+                except Exception:
+                    continue
+            if snippets:
+                break
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.debug("adder_fetch_snippets_error hts=%s error=%s", hts_code, e)
+
+    return snippets
+
+
 def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     hts_code = (state.get("hts_code") or "").strip()
     country = state.get("country")
@@ -153,17 +224,79 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
         cached["total_duty"] = round(base_rate + adder, 4)
         return cached
 
-    if not policy_chunks:
+    # ── Step 0: Chapter 99 footnote lookup (most reliable, pure SQL) ────────
+    # HTS_CODES footnotes contain Chapter 99 references like "See 9903.88.15"
+    # These map directly to the adder rate without any LLM or regex needed.
+    hts_footnotes = state.get("hts_footnotes") or []
+    chapter99_codes = []
+    for fn in hts_footnotes:
+        # Extract codes like 9903.88.15 from footnote strings
+        import re as _re
+        matches = _re.findall(r"9903\.\d{2}\.\d{2}", str(fn))
+        chapter99_codes.extend(matches)
+
+    if chapter99_codes:
+        ch99_result = tools.chapter99_lookup(chapter99_codes, country=country)
+        if ch99_result and ch99_result.get("adder_rate", 0) > 0:
+            adder_val = ch99_result["adder_rate"]
+            ch99_code = ch99_result["chapter99_code"]
+            total = round(base_rate + adder_val, 4)
+            logger.info("adder_rate_chapter99 hts=%s country=%s code=%s rate=%.1f",
+                        hts_code, country, ch99_code, adder_val)
+            result = {
+                "adder_rate": adder_val,
+                "adder_doc": ch99_code,
+                "adder_method": "chapter99_lookup",
+                "total_duty": total,
+            }
+            _cache_set(hts_code, country, result)
+            return result
+
+    # ── Step 1: Extract Chapter 99 codes from NOTICE_HTS_CODES snippets ────
+    # Even if hts_footnotes is empty, NOTICE_HTS_CODES context_snippets
+    # often contain Chapter 99 code references like "9903.88.03" or "9903.90.07"
+    # Extract those and look them up directly in HTS_CODES for the rate.
+    if not chapter99_codes:
+        notice_ch99 = tools.fetch_chapter99_from_notices(hts_code)
+        if notice_ch99:
+            chapter99_codes.extend(notice_ch99)
+            ch99_result = tools.chapter99_lookup(chapter99_codes, country=country)
+            if ch99_result and ch99_result.get("adder_rate", 0) > 0:
+                adder_val = ch99_result["adder_rate"]
+                ch99_code = ch99_result["chapter99_code"]
+                total = round(base_rate + adder_val, 4)
+                logger.info("adder_rate_notice_ch99 hts=%s country=%s code=%s rate=%.1f",
+                            hts_code, country, ch99_code, adder_val)
+                result = {
+                    "adder_rate": adder_val,
+                    "adder_doc": ch99_code,
+                    "adder_method": "chapter99_lookup",
+                    "total_duty": total,
+                }
+                _cache_set(hts_code, country, result)
+                return result
+
+    # ── Step 2: Fetch targeted snippets from NOTICE_HTS_CODES + CBP tables ──
+    notice_snippets = _fetch_notice_snippets(hts_code, country)
+    if notice_snippets:
+        logger.info("adder_rate_notice_snippets hts=%s count=%d", hts_code, len(notice_snippets))
+
+    # Combine: notice snippets first (more targeted), then ChromaDB chunks
+    all_chunks = notice_snippets + policy_chunks
+
+    if not all_chunks:
         result = {"adder_rate": 0.0, "adder_doc": None, "adder_method": "none",
                   "total_duty": round(base_rate, 4)}
         _cache_set(hts_code, country, result)
         return result
 
     valid_docs: Set[str] = {
-        c.get("document_number", "") for c in policy_chunks
+        c.get("document_number", "") for c in all_chunks
         if c.get("document_number")
     }
-    context = _build_context(policy_chunks)
+    # Use all_chunks for context, not just policy_chunks
+    policy_chunks = all_chunks
+    context = _build_context(all_chunks)
 
     # LLM call via ModelRouter — POLICY_ANALYSIS task (claude-haiku)
     from services.llm.router import get_router, TaskType
