@@ -218,6 +218,10 @@ def hts_base_rate_lookup(hts_code: str, country: Optional[str] = None) -> Option
                     logger.info("hts_base_rate_fallback original=%s resolved=%s", hts_code, code)
 
                 db_hts, description, general_rate_str, special_rate, footnotes_raw = row
+
+                # Skip header rows with no rate — fall through to child lookup
+                if not general_rate_str or not general_rate_str.strip():
+                    continue
                 mfn_rate = _parse_rate_string(general_rate_str or "")
                 footnotes = _parse_footnotes(footnotes_raw)
 
@@ -246,6 +250,48 @@ def hts_base_rate_lookup(hts_code: str, country: Optional[str] = None) -> Option
                     "fta_applied": fta_applied,
                     "footnotes": footnotes,
                 }
+
+        # Last resort: find first child code with a rate under this parent
+        cur.execute(
+            """
+            SELECT hts_code, description, general_rate, special_rate, footnotes
+            FROM TARIFFIQ.RAW.HTS_CODES
+            WHERE hts_code LIKE %s
+              AND is_header_row = FALSE
+              AND general_rate IS NOT NULL
+              AND chapter NOT IN ('98','99')
+            ORDER BY hts_code ASC
+            LIMIT 1
+            """,
+            (hts_code.replace(".", "") + "%",) if "." not in hts_code else (hts_code + "%",),
+        )
+        row = cur.fetchone()
+        if row:
+            logger.info("hts_base_rate_child_fallback original=%s resolved=%s", hts_code, row[0])
+            db_hts, description, general_rate_str, special_rate, footnotes_raw = row
+            mfn_rate = _parse_rate_string(general_rate_str or "")
+            footnotes = _parse_footnotes(footnotes_raw)
+            fta_result = _parse_fta_rate(special_rate or "", country)
+            if fta_result:
+                fta_rate, fta_program = fta_result
+                effective_rate = fta_rate
+                fta_applied = True
+            else:
+                fta_rate = None
+                fta_program = None
+                fta_applied = False
+                effective_rate = mfn_rate
+            return {
+                "hts_code": db_hts,
+                "description": description,
+                "base_rate": effective_rate,
+                "general_rate_str": general_rate_str or "",
+                "mfn_rate": mfn_rate,
+                "fta_rate": fta_rate,
+                "fta_program": fta_program,
+                "fta_applied": fta_applied,
+                "footnotes": footnotes,
+            }
 
         return None
     except Exception as e:
@@ -360,9 +406,20 @@ def hts_verify(hts_code: str) -> bool:
     conn = _sf()
     cur = conn.cursor()
     try:
+        # Accept if exact code has a rate, OR if it has children with rates
         cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code = %s LIMIT 1",
+            "SELECT 1 FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code = %s "
+            "AND is_header_row = FALSE AND general_rate IS NOT NULL LIMIT 1",
             (hts_code,),
+        )
+        if cur.fetchone():
+            return True
+        # Check if children exist with rates (handles 4-digit parent codes like 6114)
+        prefix = hts_code + "%" if "." in hts_code else hts_code + "%"
+        cur.execute(
+            "SELECT 1 FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code LIKE %s "
+            "AND is_header_row = FALSE AND general_rate IS NOT NULL LIMIT 1",
+            (prefix,),
         )
         return cur.fetchone() is not None
     except Exception as e:
@@ -643,6 +700,126 @@ def write_hitl_record(
 
 
 # ── TOOL 12 — census_trade_flow ───────────────────────────────────────────────
+
+# ── TOOL 13 — chapter99_lookup ───────────────────────────────────────────────
+
+def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Look up Chapter 99 surcharge codes directly in HTS_CODES.
+    These codes (e.g. 9903.88.01, 9903.91.06) contain the actual adder rate
+    in their general_rate field as "The duty provided in the applicable subheading + X%".
+
+    Returns the highest applicable adder rate found, with its source code.
+    Filters China-specific codes (9903.88.xx, 9903.91.xx) by country.
+    """
+    if not chapter99_codes:
+        return None
+
+    country_lower = (country or "").lower().strip()
+    is_china = country_lower in ("china", "prc", "people's republic of china")
+
+    conn = _sf()
+    cur = conn.cursor()
+    best_rate = 0.0
+    best_code = None
+    best_desc = None
+
+    try:
+        for code in chapter99_codes:
+            code = code.strip()
+            if not code.startswith("99"):
+                continue
+
+            # China-specific codes — only apply if country is China
+            if code.startswith("9903.88") or code.startswith("9903.91"):
+                if not is_china:
+                    continue
+
+            cur.execute(
+                "SELECT hts_code, general_rate, description FROM TARIFFIQ.RAW.HTS_CODES "
+                "WHERE hts_code = %s LIMIT 1",
+                (code,),
+            )
+            row = cur.fetchone()
+            if not row:
+                continue
+
+            hts_code, general_rate_str, description = row
+            if not general_rate_str:
+                continue
+
+            # Parse rate from strings like:
+            # "The duty provided in the applicable subheading + 25%"
+            # "The duty provided in the applicable subheading plus 7.5%"
+            m = re.search(r"\+\s*(\d+(?:\.\d+)?)\s*%", general_rate_str)
+            if not m:
+                m = re.search(r"plus\s+(\d+(?:\.\d+)?)\s*%", general_rate_str, re.IGNORECASE)
+            if m:
+                rate = float(m.group(1))
+                if rate > best_rate:
+                    best_rate = rate
+                    best_code = hts_code
+                    best_desc = description
+                    logger.info("chapter99_lookup found code=%s rate=%.1f country=%s",
+                                code, rate, country)
+
+        if best_code:
+            return {"adder_rate": best_rate, "chapter99_code": best_code, "description": best_desc}
+        return None
+
+    except Exception as e:
+        logger.error("chapter99_lookup_error error=%s", e)
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── TOOL 14 — fetch_chapter99_from_notices ───────────────────────────────────
+
+def fetch_chapter99_from_notices(hts_code: str) -> List[str]:
+    """
+    Scan NOTICE_HTS_CODES and CBP_NOTICE_HTS_CODES context_snippets
+    for Chapter 99 code references (9903.xx.xx pattern).
+    Returns list of unique Chapter 99 codes found.
+    Used when hts_footnotes is empty but notices contain Chapter 99 references.
+    """
+    codes = set()
+    conn = _sf()
+    cur = conn.cursor()
+    try:
+        codes_to_try = [hts_code]
+        parts = hts_code.split(".")
+        while len(parts) > 2:
+            parts = parts[:-1]
+            codes_to_try.append(".".join(parts))
+
+        for table in ["NOTICE_HTS_CODES", "CBP_NOTICE_HTS_CODES"]:
+            for code in codes_to_try:
+                try:
+                    cur.execute(
+                        f"SELECT context_snippet FROM TARIFFIQ.RAW.{table} "
+                        f"WHERE hts_code = %s AND context_snippet IS NOT NULL LIMIT 10",
+                        (code,),
+                    )
+                    for (snippet,) in cur.fetchall():
+                        if not snippet:
+                            continue
+                        matches = re.findall(r"9903\.\d{2}\.\d{2}", snippet)
+                        codes.update(matches)
+                except Exception:
+                    continue
+
+        if codes:
+            logger.info("fetch_chapter99_from_notices hts=%s found=%s", hts_code, codes)
+        return list(codes)
+    except Exception as e:
+        logger.error("fetch_chapter99_from_notices_error hts=%s error=%s", hts_code, e)
+        return []
+    finally:
+        cur.close()
+        conn.close()
+
 
 def census_trade_flow(hts_code: str) -> Dict[str, Any]:
     """Live Census Bureau API — fetches most recent available month."""
