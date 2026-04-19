@@ -204,6 +204,9 @@ async def query(request: QueryRequest):
             "trade_trend_label": result.get("trade_trend_label"),
             "final_response": result.get("final_response"),
             "citations": result.get("citations"),
+            "country_comparison": result.get("country_comparison"),
+            "rate_change_history": result.get("rate_change_history"),
+            "query_intent": result.get("query_intent"),
             "hitl_required": result.get("hitl_required"),
             "hitl_reason": result.get("hitl_reason"),
             "error": result.get("error"),
@@ -213,3 +216,16 @@ async def query(request: QueryRequest):
         tb = traceback.format_exc()
         logger.error("query_pipeline_failed", error=str(e), traceback=tb)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/hitl/feedback", response_model=dict, tags=["Core"])
+async def hitl_feedback(hitl_id: str, correct_hts: str, notes: str = ""):
+    """
+    Submit human decision for a HITL escalation.
+    Writes correct HTS back to PRODUCT_ALIASES for self-improvement.
+    """
+    from agents import tools as agent_tools
+    success = agent_tools.hitl_feedback_write(hitl_id, correct_hts, notes)
+    if success:
+        return {"status": "ok", "hitl_id": hitl_id, "correct_hts": correct_hts}
+    raise HTTPException(status_code=500, detail="Failed to write HITL feedback")

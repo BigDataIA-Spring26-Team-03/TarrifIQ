@@ -720,9 +720,10 @@ def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) 
 
     conn = _sf()
     cur = conn.cursor()
-    best_rate = 0.0
-    best_code = None
-    best_desc = None
+    total_rate = 0.0
+    applied_codes = []
+    primary_code = None
+    primary_desc = None
 
     try:
         for code in chapter99_codes:
@@ -756,15 +757,23 @@ def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) 
                 m = re.search(r"plus\s+(\d+(?:\.\d+)?)\s*%", general_rate_str, re.IGNORECASE)
             if m:
                 rate = float(m.group(1))
-                if rate > best_rate:
-                    best_rate = rate
-                    best_code = hts_code
-                    best_desc = description
-                    logger.info("chapter99_lookup found code=%s rate=%.1f country=%s",
-                                code, rate, country)
+                # IEEPA stacking: sum all applicable Chapter 99 rates
+                # e.g. 9903.88.15 (7.5% Section 301) + 9903.91.06 (25% IEEPA) = 32.5%
+                total_rate += rate
+                applied_codes.append(hts_code)
+                if primary_code is None:
+                    primary_code = hts_code
+                    primary_desc = description
+                logger.info("chapter99_lookup found code=%s rate=%.1f total_so_far=%.1f country=%s",
+                            code, rate, total_rate, country)
 
-        if best_code:
-            return {"adder_rate": best_rate, "chapter99_code": best_code, "description": best_desc}
+        if applied_codes:
+            return {
+                "adder_rate": total_rate,
+                "chapter99_code": applied_codes[-1],  # most recently added (most recent notice)
+                "chapter99_codes": applied_codes,     # all applied codes
+                "description": primary_desc,
+            }
         return None
 
     except Exception as e:
@@ -816,6 +825,139 @@ def fetch_chapter99_from_notices(hts_code: str) -> List[str]:
     except Exception as e:
         logger.error("fetch_chapter99_from_notices_error hts=%s error=%s", hts_code, e)
         return []
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── TOOL 15 — fetch_rate_change_history ─────────────────────────────────────
+
+def fetch_rate_change_history(hts_code: str, country: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch Federal Register notices that reference this HTS code,
+    ordered by publication date descending.
+    Used for "has the tariff changed?" queries.
+    Returns list of {document_number, title, publication_date, source}
+    """
+    if not hts_code:
+        return []
+
+    conn = _sf()
+    cur = conn.cursor()
+    history = []
+    seen = set()
+
+    try:
+        codes_to_try = [hts_code]
+        parts = hts_code.split(".")
+        while len(parts) > 2:
+            parts = parts[:-1]
+            codes_to_try.append(".".join(parts))
+
+        for code in codes_to_try:
+            # USTR notices
+            cur.execute(
+                """
+                SELECT f.document_number, f.title, f.publication_date::VARCHAR, 'USTR' as source
+                FROM TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n ON f.document_number = n.document_number
+                WHERE n.hts_code = %s
+                ORDER BY f.publication_date DESC NULLS LAST
+                LIMIT 5
+                """,
+                (code,),
+            )
+            for doc_num, title, pub_date, source in cur.fetchall():
+                if doc_num and doc_num not in seen:
+                    seen.add(doc_num)
+                    history.append({
+                        "document_number": doc_num,
+                        "title": title or "",
+                        "publication_date": pub_date or "",
+                        "source": source,
+                    })
+
+            # CBP notices
+            cur.execute(
+                """
+                SELECT f.document_number, f.title, f.publication_date::VARCHAR, 'CBP' as source
+                FROM TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES f
+                INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n ON f.document_number = n.document_number
+                WHERE n.hts_code = %s
+                ORDER BY f.publication_date DESC NULLS LAST
+                LIMIT 5
+                """,
+                (code,),
+            )
+            for doc_num, title, pub_date, source in cur.fetchall():
+                if doc_num and doc_num not in seen:
+                    seen.add(doc_num)
+                    history.append({
+                        "document_number": doc_num,
+                        "title": title or "",
+                        "publication_date": pub_date or "",
+                        "source": source,
+                    })
+
+            if history:
+                break
+
+        # Sort by date descending
+        history.sort(key=lambda x: x.get("publication_date", ""), reverse=True)
+        logger.info("fetch_rate_change_history hts=%s found=%d", hts_code, len(history))
+        return history[:8]
+
+    except Exception as e:
+        logger.error("fetch_rate_change_history_error hts=%s error=%s", hts_code, e)
+        return []
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── TOOL 16 — hitl_feedback_write ────────────────────────────────────────────
+
+def hitl_feedback_write(hitl_id: str, correct_hts: str, human_notes: str = "") -> bool:
+    """
+    Write human decision back to HITL_RECORDS and update PRODUCT_ALIASES.
+    Called when a human reviewer adjudicates a HITL escalation.
+    This closes the feedback loop — correct HTS gets learned for future queries.
+    """
+    conn = _sf()
+    cur = conn.cursor()
+    try:
+        # Update HITL record with human decision
+        cur.execute(
+            """
+            UPDATE TARIFFIQ.RAW.HITL_RECORDS
+            SET human_decision = %s,
+                adjudicated_at = CURRENT_TIMESTAMP()
+            WHERE hitl_id = %s
+            """,
+            (correct_hts, hitl_id),
+        )
+
+        # Fetch the original query to write alias
+        cur.execute(
+            "SELECT query_text FROM TARIFFIQ.RAW.HITL_RECORDS WHERE hitl_id = %s",
+            (hitl_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            query_text = row[0]
+            # Extract product (first few words before "from")
+            product = re.split(r"\s+from\s+", query_text.lower())[0]
+            product = re.sub(r"^(what is (the )?tariff on |tariff on |import duty on )", "", product).strip()
+            if product and correct_hts:
+                alias_write(product, correct_hts, 0.90)
+                logger.info("hitl_feedback_alias_written product=%s hts=%s", product, correct_hts)
+
+        logger.info("hitl_feedback_write hitl_id=%s hts=%s", hitl_id, correct_hts)
+        return True
+
+    except Exception as e:
+        logger.error("hitl_feedback_write_error hitl_id=%s error=%s", hitl_id, e)
+        return False
     finally:
         cur.close()
         conn.close()
