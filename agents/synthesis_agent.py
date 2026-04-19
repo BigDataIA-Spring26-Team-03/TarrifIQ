@@ -1,24 +1,18 @@
 """
 Synthesis Agent — Pipeline Step 7
 
-Combines all upstream agent outputs into a cited natural language answer.
-LLM call via ModelRouter(TaskType.ANSWER_SYNTHESIS).
-All validation via tools.py.
+Combines upstream outputs into a cited Markdown answer (fixed ## section layout).
+LLM call via ModelRouter(TaskType.ANSWER_SYNTHESIS). Validation via tools.py.
 
-Citation validation (two layers):
-  1. Every FR doc number cited must be in policy_chunks + adder_doc set
-  2. Every doc verified against Snowflake via tools.verify_fr_doc()
+Context includes: duty stack, up to 20 FR excerpts (chronological), policy summary,
+Snowflake FR notice history for the HTS, Census trade line, and alternative-origin
+base rates. Ambiguity is handled upstream (query_agent / Streamlit chips).
 
-Rate record validation: tools.hts_verify() confirms rate_record_id exists.
+Citation validation:
+  1. Every FR doc number in the answer must appear in policy_chunks / adder / history
+  2. tools.verify_fr_doc() / verify_itc_doc()
 
-Trade trend: trade_trend_label included in context + census citation.
-
-Adder provenance: adder_doc cited as dedicated "adder_source" entry.
-
-FTA awareness: if base_rate_agent applied an FTA rate (USMCA, KORUS, etc.),
-the context block says so explicitly so the LLM can report the correct rate.
-
-Pipeline confidence: HIGH / MEDIUM / LOW based on component verification.
+Rate record: tools.hts_verify(rate_record_id). Pipeline confidence: HIGH/MEDIUM/LOW.
 """
 
 import asyncio
@@ -27,6 +21,7 @@ import os
 import re
 import time
 from typing import Dict, Any, List, Optional, Set
+from urllib.parse import quote
 
 from agents.state import TariffState
 from agents import tools
@@ -49,21 +44,52 @@ VERIFIED DUTY RATE [HTS {record_id}]:
   Section 301/IEEPA:     {adder_rate:.2f}% {adder_source}
   Total effective duty:  {total_duty:.2f}%
 {footnote_line}
-FEDERAL REGISTER POLICY EXCERPTS
-(cite ONLY these document numbers: {valid_docs}):
+POLICY CHUNKS (full text per chunk until SYNTHESIS_* env budgets; cite ONLY these FR doc numbers: {valid_docs}):
 {policy_excerpts}
 
-POLICY ANALYSIS: {policy_summary}
+POLICY ANALYSIS (intermediate summary from retrieval): {policy_summary}
+
+{rate_history_block}
 
 TRADE VOLUME [Census Bureau {period}]: {trade_line}
 
+{top_importers_block}
+
 {comparison_section}
 
-RESPONSE INSTRUCTIONS BASED ON CONFIDENCE:
-- HIGH confidence: Give a direct, confident answer. No hedging. No "verify with CBP".
-- MEDIUM confidence: Give the answer, add ONE brief note about what is uncertain.
-- LOW confidence: Give the answer with explicit uncertainty flags on specific data points.
-Never use markdown headers (no #). Write in plain prose paragraphs only.
+FINAL ANSWER FORMAT (Markdown — use exactly these section headings, in this order):
+
+## 1. Product, origin, and HTS classification
+State product, country of origin, HTS code and description, and classification confidence. If the match is broad, say so.
+
+## 2. All US import charges affecting this product
+Cover: preferential (FTA) duty vs MFN, base duty, Chapter 99 / Section 301 / 232 / IEEPA or other adders (with FR document numbers from the excerpt list only), and total estimated duty. Explicitly mention import surcharges or trade-remedy charges by name when they appear in the excerpts.
+
+## 3. Policy notices in chronological order
+For each materially relevant Federal Register (or CBP/USITC) notice that affects this product or HTS chapter, oldest first: publication or effective context, agency, one or two sentences on what changed, and a link line:
+`https://www.federalregister.gov/documents/{{YYYY-XXXXX}}`
+Use only document numbers that appear in VALID FR DOCUMENTS / excerpts above. Skip notices that are not substantively about this product or chapter.
+
+## 4. Alternative sourcing countries (indicative baseline rates)
+Use the ALTERNATIVE SOURCING block when present: compare MFN/FTA baseline rates for other origins. State clearly that Section 301/232 adders are US-measures and are not recomputed per country here.
+
+## 5. Historical tariff and notice trail
+Synthesize the RATE / NOTICE HISTORY block and excerpt dates into a short dated timeline. Link each FR action you mention.
+
+## 6. Census trade snapshot (US imports)
+Summarize the latest Census period, import value, and YoY trend from the trade line (for the user’s country of origin when applicable).
+
+## 7. Top US import partners by country (Census)
+Using the TOP IMPORT PARTNERS block: report which partner countries account for the largest US import values for this HS over the summed monthly series; for each major partner list cumulative import dollars and the indicative MFN or FTA baseline duty rate for this HTS from the block. Clarify that Section 301 / 232 / IEEPA-style adders are applied at the US border under separate rules and are not recalculated per partner in that table.
+
+If a section has no supporting data in this context, write one honest sentence (do not invent notices, rates, or links).
+
+CONFIDENCE TONE:
+- HIGH: direct wording; still cite FR numbers for each policy claim.
+- MEDIUM: one short caveat on the weakest data element.
+- LOW: flag uncertainty on classification, adder source, or sparse policy excerpts.
+
+Write the final user-visible answer using the section headings above (## 1 through ## 7).
 """
 
 
@@ -73,12 +99,58 @@ def _dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return chunks if chunks else []
 
 
+def _sort_chunks_chronologically(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _key(c: Dict[str, Any]) -> tuple:
+        d = c.get("publication_date") or ""
+        return (d, c.get("document_number") or "")
+
+    return sorted(chunks, key=_key)
+
+
+def _budgeted_policy_excerpts_for_synthesis(chunks: List[Dict[str, Any]]) -> str:
+    """Include full chunk texts up to SYNTHESIS_* env budgets (default: very large)."""
+    if not chunks:
+        return "No relevant policy documents found."
+
+    max_chars = int(os.environ.get("SYNTHESIS_POLICY_EXCERPT_MAX_CHARS", "600000"))
+    max_n = int(os.environ.get("SYNTHESIS_POLICY_MAX_CHUNKS", "600"))
+
+    ordered = _sort_chunks_chronologically(chunks)
+    lines: List[str] = []
+    total = 0
+    n = 0
+    for c in ordered:
+        if n >= max_n:
+            lines.append(
+                f"[SYNTHESIS chunk cap reached at SYNTHESIS_POLICY_MAX_CHUNKS={max_n}; "
+                "increase env var to include more chunks]"
+            )
+            break
+        txt = (c.get("chunk_text") or "")
+        line = "[{doc}] {pub} | {src} | {txt}".format(
+            doc=c.get("document_number", "UNKNOWN"),
+            pub=c.get("publication_date", "") or "?",
+            src=(c.get("source", "") or "").upper(),
+            txt=txt,
+        )
+        if total + len(line) > max_chars and lines:
+            remaining = len(ordered) - n
+            lines.append(
+                f"[SYNTHESIS excerpt budget reached; omitted {remaining} remaining chunks — "
+                f"SYNTHESIS_POLICY_EXCERPT_MAX_CHARS={max_chars}]"
+            )
+            break
+        lines.append(line)
+        total += len(line)
+        n += 1
+
+    return "\n".join(lines)
+
+
 def _verify_docs(candidates: Set[str]) -> Set[str]:
     """
-    Verify doc numbers against all three source tables:
-    FEDERAL_REGISTER_NOTICES (USTR), CBP_FEDERAL_REGISTER_NOTICES, ITC_DOCUMENTS.
-    Uses tools.verify_fr_doc() which checks USTR + CBP.
-    Also checks ITC_DOCUMENTS for USITC notices.
+    Verify doc numbers against Snowflake notice tables:
+    USTR/CBP FR, ITC, EOP, ITA.
     """
     if not candidates:
         return set()
@@ -88,12 +160,24 @@ def _verify_docs(candidates: Set[str]) -> Set[str]:
             verified.add(doc)
         elif tools.verify_itc_doc(doc):
             verified.add(doc)
+        elif tools.verify_eop_doc(doc):
+            verified.add(doc)
+        elif tools.verify_ita_doc(doc):
+            verified.add(doc)
     return verified
+
+
+def _preferred_http_url(*vals: Optional[str]) -> str:
+    for v in vals:
+        s = (v or "").strip()
+        if s.startswith(("http://", "https://")):
+            return s
+    return ""
 
 
 def _fetch_doc_metadata(doc_numbers: Set[str]) -> Dict[str, Dict]:
     """
-    Fetch title, publication_date, and abstract for FR documents.
+    Fetch title, publication_date, FR html links from Snowflake notice tables.
     Returns dict keyed by document_number.
     """
     if not doc_numbers:
@@ -101,40 +185,81 @@ def _fetch_doc_metadata(doc_numbers: Set[str]) -> Dict[str, Dict]:
     try:
         conn = tools._sf()
         cur = conn.cursor()
-        meta = {}
+        meta: Dict[str, Dict[str, Any]] = {}
         docs_list = list(doc_numbers)
 
-        # Fetch from USTR notices
-        placeholders = ",".join(["%s"] * len(docs_list))
-        cur.execute(
-            f"SELECT document_number, title, publication_date "
-            f"FROM TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES "
-            f"WHERE document_number IN ({placeholders})",
-            docs_list,
-        )
-        for doc_num, title, pub_date in cur.fetchall():
-            meta[doc_num] = {
-                "title": title or "",
-                "publication_date": str(pub_date) if pub_date else "",
-                "source": "USTR",
-            }
-
-        # Fetch from CBP notices (for ones not found above)
-        remaining = [d for d in docs_list if d not in meta]
-        if remaining:
-            placeholders2 = ",".join(["%s"] * len(remaining))
+        def _load_batch(
+            table_sql: str,
+            source_tag: str,
+            snowflake_table: str,
+            ids: List[str],
+        ) -> None:
+            if not ids:
+                return
+            ph = ",".join(["%s"] * len(ids))
             cur.execute(
-                f"SELECT document_number, title, publication_date "
-                f"FROM TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES "
-                f"WHERE document_number IN ({placeholders2})",
-                remaining,
+                f"SELECT document_number, title, publication_date, html_url, body_html_url "
+                f"FROM {table_sql} "
+                f"WHERE document_number IN ({ph})",
+                ids,
             )
-            for doc_num, title, pub_date in cur.fetchall():
+            for doc_num, title, pub_date, html_url, body_html_url in cur.fetchall():
+                url = _preferred_http_url(
+                    str(html_url) if html_url is not None else "",
+                    str(body_html_url) if body_html_url is not None else "",
+                )
                 meta[doc_num] = {
                     "title": title or "",
                     "publication_date": str(pub_date) if pub_date else "",
-                    "source": "CBP",
+                    "source": source_tag,
+                    "snowflake_table": snowflake_table,
+                    "html_url": url,
+                    "body_html_url": (body_html_url or "").strip()
+                    if body_html_url
+                    else "",
                 }
+
+        _load_batch(
+            "TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES",
+            "USTR",
+            "TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES",
+            docs_list,
+        )
+
+        remaining = [d for d in docs_list if d not in meta]
+        _load_batch(
+            "TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES",
+            "CBP",
+            "TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES",
+            remaining,
+        )
+
+        remaining = [d for d in docs_list if d not in meta]
+        _load_batch(
+            "TARIFFIQ.RAW.ITC_DOCUMENTS",
+            "USITC",
+            "TARIFFIQ.RAW.ITC_DOCUMENTS",
+            remaining,
+        )
+
+        remaining = [d for d in docs_list if d not in meta]
+        _load_batch(
+            "TARIFFIQ.RAW.EOP_DOCUMENTS",
+            "EOP",
+            "TARIFFIQ.RAW.EOP_DOCUMENTS",
+            remaining,
+        )
+
+        remaining = [d for d in docs_list if d not in meta]
+        try:
+            _load_batch(
+                "TARIFFIQ.RAW.ITA_FEDERAL_REGISTER_NOTICES",
+                "ITA",
+                "TARIFFIQ.RAW.ITA_FEDERAL_REGISTER_NOTICES",
+                remaining,
+            )
+        except Exception as e:
+            logger.debug("fetch_doc_metadata_ita_skip error=%s", e)
 
         cur.close()
         conn.close()
@@ -184,7 +309,75 @@ def _compute_confidence(
     return "LOW"
 
 
-def _build_context(state: TariffState, deduped: List[Dict], valid_docs: Set[str]) -> str:
+def _format_rate_history_block(history: Optional[List[Dict[str, Any]]]) -> str:
+    if not history:
+        return (
+            "RATE / NOTICE HISTORY (Snowflake NOTICE_HTS_CODES → FR metadata, chronological):\n"
+            "  (No indexed rows returned for this HTS in the current query window.)\n"
+        )
+    lines = [
+        "RATE / NOTICE HISTORY (Snowflake — FR notices linked to this HTS; oldest first for narrative):"
+    ]
+    for row in sorted(
+        history,
+        key=lambda x: (x.get("publication_date") or "", x.get("document_number") or ""),
+    ):
+        doc = row.get("document_number") or ""
+        src = row.get("source") or ""
+        title = (row.get("title") or "").replace("\n", " ")[:200]
+        pub = row.get("publication_date") or ""
+        url = f"https://www.federalregister.gov/documents/{doc}" if doc else ""
+        lines.append(f"  - {pub} | {src} | ({doc}) {title}")
+        if url:
+            lines.append(f"    {url}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_top_importers_block(rows: Optional[List[Dict[str, Any]]]) -> str:
+    if not rows:
+        return (
+            "TOP IMPORT PARTNERS (Census HS imports — summed monthly GEN_VAL_MO over trailing months):\n"
+            "  (No partner-country rows returned; Census may have no detail for this HS level or period.)\n"
+        )
+    months = int(rows[0].get("months_in_sample") or 24)
+    lines = [
+        f"TOP IMPORT PARTNERS (Census: summed monthly US import value GEN_VAL_MO over ~{months} months; "
+        "ranked by partner country). Baseline = HTS MFN or FTA rate from Snowflake for that origin — excludes Section 301/232/IEEPA add-on layers:"
+    ]
+    for i, r in enumerate(rows, 1):
+        name = r.get("census_country_name") or r.get("lookup_country") or "unknown"
+        usd = float(r.get("imports_usd_trailing") or 0)
+        br = r.get("base_rate")
+        mfn = r.get("mfn_rate")
+        fta = r.get("fta_program")
+        applied = r.get("fta_applied")
+        cc = r.get("cty_code") or ""
+        if br is None:
+            rate_txt = "baseline rate lookup failed"
+        else:
+            try:
+                mfn_f = float(mfn) if mfn is not None else float(br)
+                extra = f" — MFN {mfn_f:.2f}%"
+                if applied and fta:
+                    extra += f", FTA applied: {fta}"
+                rate_txt = f"baseline {float(br):.2f}%{extra}"
+            except (TypeError, ValueError):
+                rate_txt = "see HTS"
+        lines.append(
+            f"  {i}. {name} [Census CTY_CODE {cc}] — imports ~${usd:,.0f} — {rate_txt}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_context(
+    state: TariffState,
+    deduped: List[Dict],
+    valid_docs: Set[str],
+    rate_change_history: Optional[List[Dict[str, Any]]] = None,
+    *,
+    country_comparison: Optional[List[Dict[str, Any]]] = None,
+    top_importers_block: str = "",
+) -> str:
     hts_code = state.get("hts_code") or "Unknown"
     record_id = state.get("rate_record_id") or hts_code
     base_rate = state.get("base_rate") or 0.0
@@ -206,13 +399,13 @@ def _build_context(state: TariffState, deduped: List[Dict], valid_docs: Set[str]
 
     footnote_line = ("HTS FOOTNOTES: " + "; ".join(hts_footnotes[:3]) + "\n") if hts_footnotes else ""
 
-    if deduped:
-        excerpts = "\n".join(
-            f"[{c.get('document_number', 'UNKNOWN')}] {c.get('chunk_text', '')[:300]}"
-            for c in deduped[:5]
-        )
-    else:
-        excerpts = "No relevant policy documents found."
+    excerpts = (
+        _budgeted_policy_excerpts_for_synthesis(deduped)
+        if deduped
+        else "No relevant policy documents found."
+    )
+
+    rate_history_block = _format_rate_history_block(rate_change_history)
 
     trade_suppressed = state.get("trade_suppressed")
     import_value = state.get("import_value_usd")
@@ -231,8 +424,10 @@ def _build_context(state: TariffState, deduped: List[Dict], valid_docs: Set[str]
     # Compute pipeline confidence for context
     conf_val = state.get("pipeline_confidence") or "UNKNOWN"
 
-    # Build country comparison section if available
-    country_comp = state.get("country_comparison") or []
+    # Build country comparison section if available (passed in — not on state until after synthesis)
+    country_comp = country_comparison if country_comparison is not None else (
+        state.get("country_comparison") or []
+    )
     if country_comp:
         comp_lines = []
         for c in country_comp[:5]:
@@ -261,8 +456,10 @@ def _build_context(state: TariffState, deduped: List[Dict], valid_docs: Set[str]
         valid_docs=", ".join(sorted(valid_docs)) if valid_docs else "none",
         policy_excerpts=excerpts,
         policy_summary=state.get("policy_summary", ""),
+        rate_history_block=rate_history_block,
         period=period,
         trade_line=trade_line,
+        top_importers_block=top_importers_block,
     )
 
 
@@ -272,11 +469,28 @@ _SOURCE_AGENCY_MAP = {
     "CBP":   {"agency": "U.S. Customs and Border Protection",       "agency_short": "CBP"},
     "USITC": {"agency": "U.S. International Trade Commission",      "agency_short": "USITC"},
     "ITC":   {"agency": "U.S. International Trade Commission",      "agency_short": "USITC"},
+    "EOP":   {"agency": "Executive Office of the President",        "agency_short": "EOP"},
+    "ITA":   {"agency": "International Trade Administration",        "agency_short": "ITA"},
 }
 
 
 def _fr_url(doc_number: str) -> str:
-    return f"https://www.federalregister.gov/documents/{doc_number}"
+    """Fallback when Snowflake has no html_url — FR keyword search by document number."""
+    dn = (doc_number or "").strip()
+    if not dn:
+        return ""
+    return (
+        "https://www.federalregister.gov/documents/search"
+        f"?conditions%5Bterm%5D={quote(dn, safe='')}"
+    )
+
+
+def _usitc_hts_lookup_url(hts_code: Optional[str]) -> Optional[str]:
+    """HTS_CODES has no public URL column; link to USITC HTS Online search."""
+    hc = (hts_code or "").strip()
+    if not hc:
+        return None
+    return f"https://hts.usitc.gov/?query={quote(hc, safe='')}"
 
 
 def _build_citations(
@@ -309,7 +523,7 @@ def _build_citations(
             "title": f"HTS {state.get('hts_code')} — {state.get('hts_description', '')}",
             "text": rate_text,
             "source": "TARIFFIQ.RAW.HTS_CODES",
-            "url": None,
+            "url": _usitc_hts_lookup_url(state.get("hts_code")),
             "effective_date": None,
         })
 
@@ -324,6 +538,9 @@ def _build_citations(
         else:
             ch99_title = adder_meta.get("title", f"FR {adder_doc}")
             ch99_text = f"Section 301/IEEPA adder rate — method: {state.get('adder_method', 'unknown')}"
+        adder_url = (adder_meta.get("html_url") or "").strip()
+        if not adder_url and not adder_doc.startswith("9903"):
+            adder_url = _fr_url(adder_doc)
         citations.append({
             "type": "adder_source",
             "id": adder_doc,
@@ -331,8 +548,8 @@ def _build_citations(
             "agency_short": "USTR",
             "title": ch99_title,
             "text": ch99_text,
-            "source": "federalregister.gov",
-            "url": _fr_url(adder_doc) if not adder_doc.startswith("9903") else None,
+            "source": adder_meta.get("snowflake_table") or "federalregister.gov",
+            "url": adder_url or None,
             "effective_date": adder_meta.get("publication_date"),
         })
 
@@ -346,6 +563,16 @@ def _build_citations(
             doc_meta = meta.get(doc, {})
             chunk_text = chunk.get("chunk_text", "") or ""
             text = chunk_text[:120].strip() if chunk_text else ""
+            doc_url = (doc_meta.get("html_url") or "").strip()
+            if not doc_url:
+                doc_url = _fr_url(doc)
+            sf_tbl = doc_meta.get("snowflake_table")
+            if not sf_tbl:
+                sf_tbl = (
+                    "TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES"
+                    if src == "CBP"
+                    else "TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES"
+                )
             citations.append({
                 "type": "federal_register",
                 "id": doc,
@@ -353,8 +580,8 @@ def _build_citations(
                 "agency_short": agency_meta["agency_short"],
                 "title": doc_meta.get("title", f"Federal Register {doc}"),
                 "text": text,
-                "source": f"TARIFFIQ.RAW.{'CBP_' if src == 'CBP' else ''}FEDERAL_REGISTER_NOTICES",
-                "url": _fr_url(doc),
+                "source": sf_tbl,
+                "url": doc_url or None,
                 "effective_date": doc_meta.get("publication_date", ""),
             })
 
@@ -432,15 +659,27 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     logger.info("synthesis_agent_start query=%s", state.get("query", "")[:80])
 
     raw_chunks = state.get("policy_chunks") or []
-    deduped = _dedupe_chunks(raw_chunks)
+    deduped = _sort_chunks_chronologically(_dedupe_chunks(raw_chunks))
 
-    # Candidate docs: policy chunks + adder_doc
+    hts_for_history = state.get("hts_code") or state.get("rate_record_id")
+    rate_change_history: Optional[List[Dict[str, Any]]] = None
+    if hts_for_history:
+        rate_change_history = tools.fetch_rate_change_history(
+            hts_for_history, country=state.get("country")
+        )
+
+    # Candidate docs: policy chunks + adder_doc + history rows
     candidate_docs: Set[str] = {
         c.get("document_number", "") for c in deduped if c.get("document_number")
     }
     adder_doc = state.get("adder_doc")
     if adder_doc:
         candidate_docs.add(adder_doc)
+    if rate_change_history:
+        for row in rate_change_history:
+            dn = row.get("document_number")
+            if dn:
+                candidate_docs.add(dn)
 
     # Verify all docs against Snowflake
     valid_docs = _verify_docs(candidate_docs)
@@ -455,7 +694,30 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     rate_verified = tools.hts_verify(record_id) if record_id else False
     adder_doc_verified = adder_doc in valid_docs if adder_doc else True
 
-    context = _build_context(state, deduped, valid_docs)
+    hts_comp = state.get("hts_code") or state.get("rate_record_id")
+    country_comparison_pre = (
+        _build_country_comparison(
+            hts_code=hts_comp,
+            current_country=state.get("country"),
+        )
+        if hts_comp
+        else []
+    )
+    top_importers_pre: List[Dict[str, Any]] = []
+    if hts_comp:
+        top_importers_pre = tools.fetch_top_importer_countries(
+            hts_comp, months=24, top_n=8
+        )
+    top_importers_block = _format_top_importers_block(top_importers_pre)
+
+    context = _build_context(
+        state,
+        deduped,
+        valid_docs,
+        rate_change_history,
+        country_comparison=country_comparison_pre,
+        top_importers_block=top_importers_block,
+    )
 
     # LLM call via ModelRouter — ANSWER_SYNTHESIS (claude-haiku)
     from services.llm.router import get_router, TaskType
@@ -517,28 +779,14 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     )
     citations = _build_citations(state, deduped, valid_docs, doc_metadata)
 
-    # Country comparison — run base rate lookup for key alternative origins
-    country_comparison = _build_country_comparison(
-        hts_code=state.get("hts_code") or state.get("rate_record_id"),
-        current_country=state.get("country"),
-    )
-
-    # Rate change history — fetch if intent is rate_change
-    rate_change_history = None
-    if state.get("query_intent") == "rate_change":
-        hts_for_history = state.get("hts_code") or state.get("rate_record_id")
-        if hts_for_history:
-            rate_change_history = tools.fetch_rate_change_history(
-                hts_for_history, country=state.get("country")
-            )
-
     logger.info("synthesis_agent_done citations=%d confidence=%s", len(citations), conf)
 
     return {
         "final_response": final_response,
         "citations": citations,
         "pipeline_confidence": conf,
-        "country_comparison": country_comparison,
+        "country_comparison": country_comparison_pre,
+        "top_importers": top_importers_pre,
         "rate_change_history": rate_change_history,
         "hitl_required": bool(state.get("hitl_required", False)),
         "hitl_reason": state.get("hitl_reason"),

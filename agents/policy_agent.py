@@ -1,12 +1,14 @@
 """
 Policy Agent — Pipeline Step 4
 
-Retrieves Federal Register policy context using Ayush's services:
-  1. HyDEQueryEnhancer.enhance_sync()  — generates hypothetical FR sentence
-  2. HybridRetriever.search_policy()   — dense + BM25 + RRF in one call
+Retrieves policy context from Chroma (USTR, CBP, USITC, ITA, EOP chunks) plus
+Snowflake notice–HTS fallbacks for those same sources where tables exist.
+
+  1. HyDEQueryEnhancer.enhance_sync()  — hypothetical FR-style query text
+  2. HybridRetriever.search_policy()   — main hybrid search + per-source legs
   3. ModelRouter(POLICY_ANALYSIS)      — LLM synthesis with numbered citations
 
-Both HyDE and HybridRetriever use singletons — instantiated once at startup,
+HyDE and HybridRetriever use singletons — instantiated once at startup,
 never per-request (BM25 index build takes seconds).
 
 Citation enforcement:
@@ -29,7 +31,13 @@ from agents import tools
 
 logger = logging.getLogger(__name__)
 
-TOP_K = 5
+TOP_K = 12
+SOURCE_LEG_K = 6  # per-agency hybrid leg so CBP/USITC/ITA/EOP are not drowned out by USTR hits
+POLICY_MERGE_MAX = 28
+# Full HTS-linked corpus can be huge; only the policy-analysis LLM is budgeted (env override).
+POLICY_CONTEXT_MAX_CHARS = int(os.environ.get("POLICY_CONTEXT_MAX_CHARS", "600000"))
+# Per-chunk slice in the numbered context sent to the policy LLM (full chunk kept in merge until budget).
+POLICY_CHUNK_TEXT_MAX_CHARS = max(120, int(os.environ.get("POLICY_CHUNK_TEXT_MAX_CHARS", "520")))
 CACHE_TTL = 21_600  # 6 h
 
 POLICY_PROMPT_SUFFIX = """
@@ -40,7 +48,7 @@ CITATION RULES (strictly enforced):
 4. If a CBP ruling covers country-of-origin, say so explicitly
 5. If context is insufficient: "Insufficient policy context for this query."
 6. Use NO knowledge outside the provided documents
-7. Maximum 3-5 sentences"""
+7. Maximum 8–12 sentences; mention each distinct notice (agency + date) when relevant."""
 
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
@@ -90,6 +98,39 @@ def _cache_set(hts_code: str, query: str, result: Dict) -> None:
 
 # ── Citation building + resolution ────────────────────────────────────────────
 
+def _chunk_key(c: Dict[str, Any]) -> str:
+    cid = c.get("chunk_id")
+    if cid is not None and cid != "":
+        return f"id:{cid}"
+    snippet = (c.get("chunk_text") or "")[:120]
+    return f"doc:{c.get('document_number', '')}|sec:{c.get('section', '')}|h:{hash(snippet)}"
+
+
+def _merge_policy_chunks_round_robin(
+    *lists: List[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Interleave lists so merged results span USTR/CBP/chapter scan without flooding duplicates."""
+    seen: Set[str] = set()
+    out: List[Dict[str, Any]] = []
+    lists_n = [x for x in lists if x]
+    if not lists_n:
+        return []
+    max_len = max(len(x) for x in lists_n)
+    for i in range(max_len):
+        for lst in lists_n:
+            if i >= len(lst):
+                continue
+            c = lst[i]
+            k = _chunk_key(c)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(c)
+            if len(out) >= POLICY_MERGE_MAX:
+                return out
+    return out
+
+
 def _build_numbered_context(chunks: List[Dict]) -> Tuple[str, Dict[int, str]]:
     """Build [1]…[N] numbered context block. Returns (text, index→doc_number map)."""
     index_to_doc: Dict[int, str] = {}
@@ -104,10 +145,44 @@ def _build_numbered_context(chunks: List[Dict]) -> Tuple[str, Dict[int, str]]:
             header += f' | "{title[:80]}"'
         if pub:
             header += f" | {pub}"
-        text = chunk.get("chunk_text", "")
-        lines.append(f"{header}\n{text[:400]}")
+        raw = chunk.get("chunk_text", "") or ""
+        text = raw[:POLICY_CHUNK_TEXT_MAX_CHARS]
+        if len(raw) > POLICY_CHUNK_TEXT_MAX_CHARS:
+            text += " …"
+        lines.append(f"{header}\n{text}")
         index_to_doc[i] = doc
     return "\n\n".join(lines), index_to_doc
+
+
+def _approx_numbered_chunk_chars(c: Dict[str, Any]) -> int:
+    """Rough size of one chunk block in `_build_numbered_context` (header + sliced body)."""
+    raw = c.get("chunk_text") or ""
+    body = min(len(raw), POLICY_CHUNK_TEXT_MAX_CHARS)
+    if len(raw) > POLICY_CHUNK_TEXT_MAX_CHARS:
+        body += 2  # ellipsis
+    # [n] agency doc | "title[:80]" | pub — buffer for variable header fields
+    return body + 280
+
+
+def _trim_chunks_for_policy_llm(
+    chunks: List[Dict[str, Any]], max_chars: int
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Include chunks in order until character budget is reached (LLM context limit)."""
+    total = 0
+    out: List[Dict[str, Any]] = []
+    for c in chunks:
+        t = _approx_numbered_chunk_chars(c)
+        if total + t > max_chars and out:
+            break
+        out.append(c)
+        total += t
+    omitted = len(chunks) - len(out)
+    if not omitted:
+        return out, ""
+    return out, (
+        f"\n[Truncated policy context: sent {len(out)} of {len(chunks)} chunks "
+        f"within POLICY_CONTEXT_MAX_CHARS={max_chars}. Increase the env var to include more.]\n"
+    )
 
 
 def _resolve_citations(summary: str, index_to_doc: Dict[int, str]) -> Tuple[str, List[str]]:
@@ -154,112 +229,78 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     from services.retrieval.hybrid import get_retriever
     retriever = get_retriever()
 
-    country_lower = (state.get("country") or "").lower().strip()
-    source_filter = "USTR" if country_lower in ("china", "prc") else None
-
-    chunks = retriever.search_policy(
+    # All sources in Chroma (USTR, CBP, USITC, ITA, EOP) — do not filter to USTR-only
+    # (older behavior for China drowned out CBP rulings and USITC notices).
+    main_hybrid = retriever.search_policy(
         query=hyde_query,
         hts_chapter=hts_chapter or None,
-        source=source_filter,
+        source=None,
         top_k=TOP_K,
+    )
+    cbp_hybrid = retriever.search_policy(
+        query=hyde_query,
+        hts_chapter=hts_chapter or None,
+        source="CBP",
+        top_k=SOURCE_LEG_K,
+    )
+    usitc_hybrid = retriever.search_policy(
+        query=hyde_query,
+        hts_chapter=hts_chapter or None,
+        source="USITC",
+        top_k=SOURCE_LEG_K,
+    )
+    ita_hybrid = retriever.search_policy(
+        query=hyde_query,
+        hts_chapter=hts_chapter or None,
+        source="ITA",
+        top_k=SOURCE_LEG_K,
+    )
+    eop_hybrid = retriever.search_policy(
+        query=hyde_query,
+        hts_chapter=hts_chapter or None,
+        source="EOP",
+        top_k=SOURCE_LEG_K,
+    )
+
+    chapter_scan: List[Dict[str, Any]] = []
+    if hts_chapter:
+        chapter_scan = retriever.search_policy(
+            query=(
+                f"import tariff duty classification Federal Register "
+                f"HTS chapter {hts_chapter} {product}"
+            ),
+            hts_chapter=hts_chapter,
+            source=None,
+            top_k=8,
+        )
+
+    chunks = _merge_policy_chunks_round_robin(
+        main_hybrid,
+        cbp_hybrid,
+        usitc_hybrid,
+        ita_hybrid,
+        eop_hybrid,
+        chapter_scan,
     )
 
     if not chunks:
         logger.info("policy_agent_filter_empty hts=%s — retrying unfiltered", hts_code)
         chunks = retriever.search_policy(query=hyde_query, top_k=TOP_K)
 
-    # ── Step 2b: Fallback — fetch chunks via NOTICE_HTS_CODES lookup ─────────
-    # If vector search returned generic chunks (no HTS code match), supplement
-    # with chunks from documents that explicitly mention this HTS code.
-    # Try progressively shorter codes: 8471.30.01.00 → 8471.30.01 → 8471.30 → 8471
-    notice_chunks = []
+    # ── Step 2b: Exhaustive Snowflake load — every chunk for every doc linked to this HTS ──
+    exhaustive: List[Dict[str, Any]] = []
     if hts_code:
-        codes_to_try = [hts_code]
-        parts = hts_code.split(".")
-        while len(parts) > 2:
-            parts = parts[:-1]
-            codes_to_try.append(".".join(parts))
-
-        try:
-            conn = tools._sf()
-            cur = conn.cursor()
-            seen_chunk_ids = {c.get("chunk_id") for c in chunks}
-
-            for code in codes_to_try:
-                # Fetch from USTR chunks
-                cur.execute(
-                    """
-                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
-                           f.title, f.publication_date::VARCHAR
-                    FROM TARIFFIQ.RAW.CHUNKS c
-                    INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
-                        ON c.document_number = n.document_number
-                    LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
-                        ON c.document_number = f.document_number
-                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
-                    ORDER BY f.publication_date DESC NULLS LAST
-                    LIMIT 3
-                    """,
-                    (code,),
-                )
-                for chunk_id, chunk_text, doc_num, section, title, pub_date in cur.fetchall():
-                    if chunk_id and chunk_id not in seen_chunk_ids:
-                        seen_chunk_ids.add(chunk_id)
-                        notice_chunks.append({
-                            "chunk_id": chunk_id,
-                            "chunk_text": chunk_text,
-                            "document_number": doc_num,
-                            "section": section or "",
-                            "title": title or "",
-                            "publication_date": pub_date or "",
-                            "source": "USTR",
-                            "hts_code": code,
-                            "retrieval_method": "notice_hts_lookup",
-                        })
-
-                # Fetch from CBP chunks
-                cur.execute(
-                    """
-                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
-                           f.title, f.publication_date::VARCHAR
-                    FROM TARIFFIQ.RAW.CBP_CHUNKS c
-                    INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n
-                        ON c.document_number = n.document_number
-                    LEFT JOIN TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES f
-                        ON c.document_number = f.document_number
-                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
-                    ORDER BY f.publication_date DESC NULLS LAST
-                    LIMIT 3
-                    """,
-                    (code,),
-                )
-                for chunk_id, chunk_text, doc_num, section, title, pub_date in cur.fetchall():
-                    if chunk_id and chunk_id not in seen_chunk_ids:
-                        seen_chunk_ids.add(chunk_id)
-                        notice_chunks.append({
-                            "chunk_id": chunk_id,
-                            "chunk_text": chunk_text,
-                            "document_number": doc_num,
-                            "section": section or "",
-                            "title": title or "",
-                            "publication_date": pub_date or "",
-                            "source": "CBP",
-                            "hts_code": code,
-                            "retrieval_method": "notice_hts_lookup",
-                        })
-
-                if notice_chunks:
-                    break  # Found direct matches — stop trying shorter codes
-
-            cur.close()
-            conn.close()
-        except Exception as e:
-            logger.warning("policy_agent_notice_fallback_error hts=%s error=%s", hts_code, e)
-
-    if notice_chunks:
-        logger.info("policy_agent_notice_fallback hts=%s found=%d", hts_code, len(notice_chunks))
-        # Prepend notice chunks — they are more targeted than vector search results
-        chunks = notice_chunks + chunks
+        exhaustive = tools.fetch_all_hts_linked_policy_chunks(hts_code)
+    if exhaustive:
+        ex_ids = {c.get("chunk_id") for c in exhaustive if c.get("chunk_id")}
+        vector_extra = [c for c in chunks if c.get("chunk_id") not in ex_ids]
+        chunks = exhaustive + vector_extra
+        logger.info(
+            "policy_agent_hts_exhaustive exhaustive=%d vector_supplement=%d total=%d",
+            len(exhaustive),
+            len(vector_extra),
+            len(chunks),
+        )
 
     if not chunks:
         logger.warning("policy_agent_no_chunks product=%s hts=%s", product, hts_code)
@@ -269,9 +310,10 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     from services.llm.router import get_router, TaskType
     router = get_router()
 
-    context_block, index_to_doc = _build_numbered_context(chunks)
+    chunks_for_llm, trim_note = _trim_chunks_for_policy_llm(chunks, POLICY_CONTEXT_MAX_CHARS)
+    context_block, index_to_doc = _build_numbered_context(chunks_for_llm)
     user_content = (
-        f"Question: {query}\n\n"
+        f"Question: {query}{trim_note}\n\n"
         f"Numbered excerpts:\n{context_block}"
         f"\n\n{POLICY_PROMPT_SUFFIX}"
     )

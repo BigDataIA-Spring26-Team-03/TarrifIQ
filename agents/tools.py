@@ -18,6 +18,8 @@ TOOLS
   10. verify_fr_doc(doc_number)
   11. write_hitl_record(query, reason, hts, conf)
   12. census_trade_flow(hts_code)
+  13. fetch_top_importer_countries(hts_code, months=24, top_n=8)
+  14. fetch_all_hts_linked_policy_chunks(hts_code) — all chunks for all docs referencing HTS
 
 Note: policy vector search and HTS vector search are handled by
 services/retrieval/hybrid.py (HybridRetriever) — not in this file.
@@ -668,6 +670,44 @@ def verify_itc_doc(doc_number: str) -> bool:
         conn.close()
 
 
+def verify_eop_doc(doc_number: str) -> bool:
+    """Check EOP_DOCUMENTS for Executive Office notices."""
+    conn = _sf()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT 1 FROM TARIFFIQ.RAW.EOP_DOCUMENTS "
+            "WHERE document_number=%s LIMIT 1",
+            (doc_number,),
+        )
+        return cur.fetchone() is not None
+    except Exception as e:
+        logger.debug("verify_eop_doc_error doc=%s error=%s", doc_number, e)
+        return False
+    finally:
+        cur.close()
+        conn.close()
+
+
+def verify_ita_doc(doc_number: str) -> bool:
+    """Check ITA_FEDERAL_REGISTER_NOTICES."""
+    conn = _sf()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT 1 FROM TARIFFIQ.RAW.ITA_FEDERAL_REGISTER_NOTICES "
+            "WHERE document_number=%s LIMIT 1",
+            (doc_number,),
+        )
+        return cur.fetchone() is not None
+    except Exception as e:
+        logger.debug("verify_ita_doc_error doc=%s error=%s", doc_number, e)
+        return False
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ── TOOL 11 — write_hitl_record ───────────────────────────────────────────────
 
 def write_hitl_record(
@@ -863,7 +903,7 @@ def fetch_rate_change_history(hts_code: str, country: Optional[str] = None) -> L
                 INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n ON f.document_number = n.document_number
                 WHERE n.hts_code = %s
                 ORDER BY f.publication_date DESC NULLS LAST
-                LIMIT 5
+                LIMIT 8
                 """,
                 (code,),
             )
@@ -885,7 +925,7 @@ def fetch_rate_change_history(hts_code: str, country: Optional[str] = None) -> L
                 INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n ON f.document_number = n.document_number
                 WHERE n.hts_code = %s
                 ORDER BY f.publication_date DESC NULLS LAST
-                LIMIT 5
+                LIMIT 8
                 """,
                 (code,),
             )
@@ -905,7 +945,7 @@ def fetch_rate_change_history(hts_code: str, country: Optional[str] = None) -> L
         # Sort by date descending
         history.sort(key=lambda x: x.get("publication_date", ""), reverse=True)
         logger.info("fetch_rate_change_history hts=%s found=%d", hts_code, len(history))
-        return history[:8]
+        return history[:14]
 
     except Exception as e:
         logger.error("fetch_rate_change_history_error hts=%s error=%s", hts_code, e)
@@ -984,3 +1024,344 @@ def census_trade_flow_timed(hts_code: str, time: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("census_trade_flow_timed_error hts=%s time=%s error=%s", hts_code, time, e)
         return {}
+
+
+def _census_cty_code_to_lookup_country(cty_code: str, cty_name: str) -> str:
+    """Map Census Schedule C country code / name to a country string for hts_base_rate_lookup."""
+    from agents.trade_agent import COUNTRY_CODE_MAP
+
+    inv: Dict[str, str] = getattr(_census_cty_code_to_lookup_country, "_inv", None)
+    if inv is None:
+        inv = {}
+        for name, code in COUNTRY_CODE_MAP.items():
+            if code not in inv:
+                inv[code] = name
+        _census_cty_code_to_lookup_country._inv = inv  # type: ignore[attr-defined]
+
+    cc = str(cty_code or "").strip().zfill(4) if str(cty_code or "").strip().isdigit() else str(cty_code or "").strip()
+    if cc in inv:
+        return inv[cc]
+
+    base = str(cty_name or "").split(",")[0].strip().lower()
+    aliases = {
+        "viet nam": "vietnam",
+        "russian federation": "russia",
+        "korea": "south korea",
+        "north korea": "north korea",
+        "hong kong": "hong kong",
+        "macao": "macao",
+        "türkiye": "turkey",
+        "turkiye": "turkey",
+        "people's republic of china": "china",
+        "peoples republic of china": "china",
+    }
+    if base in aliases:
+        return aliases[base]
+    return base
+
+
+def fetch_top_importer_countries(
+    hts_code: str,
+    *,
+    months: int = 24,
+    top_n: int = 8,
+) -> List[Dict[str, Any]]:
+    """
+    Rank partner countries by summed US import value (GEN_VAL_MO) over trailing ``months``
+    via Census HS import API. Attach indicative MFN/FTA baseline rate per country from HTS_CODES.
+
+    Section 301 / 232 adders are not recomputed here — same caveats as hts_base_rate_lookup.
+    """
+    from ingestion.census_client import get_trade_trend
+
+    if not hts_code:
+        return []
+
+    months = max(1, min(int(months), 36))
+    trend = get_trade_trend(hts_code, months=months)
+
+    def _monthly_val(row: Dict[str, Any]) -> float:
+        raw = row.get("GEN_VAL_MO") if "GEN_VAL_MO" in row else row.get("gen_val_mo")
+        try:
+            if raw in (None, "", "(D)", "-"):
+                return 0.0
+            return float(str(raw).replace(",", ""))
+        except (ValueError, TypeError):
+            return 0.0
+
+    totals: Dict[str, Dict[str, Any]] = {}
+    for snap in trend:
+        for row in snap.get("rows") or []:
+            code = str(row.get("CTY_CODE", "") or "").strip()
+            name = str(row.get("CTY_NAME", "") or "").strip()
+            nu = name.upper()
+            if not code or code == "-" or "TOTAL FOR ALL COUNTRIES" in nu:
+                continue
+            val = _monthly_val(row)
+            if code not in totals:
+                totals[code] = {"cty_code": code, "cty_name": name, "imports_usd": 0.0}
+            totals[code]["imports_usd"] += val
+
+    ranked = sorted(totals.values(), key=lambda x: x["imports_usd"], reverse=True)[:top_n]
+
+    out: List[Dict[str, Any]] = []
+    for item in ranked:
+        lookup_name = _census_cty_code_to_lookup_country(item["cty_code"], item["cty_name"])
+        rr = hts_base_rate_lookup(hts_code, country=lookup_name)
+        row_out: Dict[str, Any] = {
+            "census_country_name": item["cty_name"],
+            "cty_code": item["cty_code"],
+            "imports_usd_trailing": round(item["imports_usd"], 2),
+            "months_in_sample": months,
+            "lookup_country": lookup_name,
+            "base_rate": None,
+            "mfn_rate": None,
+            "fta_program": None,
+            "fta_applied": None,
+        }
+        if rr:
+            row_out["base_rate"] = rr.get("base_rate")
+            row_out["mfn_rate"] = rr.get("mfn_rate")
+            row_out["fta_program"] = rr.get("fta_program")
+            row_out["fta_applied"] = rr.get("fta_applied")
+        out.append(row_out)
+
+    logger.info(
+        "fetch_top_importer_countries hts=%s months=%d rows=%d",
+        hts_code,
+        months,
+        len(out),
+    )
+    return out
+
+
+def _hts_parent_codes(hts_code: str) -> List[str]:
+    """8421.30.01.00 → [8421.30.01.00, 8421.30.01, 8421.30, 8421]."""
+    if not (hts_code or "").strip():
+        return []
+    codes = [hts_code.strip()]
+    parts = hts_code.split(".")
+    while len(parts) > 2:
+        parts = parts[:-1]
+        codes.append(".".join(parts))
+    return codes
+
+
+def fetch_all_hts_linked_policy_chunks(hts_code: str) -> List[Dict[str, Any]]:
+    """
+    Load chunks for **every** document that references this HTS (or a parent code), but at most
+    ``HTS_LINKED_CHUNKS_PER_DOCUMENT`` chunks per document (ordered by chunk_index).
+
+    Sources: USTR, CBP, USITC, EOP (notice joins); ITA_CHUNKS by hts_code column.
+    """
+    if not (hts_code or "").strip():
+        return []
+
+    per_doc = max(1, int(os.environ.get("HTS_LINKED_CHUNKS_PER_DOCUMENT", "5")))
+
+    codes = _hts_parent_codes(hts_code)
+    seen: Set[str] = set()
+    rows_out: List[Dict[str, Any]] = []
+
+    conn = _sf()
+    cur = conn.cursor()
+    try:
+        for code in codes:
+
+            def _add_row(
+                chunk_id: Any,
+                chunk_text: Any,
+                doc_num: Any,
+                chunk_index: Any,
+                section: Any,
+                title: Any,
+                pub_date: Any,
+                src: str,
+                method: str,
+            ) -> None:
+                if not chunk_id or not chunk_text:
+                    return
+                cid = str(chunk_id)
+                if cid in seen:
+                    return
+                seen.add(cid)
+                rows_out.append({
+                    "chunk_id": cid,
+                    "chunk_text": str(chunk_text),
+                    "document_number": str(doc_num or ""),
+                    "chunk_index": int(chunk_index) if chunk_index is not None else 0,
+                    "section": str(section or ""),
+                    "title": str(title or ""),
+                    "publication_date": str(pub_date or ""),
+                    "source": src,
+                    "hts_code": code,
+                    "retrieval_method": method,
+                })
+
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                           f.title, f.publication_date::VARCHAR AS publication_date,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY c.document_number
+                               ORDER BY c.chunk_index ASC NULLS LAST
+                           ) AS rn
+                    FROM TARIFFIQ.RAW.CHUNKS c
+                    INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
+                        ON c.document_number = n.document_number
+                    LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                        ON c.document_number = f.document_number
+                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                )
+                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                FROM ranked
+                WHERE rn <= %s
+                ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
+                """,
+                (code, per_doc),
+            )
+            for r in cur.fetchall():
+                _add_row(
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "USTR", "hts_notice_full",
+                )
+
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                           f.title, f.publication_date::VARCHAR AS publication_date,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY c.document_number
+                               ORDER BY c.chunk_index ASC NULLS LAST
+                           ) AS rn
+                    FROM TARIFFIQ.RAW.CBP_CHUNKS c
+                    INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n
+                        ON c.document_number = n.document_number
+                    LEFT JOIN TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES f
+                        ON c.document_number = f.document_number
+                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                )
+                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                FROM ranked
+                WHERE rn <= %s
+                ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
+                """,
+                (code, per_doc),
+            )
+            for r in cur.fetchall():
+                _add_row(
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "CBP", "hts_notice_full",
+                )
+
+            try:
+                cur.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                               f.title, f.publication_date::VARCHAR AS publication_date,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY c.document_number
+                                   ORDER BY c.chunk_index ASC NULLS LAST
+                               ) AS rn
+                        FROM TARIFFIQ.RAW.ITC_CHUNKS c
+                        INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES_ITC n
+                            ON c.document_number = n.document_number
+                        LEFT JOIN TARIFFIQ.RAW.ITC_DOCUMENTS f
+                            ON c.document_number = f.document_number
+                        WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                    )
+                    SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                    FROM ranked
+                    WHERE rn <= %s
+                    ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
+                    """,
+                    (code, per_doc),
+                )
+                for r in cur.fetchall():
+                    _add_row(
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], "USITC", "hts_notice_full",
+                    )
+            except Exception as e:
+                logger.debug("fetch_all_hts_itc code=%s err=%s", code, e)
+
+            try:
+                cur.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                               f.title, f.publication_date::VARCHAR AS publication_date,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY c.document_number
+                                   ORDER BY c.chunk_index ASC NULLS LAST
+                               ) AS rn
+                        FROM TARIFFIQ.RAW.EOP_CHUNKS c
+                        INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES_EOP n
+                            ON c.document_number = n.document_number
+                        LEFT JOIN TARIFFIQ.RAW.EOP_DOCUMENTS f
+                            ON c.document_number = f.document_number
+                        WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                    )
+                    SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                    FROM ranked
+                    WHERE rn <= %s
+                    ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
+                    """,
+                    (code, per_doc),
+                )
+                for r in cur.fetchall():
+                    _add_row(
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], "EOP", "hts_notice_full",
+                    )
+            except Exception as e:
+                logger.debug("fetch_all_hts_eop code=%s err=%s", code, e)
+
+            try:
+                cur.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                               CAST(NULL AS VARCHAR) AS title,
+                               CAST(NULL AS VARCHAR) AS publication_date,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY c.document_number
+                                   ORDER BY c.chunk_index ASC NULLS LAST
+                               ) AS rn
+                        FROM TARIFFIQ.RAW.ITA_CHUNKS c
+                        WHERE c.hts_code = %s AND c.chunk_text IS NOT NULL
+                    )
+                    SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                    FROM ranked
+                    WHERE rn <= %s
+                    ORDER BY document_number, chunk_index
+                    """,
+                    (code, per_doc),
+                )
+                for r in cur.fetchall():
+                    _add_row(
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], "ITA", "hts_chunk_hts_code",
+                    )
+            except Exception as e:
+                logger.debug("fetch_all_hts_ita code=%s err=%s", code, e)
+
+        rows_out.sort(
+            key=lambda x: (
+                x.get("publication_date") or "",
+                x.get("document_number") or "",
+                x.get("chunk_index") or 0,
+            )
+        )
+        logger.info(
+            "fetch_all_hts_linked_policy_chunks hts=%s codes_tried=%d chunks=%d per_doc_cap=%d",
+            hts_code,
+            len(codes),
+            len(rows_out),
+            per_doc,
+        )
+        return rows_out
+    except Exception as e:
+        logger.error("fetch_all_hts_linked_policy_chunks_error hts=%s error=%s", hts_code, e)
+        return []
+    finally:
+        cur.close()
+        conn.close()

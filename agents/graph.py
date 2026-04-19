@@ -182,6 +182,7 @@ def run_pipeline(query: str) -> Dict[str, Any]:
         "trade_trend_pct": None, "trade_trend_label": None,
         "final_response": None, "citations": None, "pipeline_confidence": None,
         "country_comparison": None,
+        "top_importers": None,
         "rate_change_history": None,
         "query_intent": None,
         "hitl_required": None, "hitl_reason": None,
