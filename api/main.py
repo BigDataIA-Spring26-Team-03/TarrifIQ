@@ -33,6 +33,7 @@ from api.tools.hts_search import router as hts_search_router
 from api.tools.hts_chapter import router as hts_chapter_router
 from api.tools.search_policy_vector import router as search_policy_router
 from api.tools.search_hts_vector import router as search_hts_vector_router
+from api.tools.debug_agents import router as debug_agents_router
 from services.chromadb_init import initialize_chromadb
 from agents.graph import run_pipeline
 
