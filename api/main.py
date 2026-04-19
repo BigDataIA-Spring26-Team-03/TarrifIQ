@@ -54,6 +54,7 @@ tags_metadata = [
     {"name": "Core", "description": "Health check and query pipeline"},
     {"name": "HTS & Rates", "description": "HTS code lookup and search"},
     {"name": "Vector Search", "description": "ChromaDB semantic search for policies and HTS"},
+    {"name": "Debug", "description": "Per-agent debug endpoints — dev only"},
 ]
 
 
@@ -83,6 +84,7 @@ app.include_router(hts_search_router, prefix="/tools", tags=["HTS & Rates"])
 app.include_router(hts_chapter_router, prefix="/tools", tags=["HTS & Rates"])
 app.include_router(search_policy_router, prefix="/tools", tags=["Vector Search"])
 app.include_router(search_hts_vector_router, prefix="/tools", tags=["Vector Search"])
+app.include_router(debug_agents_router, prefix="/debug/agents", tags=["Debug"])
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Core"])
