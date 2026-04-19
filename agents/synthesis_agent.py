@@ -40,6 +40,7 @@ SYNTHESIS_CONTEXT_TEMPLATE = """
 USER QUERY: {query}
 PRODUCT: {product}
 COUNTRY OF ORIGIN: {country}
+PIPELINE CONFIDENCE: {pipeline_confidence}
 
 HTS CLASSIFICATION: {hts_code} — {hts_description} (confidence: {confidence})
 
@@ -55,6 +56,14 @@ FEDERAL REGISTER POLICY EXCERPTS
 POLICY ANALYSIS: {policy_summary}
 
 TRADE VOLUME [Census Bureau {period}]: {trade_line}
+
+{comparison_section}
+
+RESPONSE INSTRUCTIONS BASED ON CONFIDENCE:
+- HIGH confidence: Give a direct, confident answer. No hedging. No "verify with CBP".
+- MEDIUM confidence: Give the answer, add ONE brief note about what is uncertain.
+- LOW confidence: Give the answer with explicit uncertainty flags on specific data points.
+Never use markdown headers (no #). Write in plain prose paragraphs only.
 """
 
 
@@ -80,6 +89,59 @@ def _verify_docs(candidates: Set[str]) -> Set[str]:
         elif tools.verify_itc_doc(doc):
             verified.add(doc)
     return verified
+
+
+def _fetch_doc_metadata(doc_numbers: Set[str]) -> Dict[str, Dict]:
+    """
+    Fetch title, publication_date, and abstract for FR documents.
+    Returns dict keyed by document_number.
+    """
+    if not doc_numbers:
+        return {}
+    try:
+        conn = tools._sf()
+        cur = conn.cursor()
+        meta = {}
+        docs_list = list(doc_numbers)
+
+        # Fetch from USTR notices
+        placeholders = ",".join(["%s"] * len(docs_list))
+        cur.execute(
+            f"SELECT document_number, title, publication_date "
+            f"FROM TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES "
+            f"WHERE document_number IN ({placeholders})",
+            docs_list,
+        )
+        for doc_num, title, pub_date in cur.fetchall():
+            meta[doc_num] = {
+                "title": title or "",
+                "publication_date": str(pub_date) if pub_date else "",
+                "source": "USTR",
+            }
+
+        # Fetch from CBP notices (for ones not found above)
+        remaining = [d for d in docs_list if d not in meta]
+        if remaining:
+            placeholders2 = ",".join(["%s"] * len(remaining))
+            cur.execute(
+                f"SELECT document_number, title, publication_date "
+                f"FROM TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES "
+                f"WHERE document_number IN ({placeholders2})",
+                remaining,
+            )
+            for doc_num, title, pub_date in cur.fetchall():
+                meta[doc_num] = {
+                    "title": title or "",
+                    "publication_date": str(pub_date) if pub_date else "",
+                    "source": "CBP",
+                }
+
+        cur.close()
+        conn.close()
+        return meta
+    except Exception as e:
+        logger.warning("fetch_doc_metadata_error error=%s", e)
+        return {}
 
 
 def _validate_citations(text: str, valid_docs: Set[str]) -> tuple[bool, Set[str]]:
@@ -166,10 +228,26 @@ def _build_context(state: TariffState, deduped: List[Dict], valid_docs: Set[str]
     else:
         trade_line = "Not available from Census Bureau"
 
+    # Compute pipeline confidence for context
+    conf_val = state.get("pipeline_confidence") or "UNKNOWN"
+
+    # Build country comparison section if available
+    country_comp = state.get("country_comparison") or []
+    if country_comp:
+        comp_lines = []
+        for c in country_comp[:5]:
+            fta = f" ({c['fta_program']})" if c.get("fta_program") else ""
+            comp_lines.append(f"  {c['country']}: {c['base_rate']:.1f}% base rate{fta}")
+        comparison_section = "ALTERNATIVE SOURCING (base MFN rates only):\n" + "\n".join(comp_lines)
+    else:
+        comparison_section = ""
+
     return SYNTHESIS_CONTEXT_TEMPLATE.format(
         query=state.get("query", ""),
         product=state.get("product", "Unknown"),
         country=state.get("country", "Not specified"),
+        pipeline_confidence=conf_val,
+        comparison_section=comparison_section,
         hts_code=hts_code,
         hts_description=state.get("hts_description", ""),
         confidence=f"{(state.get('classification_confidence') or 0):.0%}",
@@ -201,9 +279,15 @@ def _fr_url(doc_number: str) -> str:
     return f"https://www.federalregister.gov/documents/{doc_number}"
 
 
-def _build_citations(state: TariffState, deduped: List[Dict], valid_docs: Set[str]) -> List[Dict[str, Any]]:
+def _build_citations(
+    state: TariffState,
+    deduped: List[Dict],
+    valid_docs: Set[str],
+    doc_metadata: Optional[Dict[str, Dict]] = None,
+) -> List[Dict[str, Any]]:
     citations = []
     seen: Set[str] = set()
+    meta = doc_metadata or {}
 
     record_id = state.get("rate_record_id")
     if record_id and record_id not in seen:
@@ -222,22 +306,34 @@ def _build_citations(state: TariffState, deduped: List[Dict], valid_docs: Set[st
             "id": record_id,
             "agency": "USITC",
             "agency_short": "USITC",
+            "title": f"HTS {state.get('hts_code')} — {state.get('hts_description', '')}",
             "text": rate_text,
             "source": "TARIFFIQ.RAW.HTS_CODES",
             "url": None,
+            "effective_date": None,
         })
 
     adder_doc = state.get("adder_doc")
-    if adder_doc and adder_doc not in seen and adder_doc in valid_docs:
+    if adder_doc and adder_doc not in seen:
         seen.add(adder_doc)
+        adder_meta = meta.get(adder_doc, {})
+        # Plain English explanation for Chapter 99 codes
+        if adder_doc.startswith("9903"):
+            ch99_title = f"Chapter 99 surcharge code {adder_doc}"
+            ch99_text = f"Section 301/IEEPA adder rate — {adder_meta.get('title', adder_doc)}"
+        else:
+            ch99_title = adder_meta.get("title", f"FR {adder_doc}")
+            ch99_text = f"Section 301/IEEPA adder rate — method: {state.get('adder_method', 'unknown')}"
         citations.append({
             "type": "adder_source",
             "id": adder_doc,
             "agency": "Office of the U.S. Trade Representative",
             "agency_short": "USTR",
-            "text": f"Section 301/IEEPA adder rate — method: {state.get('adder_method', 'unknown')}",
+            "title": ch99_title,
+            "text": ch99_text,
             "source": "federalregister.gov",
-            "url": _fr_url(adder_doc),
+            "url": _fr_url(adder_doc) if not adder_doc.startswith("9903") else None,
+            "effective_date": adder_meta.get("publication_date"),
         })
 
     # Dedup by doc number here (not in _dedupe_chunks)
@@ -247,6 +343,7 @@ def _build_citations(state: TariffState, deduped: List[Dict], valid_docs: Set[st
             seen.add(doc)
             src = chunk.get("source", "USTR").upper()
             agency_meta = _SOURCE_AGENCY_MAP.get(src, {"agency": src, "agency_short": src})
+            doc_meta = meta.get(doc, {})
             chunk_text = chunk.get("chunk_text", "") or ""
             text = chunk_text[:120].strip() if chunk_text else ""
             citations.append({
@@ -254,9 +351,11 @@ def _build_citations(state: TariffState, deduped: List[Dict], valid_docs: Set[st
                 "id": doc,
                 "agency": agency_meta["agency"],
                 "agency_short": agency_meta["agency_short"],
+                "title": doc_meta.get("title", f"Federal Register {doc}"),
                 "text": text,
                 "source": f"TARIFFIQ.RAW.{'CBP_' if src == 'CBP' else ''}FEDERAL_REGISTER_NOTICES",
                 "url": _fr_url(doc),
+                "effective_date": doc_meta.get("publication_date", ""),
             })
 
     if not state.get("trade_suppressed") and state.get("import_value_usd") is not None:
@@ -281,6 +380,54 @@ def _build_citations(state: TariffState, deduped: List[Dict], valid_docs: Set[st
     return citations
 
 
+# Key alternative sourcing countries to compare
+COMPARISON_COUNTRIES = [
+    "Vietnam", "Mexico", "India", "South Korea",
+    "Taiwan", "Germany", "Japan", "Canada",
+]
+
+
+def _build_country_comparison(
+    hts_code: Optional[str],
+    current_country: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Run base rate lookup for key alternative sourcing countries.
+    Returns a list of {country, base_rate, fta_program, fta_applied, total_note}
+    sorted by effective rate ascending.
+    Skips the current country and countries that fail lookup.
+    """
+    if not hts_code:
+        return []
+
+    results = []
+    current_lower = (current_country or "").lower().strip()
+
+    for country in COMPARISON_COUNTRIES:
+        if country.lower() == current_lower:
+            continue
+        try:
+            rate_result = tools.hts_base_rate_lookup(hts_code, country=country)
+            if rate_result is None:
+                continue
+            results.append({
+                "country": country,
+                "base_rate": rate_result.get("base_rate", 0.0),
+                "mfn_rate": rate_result.get("mfn_rate", 0.0),
+                "fta_program": rate_result.get("fta_program"),
+                "fta_applied": rate_result.get("fta_applied", False),
+                # Note: adder rates not computed here (would require full pipeline per country)
+                "note": rate_result.get("fta_program") or "MFN rate",
+            })
+        except Exception as e:
+            logger.debug("country_comparison_error country=%s error=%s", country, e)
+            continue
+
+    # Sort by effective base rate ascending
+    results.sort(key=lambda x: x["base_rate"])
+    return results[:5]  # top 5 cheapest alternatives
+
+
 def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
     logger.info("synthesis_agent_start query=%s", state.get("query", "")[:80])
 
@@ -297,6 +444,9 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
 
     # Verify all docs against Snowflake
     valid_docs = _verify_docs(candidate_docs)
+
+    # Fetch metadata for citation enrichment
+    doc_metadata = _fetch_doc_metadata(valid_docs)
     if candidate_docs - valid_docs:
         logger.warning("synthesis_unverified_docs=%s", candidate_docs - valid_docs)
 
@@ -365,13 +515,31 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
         fr_docs_verified=bool(valid_docs),
         hitl_was_triggered=bool(state.get("hitl_required", False)),
     )
-    citations = _build_citations(state, deduped, valid_docs)
+    citations = _build_citations(state, deduped, valid_docs, doc_metadata)
+
+    # Country comparison — run base rate lookup for key alternative origins
+    country_comparison = _build_country_comparison(
+        hts_code=state.get("hts_code") or state.get("rate_record_id"),
+        current_country=state.get("country"),
+    )
+
+    # Rate change history — fetch if intent is rate_change
+    rate_change_history = None
+    if state.get("query_intent") == "rate_change":
+        hts_for_history = state.get("hts_code") or state.get("rate_record_id")
+        if hts_for_history:
+            rate_change_history = tools.fetch_rate_change_history(
+                hts_for_history, country=state.get("country")
+            )
+
     logger.info("synthesis_agent_done citations=%d confidence=%s", len(citations), conf)
 
     return {
         "final_response": final_response,
         "citations": citations,
         "pipeline_confidence": conf,
+        "country_comparison": country_comparison,
+        "rate_change_history": rate_change_history,
         "hitl_required": bool(state.get("hitl_required", False)),
         "hitl_reason": state.get("hitl_reason"),
     }

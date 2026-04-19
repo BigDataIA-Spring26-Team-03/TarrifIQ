@@ -25,6 +25,7 @@ class TariffState(TypedDict):
     # Step 1 — Query Agent
     product: Optional[str]
     country: Optional[str]
+    query_intent: Optional[str]   # "rate_change" | "country_compare" | "exemption_check" | None
     clarification_needed: Optional[bool]       # True if product too broad
     clarification_message: Optional[str]       # Human-readable message
     clarification_suggestions: Optional[List[Dict[str, str]]]  # [{label, query}]
@@ -66,6 +67,10 @@ class TariffState(TypedDict):
     final_response: Optional[str]
     citations: Optional[List[Dict[str, Any]]]
     pipeline_confidence: Optional[str]  # "HIGH" | "MEDIUM" | "LOW"
+
+    # Step 7 extras
+    country_comparison: Optional[List[Dict[str, Any]]]
+    rate_change_history: Optional[List[Dict[str, Any]]]
 
     # HITL
     hitl_required: Optional[bool]
