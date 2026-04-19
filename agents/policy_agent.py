@@ -151,14 +151,9 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     logger.info("policy_agent_hyde=%s", hyde_query[:120])
 
     # ── Step 2: Hybrid retrieval (dense + BM25 + RRF) ─────────────────────────
-    # Use HTS chapter filter for precision. HybridRetriever is a singleton —
-    # BM25 index is built once at startup, not per-request.
     from services.retrieval.hybrid import get_retriever
     retriever = get_retriever()
 
-    # Pass source filter based on country:
-    # China queries → prioritise USTR (Section 301 notices)
-    # All others → no source filter (CBP rulings may be relevant for any country)
     country_lower = (state.get("country") or "").lower().strip()
     source_filter = "USTR" if country_lower in ("china", "prc") else None
 
@@ -169,11 +164,102 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
         top_k=TOP_K,
     )
 
-    # If filtered returns nothing, retry unfiltered
     if not chunks:
-        logger.info("policy_agent_filter_empty hts=%s source=%s — retrying unfiltered",
-                    hts_code, source_filter)
+        logger.info("policy_agent_filter_empty hts=%s — retrying unfiltered", hts_code)
         chunks = retriever.search_policy(query=hyde_query, top_k=TOP_K)
+
+    # ── Step 2b: Fallback — fetch chunks via NOTICE_HTS_CODES lookup ─────────
+    # If vector search returned generic chunks (no HTS code match), supplement
+    # with chunks from documents that explicitly mention this HTS code.
+    # Try progressively shorter codes: 8471.30.01.00 → 8471.30.01 → 8471.30 → 8471
+    notice_chunks = []
+    if hts_code:
+        codes_to_try = [hts_code]
+        parts = hts_code.split(".")
+        while len(parts) > 2:
+            parts = parts[:-1]
+            codes_to_try.append(".".join(parts))
+
+        try:
+            conn = tools._sf()
+            cur = conn.cursor()
+            seen_chunk_ids = {c.get("chunk_id") for c in chunks}
+
+            for code in codes_to_try:
+                # Fetch from USTR chunks
+                cur.execute(
+                    """
+                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
+                           f.title, f.publication_date::VARCHAR
+                    FROM TARIFFIQ.RAW.CHUNKS c
+                    INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
+                        ON c.document_number = n.document_number
+                    LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                        ON c.document_number = f.document_number
+                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                    ORDER BY f.publication_date DESC NULLS LAST
+                    LIMIT 3
+                    """,
+                    (code,),
+                )
+                for chunk_id, chunk_text, doc_num, section, title, pub_date in cur.fetchall():
+                    if chunk_id and chunk_id not in seen_chunk_ids:
+                        seen_chunk_ids.add(chunk_id)
+                        notice_chunks.append({
+                            "chunk_id": chunk_id,
+                            "chunk_text": chunk_text,
+                            "document_number": doc_num,
+                            "section": section or "",
+                            "title": title or "",
+                            "publication_date": pub_date or "",
+                            "source": "USTR",
+                            "hts_code": code,
+                            "retrieval_method": "notice_hts_lookup",
+                        })
+
+                # Fetch from CBP chunks
+                cur.execute(
+                    """
+                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.section,
+                           f.title, f.publication_date::VARCHAR
+                    FROM TARIFFIQ.RAW.CBP_CHUNKS c
+                    INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n
+                        ON c.document_number = n.document_number
+                    LEFT JOIN TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES f
+                        ON c.document_number = f.document_number
+                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                    ORDER BY f.publication_date DESC NULLS LAST
+                    LIMIT 3
+                    """,
+                    (code,),
+                )
+                for chunk_id, chunk_text, doc_num, section, title, pub_date in cur.fetchall():
+                    if chunk_id and chunk_id not in seen_chunk_ids:
+                        seen_chunk_ids.add(chunk_id)
+                        notice_chunks.append({
+                            "chunk_id": chunk_id,
+                            "chunk_text": chunk_text,
+                            "document_number": doc_num,
+                            "section": section or "",
+                            "title": title or "",
+                            "publication_date": pub_date or "",
+                            "source": "CBP",
+                            "hts_code": code,
+                            "retrieval_method": "notice_hts_lookup",
+                        })
+
+                if notice_chunks:
+                    break  # Found direct matches — stop trying shorter codes
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.warning("policy_agent_notice_fallback_error hts=%s error=%s", hts_code, e)
+
+    if notice_chunks:
+        logger.info("policy_agent_notice_fallback hts=%s found=%d", hts_code, len(notice_chunks))
+        # Prepend notice chunks — they are more targeted than vector search results
+        chunks = notice_chunks + chunks
 
     if not chunks:
         logger.warning("policy_agent_no_chunks product=%s hts=%s", product, hts_code)

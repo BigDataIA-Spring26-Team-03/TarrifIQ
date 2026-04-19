@@ -22,6 +22,54 @@ from agents import tools
 
 logger = logging.getLogger(__name__)
 
+# ── Query Intent Detection ─────────────────────────────────────────────────────
+# Detect special query intents before running the standard pipeline.
+# Returns intent type and extracted entities, or None for standard pipeline.
+
+CHANGE_PATTERNS = [
+    r"(changed?|change|recent|latest|new|updated?|modified?|increase|decrease|rais|lower)",
+    r"(when did|since when|how long|history|historical|past|before|used to)",
+    r"(what happen|what will|upcoming|future|soon|expect)",
+]
+
+COMPARE_PATTERNS = [
+    r"(cheaper|cheapest|lower|lowest|better|compare|vs\.?|versus|or|between)",
+    r"(which country|which source|where (to |should I )?import|best (country|source|origin))",
+]
+
+EXEMPT_PATTERNS = [
+    r"(exempt|exclusion|excluded|waiver|not subject|exception|excluded from)",
+    r"(which products|what products|list of|products not)",
+]
+
+
+def _detect_intent(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Detect special query intents. Returns intent dict or None for standard pipeline.
+    
+    Intents:
+      - "rate_change": "has the tariff on X changed?" / "when did tariffs on X change?"
+      - "country_compare": "cheaper from China or Vietnam?"
+      - "exemption_check": "what products are exempt from Section 301?"
+      - None: standard "what is the tariff on X from Y?" pipeline
+    """
+    q = query.lower().strip()
+    
+    # Check for rate change intent
+    if any(re.search(p, q) for p in CHANGE_PATTERNS):
+        return {"intent": "rate_change"}
+    
+    # Check for country comparison intent  
+    if any(re.search(p, q) for p in COMPARE_PATTERNS):
+        return {"intent": "country_compare"}
+    
+    # Check for exemption intent
+    if any(re.search(p, q) for p in EXEMPT_PATTERNS):
+        return {"intent": "exemption_check"}
+    
+    return None
+
+
 MAX_RETRIES = 3
 RETRY_DELAYS = [0.5, 1.0, 2.0]
 SEMANTIC_THRESHOLD = 0.92
@@ -421,8 +469,15 @@ def run_query_agent(state: TariffState) -> Dict[str, Any]:
                 logger.info("query_agent_ambiguous product=%s — requesting clarification", product)
                 return clarification
 
-            logger.info("query_agent_done product=%s country=%s", product, country)
-            result = {"product": product, "country": country}
+            # Intent detection — check for special query types
+            intent_info = _detect_intent(query)
+            if intent_info:
+                intent = intent_info["intent"]
+                logger.info("query_agent_intent product=%s intent=%s", product, intent)
+                result = {"product": product, "country": country, "query_intent": intent}
+            else:
+                result = {"product": product, "country": country}
+
             _exact_set(query, result)
             _semantic_set(query, result)
             return result
