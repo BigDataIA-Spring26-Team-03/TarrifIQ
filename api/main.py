@@ -208,6 +208,7 @@ async def query(request: QueryRequest):
             "final_response": result.get("final_response"),
             "citations": result.get("citations"),
             "country_comparison": result.get("country_comparison"),
+            "top_importers": result.get("top_importers"),
             "rate_change_history": result.get("rate_change_history"),
             "query_intent": result.get("query_intent"),
             "hitl_required": result.get("hitl_required"),
