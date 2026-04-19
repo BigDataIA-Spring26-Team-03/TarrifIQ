@@ -22,9 +22,28 @@ logger = structlog.get_logger()
 
 
 def get_chroma_client() -> chromadb.HttpClient:
-    """Get ChromaDB HttpClient (same pattern as chromadb_init.py)."""
-    host = os.environ.get("CHROMADB_HOST", os.environ.get("CHROMA_HOST", "chromadb"))
-    port = int(os.environ.get("CHROMADB_PORT", os.environ.get("CHROMA_PORT", 8000)))
+    """Get ChromaDB HttpClient with Docker/local auto-detection."""
+    # Check environment variables first
+    host = os.environ.get("CHROMADB_HOST") or os.environ.get("CHROMA_HOST")
+    port = os.environ.get("CHROMADB_PORT") or os.environ.get("CHROMA_PORT")
+
+    # If not explicitly set, auto-detect based on environment
+    if not host or not port:
+        # Detect if running inside Docker
+        in_docker = os.path.exists("/.dockerenv")
+
+        if in_docker:
+            # Inside Docker: use Docker service name and internal port
+            host = host or "chromadb"
+            port = int(port or 8000)
+        else:
+            # Outside Docker: use 127.0.0.1 and mapped port (more reliable than localhost on Windows)
+            host = host or "127.0.0.1"
+            port = int(port or 9001)
+    else:
+        port = int(port)
+
+    logger.info("ChromaDB client", host=host, port=port, docker=os.path.exists("/.dockerenv"))
     return chromadb.HttpClient(host=host, port=port)
 
 
