@@ -1,0 +1,41 @@
+# Virtual environments (never bake these — pip install runs in the image)
+.venv
+.venv*
+venv
+env
+ENV
+
+# Git / IDE
+.git
+.gitignore
+.cursor
+.idea
+.vscode
+
+# Python noise
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+dist
+build
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+coverage.xml
+
+# Secrets (compose injects via env_file at runtime)
+.env
+.env.*
+!.env.example
+
+# Local data / caches that should not be in images
+*.log
+
+# Large optional trees (adjust if you need them in a specific image)
+node_modules
