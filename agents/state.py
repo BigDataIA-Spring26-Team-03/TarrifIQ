@@ -70,6 +70,7 @@ class TariffState(TypedDict):
 
     # Step 7 extras
     country_comparison: Optional[List[Dict[str, Any]]]
+    top_importers: Optional[List[Dict[str, Any]]]
     rate_change_history: Optional[List[Dict[str, Any]]]
 
     # HITL
