@@ -78,7 +78,7 @@ def _needs_build(chroma: chromadb.HttpClient, name: str) -> bool:
 
 
 def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
-    """Build policy_notices from USTR + CBP + ITC chunks."""
+    """Build policy_notices from USTR + CBP + ITC + ITA + EOP chunks."""
     conn = get_snowflake_conn()
     cur = conn.cursor()
     try:
@@ -126,8 +126,38 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         except Exception as e:
             logger.warning("chroma_init: ITC_CHUNKS unavailable: %s", e)
 
+        # ITA chunks
+        ita_start = len(documents)
+        try:
+            cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter FROM ITA_CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+            for i, row in enumerate(cur.fetchall()):
+                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
+                documents.append(text)
+                ids.append(f"ITA_{i}")
+                metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
+                                   "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
+                                   "source": "ITA", "section": section or ""})
+            logger.info("chroma_init: loaded %d ITA chunks", len(documents) - ita_start)
+        except Exception as e:
+            logger.warning("chroma_init: ITA_CHUNKS unavailable: %s", e)
+
+        # EOP chunks
+        eop_start = len(documents)
+        try:
+            cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter FROM EOP_CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+            for i, row in enumerate(cur.fetchall()):
+                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
+                documents.append(text)
+                ids.append(f"EOP_{i}")
+                metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
+                                   "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
+                                   "source": "EOP", "section": section or ""})
+            logger.info("chroma_init: loaded %d EOP chunks", len(documents) - eop_start)
+        except Exception as e:
+            logger.warning("chroma_init: EOP_CHUNKS unavailable: %s", e)
+
         # Embed and upsert
-        batch_size = 64
+        batch_size = 32
         total = len(documents)
         for i in range(0, total, batch_size):
             try:
@@ -137,8 +167,9 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
                     metadatas=metadatas[i:i+batch_size],
                     embeddings=embed_batch(documents[i:i+batch_size]),
                 )
+                logger.info("chroma_init: policy batch %d-%d upserted", i, min(i+batch_size, total))
             except Exception as e:
-                logger.warning("chroma_init: policy batch %d failed: %s", i, e)
+                logger.error("chroma_init: policy batch %d failed: %s", i, e)
 
         logger.info("chroma_init: policy_notices complete total=%d", total)
         return total
@@ -162,7 +193,7 @@ def build_hts_descriptions_collection(chroma: chromadb.HttpClient) -> int:
                       "chapter": r[4] or "", "is_chapter99": str(r[5]) if r[5] is not None else "False"}
                      for r in rows]
 
-        batch_size = 64
+        batch_size = 32
         for i in range(0, len(documents), batch_size):
             try:
                 col.upsert(
@@ -171,8 +202,9 @@ def build_hts_descriptions_collection(chroma: chromadb.HttpClient) -> int:
                     metadatas=metadatas[i:i+batch_size],
                     embeddings=embed_batch(documents[i:i+batch_size]),
                 )
+                logger.info("chroma_init: hts batch %d-%d upserted", i, min(i+batch_size, len(documents)))
             except Exception as e:
-                logger.warning("chroma_init: hts batch %d failed: %s", i, e)
+                logger.error("chroma_init: hts batch %d failed: %s", i, e)
 
         logger.info("chroma_init: hts_descriptions complete total=%d", len(documents))
         return len(documents)
