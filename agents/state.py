@@ -50,6 +50,7 @@ class TariffState(TypedDict):
 
     # Step 5 — Adder Rate Agent  (LLM reads policy_chunks)
     adder_rate: Optional[float]       # Section 301 / IEEPA / Section 232 adder
+    adder_specific_duty: Optional[str]  # e.g. "66.6¢/kg" for specific duty codes
     adder_doc: Optional[str]          # FR document that sourced the adder
     adder_method: Optional[str]       # "llm_policy" | "regex_fallback" | "none"
     total_duty: Optional[float]       # base_rate + adder_rate

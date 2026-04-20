@@ -216,10 +216,13 @@ def run_classification_agent(state: TariffState) -> Dict[str, Any]:
             "error": f"HTS {hts_code} not found in Snowflake",
         }
 
-    if verified != hts_code:
+    raw_hts_code = hts_code
+    if verified != raw_hts_code:
         description = tools.hts_description(verified) or description
         confidence = max(0.0, confidence - 0.05)
-        hts_code = verified
+    # Always propagate verified/shortened code downstream so alias write-back
+    # cannot use an unverified raw model output.
+    hts_code = verified
 
     hitl = confidence < HITL_THRESHOLD
     logger.info("classification_agent_done hts=%s conf=%.2f hitl=%s", hts_code, confidence, hitl)

@@ -23,6 +23,7 @@ Redis cache: 1-hour TTL keyed on (hts_code + country).
 """
 
 import asyncio
+import ast
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from agents import tools
 logger = logging.getLogger(__name__)
 
 CACHE_TTL = 3_600  # 1 h
+CHAP99_RE = re.compile(r"(9903\.\d{2}(?:\.\d{2}(?:\.\d{2})?)?)")
 
 ADDER_PROMPT = """Given the Federal Register excerpts below, determine the CURRENT effective
 Section 301, Section 232, or IEEPA additional duty rate for:
@@ -230,13 +232,35 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     hts_footnotes = state.get("hts_footnotes") or []
     chapter99_codes = []
     for fn in hts_footnotes:
-        # Extract codes like 9903.88.15 from footnote strings
-        import re as _re
-        matches = _re.findall(r"9903\.\d{2}\.\d{2}", str(fn))
+        # Footnotes are stored as str(dict) with single quotes — use ast.literal_eval
+        if isinstance(fn, dict):
+            value = fn.get("value", "") or ""
+        elif isinstance(fn, str):
+            try:
+                parsed = ast.literal_eval(fn)
+                value = parsed.get("value", "") if isinstance(parsed, dict) else fn
+            except (ValueError, SyntaxError):
+                value = fn  # fallback: run regex on raw string
+        else:
+            continue
+        matches = CHAP99_RE.findall(value)
         chapter99_codes.extend(matches)
+        if matches:
+            logger.info("chap99_footnote_parsed value=%s codes=%s", value.strip(), matches)
 
     if chapter99_codes:
         ch99_result = tools.chapter99_lookup(chapter99_codes, country=country)
+        if ch99_result and ch99_result.get("adder_rate") == -1.0:
+            result = {
+                "adder_rate": 0.0,
+                "adder_specific_duty": ch99_result.get("adder_specific_duty", ""),
+                "adder_method": "chapter99_specific_duty",
+                "adder_doc": ch99_result.get("chapter99_code", ""),
+                "total_duty": round(base_rate, 4),
+            }
+            logger.info("chap99_specific_duty hts=%s duty=%s", hts_code, result["adder_specific_duty"])
+            _cache_set(hts_code, country, result)
+            return result
         if ch99_result and ch99_result.get("adder_rate", 0) > 0:
             adder_val = ch99_result["adder_rate"]
             ch99_code = ch99_result["chapter99_code"]
@@ -261,6 +285,17 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
         if notice_ch99:
             chapter99_codes.extend(notice_ch99)
             ch99_result = tools.chapter99_lookup(chapter99_codes, country=country)
+            if ch99_result and ch99_result.get("adder_rate") == -1.0:
+                result = {
+                    "adder_rate": 0.0,
+                    "adder_specific_duty": ch99_result.get("adder_specific_duty", ""),
+                    "adder_method": "chapter99_specific_duty",
+                    "adder_doc": ch99_result.get("chapter99_code", ""),
+                    "total_duty": round(base_rate, 4),
+                }
+                logger.info("chap99_specific_duty hts=%s duty=%s", hts_code, result["adder_specific_duty"])
+                _cache_set(hts_code, country, result)
+                return result
             if ch99_result and ch99_result.get("adder_rate", 0) > 0:
                 adder_val = ch99_result["adder_rate"]
                 ch99_code = ch99_result["chapter99_code"]
