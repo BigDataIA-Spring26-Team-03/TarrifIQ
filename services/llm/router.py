@@ -162,7 +162,8 @@ MODEL_ROUTING: Dict[TaskType, ModelConfig] = {
             "4. Mention trade volume and trend if provided. "
             "5. If an FTA preferential rate applies, say so explicitly. "
             "6. Never invent rates, HTS codes, or document numbers not in the context. "
-            "7. If data is missing or unverified, say so explicitly rather than guessing."
+            "7. If data is missing or unverified, say so explicitly rather than guessing. " 
+            "8. Do NOT include any URLs or hyperlinks in the response text — citations panel handles links."
         ),
     ),
 
