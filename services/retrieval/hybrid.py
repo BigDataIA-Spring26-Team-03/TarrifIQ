@@ -175,15 +175,19 @@ class HybridRetriever:
             top_k=top_k
         )
 
+        # Enrich query with chapter context instead of metadata filtering.
+        if hts_chapter:
+            query = f"HTS chapter {hts_chapter} tariff {query}"
+
         # Step 1: Dense search
         dense_results = self._dense_search_policy(
-            query, hts_chapter, source, top_k * 3
+            query, None, source, top_k * 3
         )
         dense_dict = {r["chunk_id"]: (r, idx) for idx, r in enumerate(dense_results)}
 
         # Step 2: Sparse search (BM25)
         sparse_results = self._sparse_search_policy(
-            query, hts_chapter, source, top_k * 3
+            query, None, source, top_k * 3
         )
         sparse_dict = {r["chunk_id"]: (r, idx) for idx, r in enumerate(sparse_results)}
 
@@ -235,12 +239,12 @@ class HybridRetriever:
         if hts_chapter and source:
             where_filter = {
                 "$and": [
-                    {"hts_chapter": {"$eq": hts_chapter}},
+                    {"hts_chapter": {"$contains": hts_chapter}},
                     {"source": {"$eq": source}}
                 ]
             }
         elif hts_chapter:
-            where_filter = {"hts_chapter": {"$eq": hts_chapter}}
+            where_filter = {"hts_chapter": {"$contains": hts_chapter}}
         elif source:
             where_filter = {"source": {"$eq": source}}
 
@@ -314,7 +318,7 @@ class HybridRetriever:
 
                 # Apply chapter filter
                 if hts_chapter:
-                    if metadata.get("hts_chapter") != hts_chapter:
+                    if hts_chapter not in str(metadata.get("hts_chapter", "")):
                         continue
 
                 # Apply source filter
