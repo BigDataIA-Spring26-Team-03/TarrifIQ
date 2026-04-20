@@ -743,6 +743,116 @@ def write_hitl_record(
 
 # ── TOOL 13 — chapter99_lookup ───────────────────────────────────────────────
 
+def _expand_chap99_codes(codes: list, conn) -> list:
+    """
+    Expand Chapter 99 code ranges represented by boundary pairs with same prefix.
+    Example: 9904.02.01 + 9904.02.37 -> all HTS_CODES between those bounds.
+    """
+    expanded = []
+    codes_sorted = sorted(set(str(c).strip() for c in (codes or []) if str(c).strip()))
+
+    i = 0
+    while i < len(codes_sorted):
+        code = codes_sorted[i]
+        if i + 1 < len(codes_sorted):
+            next_code = codes_sorted[i + 1]
+            prefix_a = code.rsplit(".", 1)[0] if "." in code else code
+            prefix_b = next_code.rsplit(".", 1)[0] if "." in next_code else next_code
+            if prefix_a == prefix_b:
+                try:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(
+                            """
+                            SELECT HTS_CODE FROM TARIFFIQ.RAW.HTS_CODES
+                            WHERE HTS_CODE >= %s AND HTS_CODE <= %s
+                              AND IS_CHAPTER99 = TRUE
+                            ORDER BY HTS_CODE
+                            """,
+                            (code, next_code),
+                        )
+                        rows = cur.fetchall()
+                        expanded.extend([r[0] for r in rows if r and r[0]])
+                    finally:
+                        cur.close()
+                    i += 2
+                    continue
+                except Exception:
+                    pass
+        expanded.append(code)
+        i += 1
+
+    return expanded
+
+
+PERCENT_RE = re.compile(r"\+\s*(\d+(?:\.\d+)?)\s*%")
+CENTS_KG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[¢c]/\s*kg", re.IGNORECASE)
+DOLLAR_KG_RE = re.compile(r"\$(\d+(?:\.\d+)?)/\s*kg", re.IGNORECASE)
+
+
+def _parse_chap99_rate(general_rate: str, raw_json: Any) -> float:
+    """
+    Parse adder rate from Chapter 99 HTS row.
+    Priority: GENERAL_RATE % → RAW_JSON.general % → RAW_JSON.additionalDuties.
+    Returns -1.0 for specific (non-ad valorem) duties (e.g., cents/kg).
+    """
+    import json as _json
+
+    if general_rate:
+        m = PERCENT_RE.search(str(general_rate))
+        if m:
+            return float(m.group(1))
+
+    raw: Dict[str, Any] = {}
+    if raw_json:
+        try:
+            raw = _json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        except Exception:
+            raw = {}
+
+    general_field = raw.get("general", "") or ""
+    if general_field:
+        m = PERCENT_RE.search(str(general_field))
+        if m:
+            return float(m.group(1))
+
+    additional = raw.get("additionalDuties", "") or raw.get("addiitionalDuties", "") or ""
+    if additional:
+        m = PERCENT_RE.search(str(additional))
+        if m:
+            return float(m.group(1))
+        if CENTS_KG_RE.search(str(additional)) or DOLLAR_KG_RE.search(str(additional)):
+            return -1.0
+    return 0.0
+
+
+def _chap99_rate_source(general_rate: str, raw_json: Any) -> Tuple[str, str]:
+    """Return (source_tag, specific_duty_text) used for logging/result enrichment."""
+    import json as _json
+
+    if general_rate and PERCENT_RE.search(str(general_rate)):
+        return "general_rate", ""
+
+    raw: Dict[str, Any] = {}
+    if raw_json:
+        try:
+            raw = _json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        except Exception:
+            raw = {}
+
+    general_field = raw.get("general", "") or ""
+    if general_field and PERCENT_RE.search(str(general_field)):
+        return "raw_json_general", ""
+
+    additional = raw.get("additionalDuties", "") or raw.get("addiitionalDuties", "") or ""
+    if additional:
+        if PERCENT_RE.search(str(additional)):
+            return "raw_json_additional", ""
+        if CENTS_KG_RE.search(str(additional)) or DOLLAR_KG_RE.search(str(additional)):
+            return "raw_json_additional", str(additional)
+    return "none", ""
+
+
 def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Look up Chapter 99 surcharge codes directly in HTS_CODES.
@@ -759,14 +869,16 @@ def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) 
     is_china = country_lower in ("china", "prc", "people's republic of china")
 
     conn = _sf()
-    cur = conn.cursor()
-    total_rate = 0.0
-    applied_codes = []
-    primary_code = None
-    primary_desc = None
+    best_rate = 0.0
+    best_code = ""
+    best_desc = ""
+    specific_duty_code = ""
+    specific_duty_text = ""
 
     try:
-        for code in chapter99_codes:
+        expanded_codes = _expand_chap99_codes(chapter99_codes, conn)
+        cur = conn.cursor()
+        for code in expanded_codes:
             code = code.strip()
             if not code.startswith("99"):
                 continue
@@ -777,42 +889,43 @@ def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) 
                     continue
 
             cur.execute(
-                "SELECT hts_code, general_rate, description FROM TARIFFIQ.RAW.HTS_CODES "
-                "WHERE hts_code = %s LIMIT 1",
+                "SELECT hts_code, general_rate, raw_json, description FROM TARIFFIQ.RAW.HTS_CODES "
+                "WHERE hts_code = %s AND is_chapter99 = TRUE LIMIT 1",
                 (code,),
             )
             row = cur.fetchone()
             if not row:
                 continue
 
-            hts_code, general_rate_str, description = row
-            if not general_rate_str:
+            hts_code, general_rate_str, raw_json, description = row
+            rate = _parse_chap99_rate(general_rate_str, raw_json)
+            source, specific_text = _chap99_rate_source(general_rate_str, raw_json)
+            logger.info("chap99_rate_parsed code=%s rate=%s source=%s", hts_code, rate, source)
+
+            if rate == -1.0 and not specific_duty_code:
+                specific_duty_code = hts_code
+                specific_duty_text = specific_text
                 continue
 
-            # Parse rate from strings like:
-            # "The duty provided in the applicable subheading + 25%"
-            # "The duty provided in the applicable subheading plus 7.5%"
-            m = re.search(r"\+\s*(\d+(?:\.\d+)?)\s*%", general_rate_str)
-            if not m:
-                m = re.search(r"plus\s+(\d+(?:\.\d+)?)\s*%", general_rate_str, re.IGNORECASE)
-            if m:
-                rate = float(m.group(1))
-                # IEEPA stacking: sum all applicable Chapter 99 rates
-                # e.g. 9903.88.15 (7.5% Section 301) + 9903.91.06 (25% IEEPA) = 32.5%
-                total_rate += rate
-                applied_codes.append(hts_code)
-                if primary_code is None:
-                    primary_code = hts_code
-                    primary_desc = description
-                logger.info("chapter99_lookup found code=%s rate=%.1f total_so_far=%.1f country=%s",
-                            code, rate, total_rate, country)
+            if rate > best_rate:
+                best_rate = rate
+                best_code = hts_code
+                best_desc = description or ""
 
-        if applied_codes:
+        cur.close()
+
+        if best_rate > 0:
             return {
-                "adder_rate": total_rate,
-                "chapter99_code": applied_codes[-1],  # most recently added (most recent notice)
-                "chapter99_codes": applied_codes,     # all applied codes
-                "description": primary_desc,
+                "adder_rate": best_rate,
+                "chapter99_code": best_code,
+                "description": best_desc,
+            }
+        if specific_duty_code:
+            return {
+                "adder_rate": -1.0,
+                "chapter99_code": specific_duty_code,
+                "description": "",
+                "adder_specific_duty": specific_duty_text,
             }
         return None
 
@@ -820,7 +933,6 @@ def chapter99_lookup(chapter99_codes: List[str], country: Optional[str] = None) 
         logger.error("chapter99_lookup_error error=%s", e)
         return None
     finally:
-        cur.close()
         conn.close()
 
 
