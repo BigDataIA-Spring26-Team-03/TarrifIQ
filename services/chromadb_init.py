@@ -5,7 +5,7 @@ Builds two collections using HttpClient (ChromaDB container):
   1. policy_notices  — CHUNKS (USTR) + CBP_CHUNKS + ITC_CHUNKS
   2. hts_descriptions — HTS_CODES descriptions
 
-Skip-if-populated: if collection already has >1000 docs, skip rebuild.
+Skip-if-populated: if collection already has >10000 docs, skip rebuild.
 Set CHROMADB_FORCE_REBUILD=true to force full rebuild.
 
 NEVER deletes collections on every startup — that would wipe data for 60-90s.
@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _embedder = None
-SKIP_THRESHOLD = 1000
+SKIP_THRESHOLD = 10000
 
 
 def get_snowflake_conn():
@@ -90,7 +90,7 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         for i, row in enumerate(cur.fetchall()):
             chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
             documents.append(text)
-            ids.append(f"USTR_{i}")
+            ids.append(f"USTR_{chunk_id}" if chunk_id else f"USTR_{i}")
             metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
                                "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
                                "source": "USTR", "section": section or ""})
@@ -103,7 +103,7 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
             for i, row in enumerate(cur.fetchall()):
                 chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, gen_rate = row
                 documents.append(text)
-                ids.append(f"CBP_{i}")
+                ids.append(f"CBP_{chunk_id}" if chunk_id else f"CBP_{i}")
                 metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
                                    "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
                                    "source": "CBP", "section": section or "", "general_rate": gen_rate or ""})
@@ -118,7 +118,7 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
             for i, row in enumerate(cur.fetchall()):
                 chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
                 documents.append(text)
-                ids.append(f"USITC_{i}")
+                ids.append(f"USITC_{chunk_id}" if chunk_id else f"USITC_{i}")
                 metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
                                    "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
                                    "source": "USITC", "section": section or ""})
@@ -133,7 +133,7 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
             for i, row in enumerate(cur.fetchall()):
                 chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
                 documents.append(text)
-                ids.append(f"ITA_{i}")
+                ids.append(f"ITA_{chunk_id}" if chunk_id else f"ITA_{i}")
                 metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
                                    "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
                                    "source": "ITA", "section": section or ""})
@@ -148,7 +148,7 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
             for i, row in enumerate(cur.fetchall()):
                 chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
                 documents.append(text)
-                ids.append(f"EOP_{i}")
+                ids.append(f"EOP_{chunk_id}" if chunk_id else f"EOP_{i}")
                 metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
                                    "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
                                    "source": "EOP", "section": section or ""})
@@ -220,14 +220,9 @@ def search_policy(query: str, hts_chapter: Optional[str] = None, source: Optiona
     except Exception:
         raise RuntimeError("policy_notices not initialized.")
 
-    where = None
-    if source or hts_chapter:
-        filters = []
-        if source:
-            filters.append({"source": {"$eq": source}})
-        if hts_chapter:
-            filters.append({"hts_chapter": {"$eq": hts_chapter}})
-        where = {"$and": filters} if len(filters) > 1 else filters[0]
+    if hts_chapter:
+        query = f"HTS chapter {hts_chapter} tariff {query}"
+    where = {"source": {"$eq": source}} if source else None
 
     results = col.query(query_texts=[query], n_results=limit, where=where,
                         include=["documents", "metadatas", "distances"])
@@ -250,7 +245,9 @@ def search_hts(query: str, chapter: Optional[str] = None, limit: int = 5) -> Lis
     except Exception:
         raise RuntimeError("hts_descriptions not initialized.")
 
-    where = {"chapter": {"$eq": chapter}} if chapter else None
+    if chapter:
+        query = f"HTS chapter {chapter} {query}"
+    where = None
     results = col.query(query_texts=[query], n_results=limit, where=where,
                         include=["documents", "metadatas", "distances"])
 
@@ -267,9 +264,13 @@ def search_hts(query: str, chapter: Optional[str] = None, limit: int = 5) -> Lis
 def initialize_chromadb():
     """
     Initialize ChromaDB on startup.
-    Skips if collections already populated (>1000 docs).
+    Skips if collections already populated (>10000 docs).
     Set CHROMADB_FORCE_REBUILD=true to force full rebuild.
+    Set CHROMADB_SKIP_INIT=true to skip init entirely.
     """
+    if os.environ.get("CHROMADB_SKIP_INIT", "false").lower() == "true":
+        logger.info("chroma_init: skipped (CHROMADB_SKIP_INIT=true)")
+        return
     logger.info("chroma_init: starting")
     start = time.time()
     chroma = get_chroma_client()
