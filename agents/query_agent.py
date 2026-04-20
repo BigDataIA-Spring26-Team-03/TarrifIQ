@@ -27,19 +27,22 @@ logger = logging.getLogger(__name__)
 # Returns intent type and extracted entities, or None for standard pipeline.
 
 CHANGE_PATTERNS = [
-    r"(changed?|change|recent|latest|new|updated?|modified?|increase|decrease|rais|lower)",
-    r"(when did|since when|how long|history|historical|past|before|used to)",
-    r"(what happen|what will|upcoming|future|soon|expect)",
+    r"(has.*changed|have.*changed|did.*change|when did.*change)",
+    r"(since when|how long|history of tariff|historical rate|tariff history)",
+    r"(what happened to|what will happen|upcoming tariff|future tariff|expect.*tariff)",
+    r"(recent.*tariff|latest.*tariff|new.*tariff|tariff.*update|tariff.*modified)",
 ]
 
 COMPARE_PATTERNS = [
-    r"(cheaper|cheapest|lower|lowest|better|compare|vs\.?|versus|or|between)",
-    r"(which country|which source|where (to |should I )?import|best (country|source|origin))",
+    r"(cheaper to import from|which is cheaper|is it cheaper)",
+    r"(which country.*import|where should.*import|best.*source.*import)",
+    r"(compare.*tariff|tariff.*comparison|vs\.?\s+\w+.*tariff|tariff.*vs\.?\s+\w+)",
+    r"(china.*or.*vietnam|vietnam.*or.*china|china.*vs.*mexico|mexico.*vs.*china)",
 ]
 
 EXEMPT_PATTERNS = [
-    r"(exempt|exclusion|excluded|waiver|not subject|exception|excluded from)",
-    r"(which products|what products|list of|products not)",
+    r"(exempt from|excluded from|not subject to|exclusion from)",
+    r"(which products.*exempt|what products.*excluded|products.*not.*tariff)",
 ]
 
 
