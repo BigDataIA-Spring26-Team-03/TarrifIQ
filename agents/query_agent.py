@@ -246,8 +246,14 @@ def _check_ambiguity(product: str, country: Optional[str]) -> Optional[Dict]:
 
     product_lower = product.lower().strip()
 
-    # Multi-word products are already specific enough
-    if len(product_lower.split()) >= 2:
+    # Skip ambiguity check only for products already in high-confidence aliases
+    # (those are manually curated and don't need clarification)
+    alias_result = tools.alias_lookup(product_lower)
+    if alias_result and alias_result[1] >= 0.95:
+        return None
+
+    # Multi-word products with 3+ words are specific enough to skip
+    if len(product_lower.split()) >= 3:
         return None
 
     try:
