@@ -42,6 +42,7 @@ HTS CLASSIFICATION: {hts_code} — {hts_description} (confidence: {confidence})
 VERIFIED DUTY RATE [HTS {record_id}]:
   {rate_line}
   Section 301/IEEPA:     {adder_rate:.2f}% {adder_source}
+{specific_duty_line}
   Total effective duty:  {total_duty:.2f}%
 {footnote_line}
 POLICY CHUNKS (full text per chunk until SYNTHESIS_* env budgets; cite ONLY these FR doc numbers: {valid_docs}):
@@ -384,8 +385,15 @@ def _build_context(
     adder_rate = state.get("adder_rate") or 0.0
     total_duty = state.get("total_duty") or 0.0
     adder_doc = state.get("adder_doc")
+    adder_specific_duty = (state.get("adder_specific_duty") or "").strip()
 
     adder_source = f"(sourced from {adder_doc})" if adder_doc else "(source: not identified)"
+    specific_duty_line = ""
+    if adder_specific_duty:
+        if adder_doc:
+            specific_duty_line = f"  Chapter 99 specific duty: {adder_specific_duty} [{adder_doc}]"
+        else:
+            specific_duty_line = f"  Chapter 99 specific duty: {adder_specific_duty}"
 
     fta_applied = state.get("fta_applied", False)
     fta_program = state.get("fta_program")
@@ -451,6 +459,7 @@ def _build_context(
         base_rate=base_rate,
         adder_rate=adder_rate,
         adder_source=adder_source,
+        specific_duty_line=specific_duty_line,
         total_duty=total_duty,
         footnote_line=footnote_line,
         valid_docs=", ".join(sorted(valid_docs)) if valid_docs else "none",
@@ -686,8 +695,15 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
 
     # Fetch metadata for citation enrichment
     doc_metadata = _fetch_doc_metadata(valid_docs)
-    if candidate_docs - valid_docs:
-        logger.warning("synthesis_unverified_docs=%s", candidate_docs - valid_docs)
+    unverified_docs = candidate_docs - valid_docs
+    # Suppress unverified doc warning for chapter99_lookup sourced adder docs
+    adder_doc = state.get("adder_doc") or ""
+    adder_method = state.get("adder_method") or ""
+    if adder_method == "chapter99_lookup" and adder_doc in unverified_docs:
+        unverified_docs.discard(adder_doc)
+        logger.info("synthesis_chap99_doc_suppressed doc=%s", adder_doc)
+    if unverified_docs:
+        logger.warning("synthesis_unverified_docs=%s", unverified_docs)
 
     # Verify rate record
     record_id = state.get("rate_record_id")
