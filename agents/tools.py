@@ -499,8 +499,8 @@ def alias_write(product: str, hts_code: str, confidence: float) -> None:
         if existing:
             if existing[0] == hts_code and stored > float(existing[1] or 0):
                 cur.execute(
-                    "UPDATE TARIFFIQ.RAW.PRODUCT_ALIASES SET confidence=%s, "
-                    "updated_at=CURRENT_TIMESTAMP() WHERE LOWER(alias)=LOWER(%s)",
+                    "UPDATE TARIFFIQ.RAW.PRODUCT_ALIASES SET confidence=%s "
+                    "WHERE LOWER(alias)=LOWER(%s)",
                     (stored, product.strip()),
                 )
                 logger.info("alias_write_updated product=%s hts=%s", product, hts_code)
@@ -510,8 +510,8 @@ def alias_write(product: str, hts_code: str, confidence: float) -> None:
         else:
             cur.execute(
                 "INSERT INTO TARIFFIQ.RAW.PRODUCT_ALIASES "
-                "(alias, hts_code, confidence, created_at, updated_at) "
-                "VALUES (%s,%s,%s,CURRENT_TIMESTAMP(),CURRENT_TIMESTAMP())",
+                "(alias, hts_code, confidence, created_at) "
+                "VALUES (%s,%s,%s,CURRENT_TIMESTAMP())",
                 (product.strip(), hts_code, stored),
             )
             logger.info("alias_write_inserted product=%s hts=%s conf=%.2f", product, hts_code, stored)
