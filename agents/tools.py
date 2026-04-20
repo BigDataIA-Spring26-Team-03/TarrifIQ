@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import uuid
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -1247,16 +1248,68 @@ def fetch_top_importer_countries(
     return out
 
 
-def _hts_parent_codes(hts_code: str) -> List[str]:
-    """8421.30.01.00 → [8421.30.01.00, 8421.30.01, 8421.30, 8421]."""
+def _get_hts_hierarchy(hts_code: str) -> List[str]:
+    """
+    Returns all parent codes for hierarchical lookup.
+    "7217.10.80" → ["7217.10.80", "7217.10", "7217", "72"]
+    """
     if not (hts_code or "").strip():
         return []
-    codes = [hts_code.strip()]
-    parts = hts_code.split(".")
-    while len(parts) > 2:
+    s = hts_code.strip()
+    levels: List[str] = []
+    levels.append(s)
+    parts = s.split(".")
+    while len(parts) > 1:
         parts = parts[:-1]
-        codes.append(".".join(parts))
-    return codes
+        levels.append(".".join(parts))
+    chapter = s.replace(".", "")[:2]
+    if chapter and chapter not in levels:
+        levels.append(chapter)
+    return levels
+
+
+def _score_chunk_relevance(
+    doc_number: str,
+    hts_code: str,
+    doc_hts_map: Dict[str, Set[str]],
+) -> int:
+    """
+    Score how specifically this document matches the queried HTS code.
+    4 = exact subheading match
+    3 = parent subheading match (e.g. 7217.10)
+    2 = heading match (e.g. 7217)
+    1 = chapter match only (e.g. 72)
+    0 = no match found
+    """
+    linked = doc_hts_map.get(doc_number, set())
+    if not linked:
+        return 0
+
+    hc = hts_code.strip()
+    code_clean = hc.replace(".", "")
+    parts = hc.split(".")
+    chapter = code_clean[:2]
+
+    for lhts in linked:
+        if lhts.replace(".", "") == code_clean:
+            return 4
+
+    if len(parts) >= 2:
+        parent = ".".join(parts[:2])
+        for lhts in linked:
+            if lhts.startswith(parent):
+                return 3
+
+    heading = parts[0]
+    for lhts in linked:
+        if lhts.startswith(heading):
+            return 2
+
+    for lhts in linked:
+        if lhts.replace(".", "")[:2] == chapter:
+            return 1
+
+    return 0
 
 
 def fetch_all_hts_linked_policy_chunks(hts_code: str) -> List[Dict[str, Any]]:
@@ -1271,190 +1324,223 @@ def fetch_all_hts_linked_policy_chunks(hts_code: str) -> List[Dict[str, Any]]:
 
     per_doc = max(1, int(os.environ.get("HTS_LINKED_CHUNKS_PER_DOCUMENT", "5")))
 
-    codes = _hts_parent_codes(hts_code)
+    codes_to_try = _get_hts_hierarchy(hts_code.strip())
+    if not codes_to_try:
+        return []
+
+    ph = ",".join(["%s"] * len(codes_to_try))
+    in_params = tuple(codes_to_try)
+
     seen: Set[str] = set()
     rows_out: List[Dict[str, Any]] = []
+    doc_hts_map: Dict[str, Set[str]] = defaultdict(set)
 
     conn = _sf()
     cur = conn.cursor()
     try:
-        for code in codes:
 
-            def _add_row(
-                chunk_id: Any,
-                chunk_text: Any,
-                doc_num: Any,
-                chunk_index: Any,
-                section: Any,
-                title: Any,
-                pub_date: Any,
-                src: str,
-                method: str,
-            ) -> None:
-                if not chunk_id or not chunk_text:
-                    return
-                cid = str(chunk_id)
-                if cid in seen:
-                    return
-                seen.add(cid)
-                rows_out.append({
-                    "chunk_id": cid,
-                    "chunk_text": str(chunk_text),
-                    "document_number": str(doc_num or ""),
-                    "chunk_index": int(chunk_index) if chunk_index is not None else 0,
-                    "section": str(section or ""),
-                    "title": str(title or ""),
-                    "publication_date": str(pub_date or ""),
-                    "source": src,
-                    "hts_code": code,
-                    "retrieval_method": method,
-                })
+        def _note_link(doc_num: Any, linked_hts: Any) -> None:
+            d = str(doc_num or "").strip()
+            h = str(linked_hts or "").strip()
+            if d and h:
+                doc_hts_map[d].add(h)
 
+        def _add_row(
+            chunk_id: Any,
+            chunk_text: Any,
+            doc_num: Any,
+            chunk_index: Any,
+            section: Any,
+            title: Any,
+            pub_date: Any,
+            src: str,
+            method: str,
+            linked_hts: Any,
+        ) -> None:
+            if not chunk_id or not chunk_text:
+                return
+            cid = str(chunk_id)
+            if cid in seen:
+                return
+            seen.add(cid)
+            lh = str(linked_hts or "").strip()
+            rows_out.append({
+                "chunk_id": cid,
+                "chunk_text": str(chunk_text),
+                "document_number": str(doc_num or ""),
+                "chunk_index": int(chunk_index) if chunk_index is not None else 0,
+                "section": str(section or ""),
+                "title": str(title or ""),
+                "publication_date": str(pub_date or ""),
+                "source": src,
+                "hts_code": hts_code.strip(),
+                "retrieval_method": method,
+                "linked_hts_code": lh,
+            })
+
+        cur.execute(
+            f"""
+            WITH ranked AS (
+                SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                       f.title, f.publication_date::VARCHAR AS publication_date,
+                       n.hts_code AS linked_hts,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY c.document_number
+                           ORDER BY c.chunk_index ASC NULLS LAST
+                       ) AS rn
+                FROM TARIFFIQ.RAW.CHUNKS c
+                INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
+                    ON c.document_number = n.document_number
+                LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                    ON c.document_number = f.document_number
+                WHERE n.hts_code IN ({ph}) AND c.chunk_text IS NOT NULL
+            )
+            SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date, linked_hts
+            FROM ranked
+            WHERE rn <= %s
+            ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
+            """,
+            in_params + (per_doc,),
+        )
+        for r in cur.fetchall():
+            _note_link(r[2], r[7])
+            _add_row(
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], "USTR", "hts_notice_full", r[7],
+            )
+
+        cur.execute(
+            f"""
+            WITH ranked AS (
+                SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                       f.title, f.publication_date::VARCHAR AS publication_date,
+                       n.hts_code AS linked_hts,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY c.document_number
+                           ORDER BY c.chunk_index ASC NULLS LAST
+                       ) AS rn
+                FROM TARIFFIQ.RAW.CBP_CHUNKS c
+                INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n
+                    ON c.document_number = n.document_number
+                LEFT JOIN TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES f
+                    ON c.document_number = f.document_number
+                WHERE n.hts_code IN ({ph}) AND c.chunk_text IS NOT NULL
+            )
+            SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date, linked_hts
+            FROM ranked
+            WHERE rn <= %s
+            ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
+            """,
+            in_params + (per_doc,),
+        )
+        for r in cur.fetchall():
+            _note_link(r[2], r[7])
+            _add_row(
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], "CBP", "hts_notice_full", r[7],
+            )
+
+        try:
             cur.execute(
-                """
+                f"""
                 WITH ranked AS (
                     SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
                            f.title, f.publication_date::VARCHAR AS publication_date,
+                           n.hts_code AS linked_hts,
                            ROW_NUMBER() OVER (
                                PARTITION BY c.document_number
                                ORDER BY c.chunk_index ASC NULLS LAST
                            ) AS rn
-                    FROM TARIFFIQ.RAW.CHUNKS c
-                    INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES n
+                    FROM TARIFFIQ.RAW.ITC_CHUNKS c
+                    INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES_ITC n
                         ON c.document_number = n.document_number
-                    LEFT JOIN TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES f
+                    LEFT JOIN TARIFFIQ.RAW.ITC_DOCUMENTS f
                         ON c.document_number = f.document_number
-                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                    WHERE n.hts_code IN ({ph}) AND c.chunk_text IS NOT NULL
                 )
-                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date, linked_hts
                 FROM ranked
                 WHERE rn <= %s
                 ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
                 """,
-                (code, per_doc),
+                in_params + (per_doc,),
             )
             for r in cur.fetchall():
+                _note_link(r[2], r[7])
                 _add_row(
-                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "USTR", "hts_notice_full",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "USITC", "hts_notice_full", r[7],
                 )
+        except Exception as e:
+            logger.debug("fetch_all_hts_itc levels=%s err=%s", codes_to_try, e)
 
+        try:
             cur.execute(
-                """
+                f"""
                 WITH ranked AS (
                     SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
                            f.title, f.publication_date::VARCHAR AS publication_date,
+                           n.hts_code AS linked_hts,
                            ROW_NUMBER() OVER (
                                PARTITION BY c.document_number
                                ORDER BY c.chunk_index ASC NULLS LAST
                            ) AS rn
-                    FROM TARIFFIQ.RAW.CBP_CHUNKS c
-                    INNER JOIN TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES n
+                    FROM TARIFFIQ.RAW.EOP_CHUNKS c
+                    INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES_EOP n
                         ON c.document_number = n.document_number
-                    LEFT JOIN TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES f
+                    LEFT JOIN TARIFFIQ.RAW.EOP_DOCUMENTS f
                         ON c.document_number = f.document_number
-                    WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
+                    WHERE n.hts_code IN ({ph}) AND c.chunk_text IS NOT NULL
                 )
-                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
+                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date, linked_hts
                 FROM ranked
                 WHERE rn <= %s
                 ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
                 """,
-                (code, per_doc),
+                in_params + (per_doc,),
             )
             for r in cur.fetchall():
+                _note_link(r[2], r[7])
                 _add_row(
-                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "CBP", "hts_notice_full",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "EOP", "hts_notice_full", r[7],
                 )
+        except Exception as e:
+            logger.debug("fetch_all_hts_eop levels=%s err=%s", codes_to_try, e)
 
-            try:
-                cur.execute(
-                    """
-                    WITH ranked AS (
-                        SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
-                               f.title, f.publication_date::VARCHAR AS publication_date,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY c.document_number
-                                   ORDER BY c.chunk_index ASC NULLS LAST
-                               ) AS rn
-                        FROM TARIFFIQ.RAW.ITC_CHUNKS c
-                        INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES_ITC n
-                            ON c.document_number = n.document_number
-                        LEFT JOIN TARIFFIQ.RAW.ITC_DOCUMENTS f
-                            ON c.document_number = f.document_number
-                        WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
-                    )
-                    SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
-                    FROM ranked
-                    WHERE rn <= %s
-                    ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
-                    """,
-                    (code, per_doc),
+        try:
+            cur.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
+                           CAST(NULL AS VARCHAR) AS title,
+                           CAST(NULL AS VARCHAR) AS publication_date,
+                           c.hts_code AS linked_hts,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY c.document_number
+                               ORDER BY c.chunk_index ASC NULLS LAST
+                           ) AS rn
+                    FROM TARIFFIQ.RAW.ITA_CHUNKS c
+                    WHERE c.hts_code IN ({ph}) AND c.chunk_text IS NOT NULL
                 )
-                for r in cur.fetchall():
-                    _add_row(
-                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], "USITC", "hts_notice_full",
-                    )
-            except Exception as e:
-                logger.debug("fetch_all_hts_itc code=%s err=%s", code, e)
+                SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date, linked_hts
+                FROM ranked
+                WHERE rn <= %s
+                ORDER BY document_number, chunk_index
+                """,
+                in_params + (per_doc,),
+            )
+            for r in cur.fetchall():
+                _note_link(r[2], r[7])
+                _add_row(
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], "ITA", "hts_chunk_hts_code", r[7],
+                )
+        except Exception as e:
+            logger.debug("fetch_all_hts_ita levels=%s err=%s", codes_to_try, e)
 
-            try:
-                cur.execute(
-                    """
-                    WITH ranked AS (
-                        SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
-                               f.title, f.publication_date::VARCHAR AS publication_date,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY c.document_number
-                                   ORDER BY c.chunk_index ASC NULLS LAST
-                               ) AS rn
-                        FROM TARIFFIQ.RAW.EOP_CHUNKS c
-                        INNER JOIN TARIFFIQ.RAW.NOTICE_HTS_CODES_EOP n
-                            ON c.document_number = n.document_number
-                        LEFT JOIN TARIFFIQ.RAW.EOP_DOCUMENTS f
-                            ON c.document_number = f.document_number
-                        WHERE n.hts_code = %s AND c.chunk_text IS NOT NULL
-                    )
-                    SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
-                    FROM ranked
-                    WHERE rn <= %s
-                    ORDER BY publication_date ASC NULLS LAST, document_number, chunk_index
-                    """,
-                    (code, per_doc),
-                )
-                for r in cur.fetchall():
-                    _add_row(
-                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], "EOP", "hts_notice_full",
-                    )
-            except Exception as e:
-                logger.debug("fetch_all_hts_eop code=%s err=%s", code, e)
-
-            try:
-                cur.execute(
-                    """
-                    WITH ranked AS (
-                        SELECT c.chunk_id, c.chunk_text, c.document_number, c.chunk_index, c.section,
-                               CAST(NULL AS VARCHAR) AS title,
-                               CAST(NULL AS VARCHAR) AS publication_date,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY c.document_number
-                                   ORDER BY c.chunk_index ASC NULLS LAST
-                               ) AS rn
-                        FROM TARIFFIQ.RAW.ITA_CHUNKS c
-                        WHERE c.hts_code = %s AND c.chunk_text IS NOT NULL
-                    )
-                    SELECT chunk_id, chunk_text, document_number, chunk_index, section, title, publication_date
-                    FROM ranked
-                    WHERE rn <= %s
-                    ORDER BY document_number, chunk_index
-                    """,
-                    (code, per_doc),
-                )
-                for r in cur.fetchall():
-                    _add_row(
-                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], "ITA", "hts_chunk_hts_code",
-                    )
-            except Exception as e:
-                logger.debug("fetch_all_hts_ita code=%s err=%s", code, e)
+        doc_nums = {r.get("document_number", "") for r in rows_out if r.get("document_number")}
+        logger.info(
+            "hts_hierarchical_lookup code=%s levels=%s docs_found=%d",
+            hts_code,
+            codes_to_try,
+            len(doc_nums),
+        )
 
         rows_out.sort(
             key=lambda x: (
@@ -1463,14 +1549,47 @@ def fetch_all_hts_linked_policy_chunks(hts_code: str) -> List[Dict[str, Any]]:
                 x.get("chunk_index") or 0,
             )
         )
+
+        hierarchy = _get_hts_hierarchy(hts_code.strip())
+        for chunk in rows_out:
+            doc = chunk.get("document_number", "")
+            linked_hts = chunk.get("linked_hts_code", "")
+            if doc and linked_hts:
+                doc_hts_map[str(doc).strip()].add(str(linked_hts).strip())
+
+        qhts = hts_code.strip()
+        for chunk in rows_out:
+            doc = str(chunk.get("document_number", "") or "").strip()
+            chunk["_relevance_score"] = _score_chunk_relevance(doc, qhts, doc_hts_map)
+
+        high_relevance = [c for c in rows_out if c["_relevance_score"] >= 2]
+        low_relevance = [c for c in rows_out if c["_relevance_score"] == 1]
+        no_match = [c for c in rows_out if c["_relevance_score"] == 0]
+
+        final_chunks = high_relevance[:20]
+        if len(final_chunks) < 5:
+            final_chunks = final_chunks + low_relevance[: max(0, 20 - len(final_chunks))]
+
+        for chunk in final_chunks:
+            chunk.pop("_relevance_score", None)
+
         logger.info(
-            "fetch_all_hts_linked_policy_chunks hts=%s codes_tried=%d chunks=%d per_doc_cap=%d",
+            "hts_relevance_filter hts=%s high=%d low=%d no_match=%d final=%d",
             hts_code,
-            len(codes),
-            len(rows_out),
+            len(high_relevance),
+            len(low_relevance),
+            len(no_match),
+            len(final_chunks),
+        )
+
+        logger.info(
+            "fetch_all_hts_linked_policy_chunks hts=%s levels=%d chunks=%d per_doc_cap=%d",
+            hts_code,
+            len(codes_to_try),
+            len(final_chunks),
             per_doc,
         )
-        return rows_out
+        return final_chunks
     except Exception as e:
         logger.error("fetch_all_hts_linked_policy_chunks_error hts=%s error=%s", hts_code, e)
         return []
