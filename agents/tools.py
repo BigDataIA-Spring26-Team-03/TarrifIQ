@@ -320,9 +320,7 @@ def hts_keyword_search(
         search_lower = query.lower().strip()
         conditions = [
             "LOWER(description) LIKE LOWER(%s)",
-            "is_header_row = FALSE",
             "chapter NOT IN ('98','99')",
-            "general_rate IS NOT NULL",
         ]
         params: List[Any] = [f"%{search_lower}%"]
 

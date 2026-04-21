@@ -480,7 +480,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     notice_doc = state.get("notice_doc")
     exhaustive: List[Dict[str, Any]] = []
     if hts_code:
-        raw_exhaustive = tools.fetch_all_hts_linked_policy_chunks(hts_code, seed_doc=notice_doc)
+        raw_exhaustive = tools.fetch_all_hts_linked_policy_chunks(hts_code)
         if raw_exhaustive:
             bm25_query = f"{product} {hts_code} tariff duty {country}"
             exhaustive = _bm25_rerank_exhaustive(raw_exhaustive, bm25_query, top_n=10)

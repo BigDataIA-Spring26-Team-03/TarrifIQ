@@ -38,11 +38,67 @@ from agents import tools
 logger = logging.getLogger(__name__)
 
 
-# ── Node wrappers ──────────────────────────────────────────────────────────────
+def _fetch_subcategory_suggestions(hts_code: str, product: str, country: str) -> list:
+    if not hts_code:
+        return []
+    try:
+        heading = hts_code.split(".")[0] if "." in hts_code else hts_code[:4]
+        country_suffix = f" from {country}" if country else ""
+        # Expand product query with synonyms for better HTS matching
+        SYNONYMS = {
+            'pipes': 'tubes', 'pipe': 'tube',
+            'steel pipes': 'steel tubes', 'iron pipes': 'iron tubes',
+        }
+        search_product = product.lower().strip()
+        for term, synonym in SYNONYMS.items():
+            if term in search_product:
+                search_product = search_product.replace(term, synonym)
+                break
+        rows = tools.hts_keyword_search(query=search_product, limit=12, heading_filter=heading)
+        # If too few results, broaden to chapter level
+        if len(rows) < 3:
+            chapter = heading[:2]
+            broader = tools.hts_keyword_search(query=product, limit=12, chapter_filter=chapter)
+            # Merge, dedupe by hts_code
+            seen_codes = {r['hts_code'] for r in rows}
+            for r in broader:
+                if r['hts_code'] not in seen_codes:
+                    rows.append(r)
+                    seen_codes.add(r['hts_code'])
+        # Still too few — search globally without any filter
+        if len(rows) < 3:
+            broader = tools.hts_keyword_search(query=product, limit=12)
+            seen_codes = {r["hts_code"] for r in rows}
+            for r in broader:
+                if r["hts_code"] not in seen_codes:
+                    rows.append(r)
+                    seen_codes.add(r["hts_code"])
+        if not rows:
+            return []
+        suggestions = []
+        seen: set = set()
+        for r in rows:
+            desc = (r.get("description") or "").strip()
+            if not desc or len(desc) < 4:
+                continue
+            if desc.lower().startswith(("of ", "other", "not ", "nesoi", ":")):
+                continue
+            dl = desc.lower()
+            if dl in seen:
+                continue
+            seen.add(dl)
+            label = desc if len(desc) <= 70 else desc[:67] + "..."
+            suggestions.append({"label": label, "query": f"{dl}{country_suffix}"})
+            if len(suggestions) >= 5:
+                break
+        return suggestions
+    except Exception as e:
+        logger.debug("fetch_subcategory_suggestions_error hts=%s error=%s", hts_code, e)
+        return []
+
 
 def query_node(state: TariffState) -> Dict[str, Any]:
     result = run_query_agent(state)
-    # If query agent detected ambiguity, mark for short-circuit
     if result.get("clarification_needed"):
         return {
             "clarification_needed": True,
@@ -55,18 +111,26 @@ def query_node(state: TariffState) -> Dict[str, Any]:
 
 
 def classification_node(state: TariffState) -> Dict[str, Any]:
-    return run_classification_agent(state)
+    result = run_classification_agent(state)
+    if result.get("hitl_required") and result.get("hitl_reason") in ("low_confidence", "semantic_mismatch"):
+        hts_code = result.get("hts_code")
+        product = state.get("product") or ""
+        country = state.get("country") or ""
+        suggestions = _fetch_subcategory_suggestions(hts_code, product, country)
+        if suggestions:
+            result["clarification_needed"] = True
+            result["clarification_message"] = (
+                f'"{product}" matches multiple HTS subcategories with different rates. '
+                f"Which type are you importing{' from ' + country if country else ''}?"
+            )
+            result["clarification_suggestions"] = suggestions
+            logger.info("classification_node_suggestions product=%s count=%d", product, len(suggestions))
+    return result
 
 
 def base_rate_node(state: TariffState) -> Dict[str, Any]:
     result = run_base_rate_agent(state)
-    # Self-improvement write-back: only when classification passed and rate found
-    if not state.get("hitl_required") and result.get("rate_record_id"):
-        product = state.get("_product_for_feedback") or state.get("product")
-        hts_code = state.get("hts_code")
-        confidence = float(state.get("classification_confidence") or 0.0)
-        if product and hts_code:
-            tools.alias_write(product, hts_code, confidence)
+    # Auto alias write-back disabled — was writing wrong codes automatically
     return result
 
 
@@ -91,10 +155,8 @@ def hitl_node(state: TariffState) -> Dict[str, Any]:
     query_text = state.get("query", "")
     hts = state.get("hts_code")
     conf = state.get("classification_confidence")
-
     logger.warning("hitl_escalation query=%s reason=%s hts=%s conf=%s",
                    query_text[:80], reason, hts, conf)
-
     hitl_id = tools.write_hitl_record(
         query_text=query_text,
         trigger_reason=reason,
@@ -103,11 +165,8 @@ def hitl_node(state: TariffState) -> Dict[str, Any]:
     )
     if hitl_id:
         logger.info("hitl_record_written id=%s", hitl_id)
-
     return {"hitl_required": True}
 
-
-# ── Conditional edges ──────────────────────────────────────────────────────────
 
 def after_query(state: TariffState) -> str:
     if state.get("clarification_needed"):
@@ -116,7 +175,9 @@ def after_query(state: TariffState) -> str:
 
 
 def after_classification(state: TariffState) -> str:
-    if state.get("hitl_required") and state.get("hitl_reason") == "low_confidence":
+    if state.get("clarification_needed"):
+        return "hitl"
+    if state.get("hitl_required") and state.get("hitl_reason") in ("low_confidence", "semantic_mismatch"):
         return "hitl"
     return "base_rate"
 
@@ -127,11 +188,8 @@ def after_synthesis(state: TariffState) -> str:
     return "end"
 
 
-# ── Graph construction ─────────────────────────────────────────────────────────
-
 def build_graph() -> StateGraph:
     wf = StateGraph(TariffState)
-
     wf.add_node("query_step",      query_node)
     wf.add_node("classify_step",   classification_node)
     wf.add_node("base_rate_step",  base_rate_node)
@@ -140,7 +198,6 @@ def build_graph() -> StateGraph:
     wf.add_node("trade_step",      trade_node)
     wf.add_node("synthesis_step",  synthesis_node)
     wf.add_node("hitl_step",       hitl_node)
-
     wf.set_entry_point("query_step")
     wf.add_conditional_edges(
         "query_step", after_query,
@@ -154,24 +211,17 @@ def build_graph() -> StateGraph:
     wf.add_edge("adder_rate_step", "policy_step")
     wf.add_edge("policy_step",     "trade_step")
     wf.add_edge("trade_step",      "synthesis_step")
-    wf.add_conditional_edges(
-        "synthesis_step", after_synthesis,
-        {"end": END, "hitl": "hitl_step"},
-    )
+    wf.add_conditional_edges("synthesis_step", after_synthesis, {"end": END, "hitl": "hitl_step"})
     wf.add_edge("hitl_step", END)
-
     return wf.compile(checkpointer=MemorySaver())
 
 
 tariff_graph = build_graph()
 
 
-# ── Public entry point ─────────────────────────────────────────────────────────
-
 def run_pipeline(query: str) -> Dict[str, Any]:
     t0 = time.monotonic()
     logger.info("pipeline_start query=%s", query[:100])
-
     initial_state: TariffState = {
         "query": query,
         "product": None, "country": None,
@@ -184,18 +234,12 @@ def run_pipeline(query: str) -> Dict[str, Any]:
         "adder_rate": None, "adder_doc": None, "adder_basis": None, "adder_method": None, "total_duty": None,
         "import_value_usd": None, "import_quantity": None,
         "trade_period": None, "trade_country_code": None,
-        "trade_suppressed": None,
-        "trade_trend_pct": None, "trade_trend_label": None,
+        "trade_suppressed": None, "trade_trend_pct": None, "trade_trend_label": None,
         "final_response": None, "citations": None, "pipeline_confidence": None,
-        "country_comparison": None,
-        "top_importers": None,
-        "rate_change_history": None,
-        "query_intent": None,
-        "hitl_required": None, "hitl_reason": None,
-        "_product_for_feedback": None,
-        "error": None,
+        "country_comparison": None, "top_importers": None, "rate_change_history": None,
+        "query_intent": None, "hitl_required": None, "hitl_reason": None,
+        "_product_for_feedback": None, "error": None,
     }
-
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     result = tariff_graph.invoke(initial_state, config=config)
     elapsed_ms = round((time.monotonic() - t0) * 1000)

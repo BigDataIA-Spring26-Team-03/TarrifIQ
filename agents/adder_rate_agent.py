@@ -229,7 +229,7 @@ def _fetch_notice_snippets(hts_code: str, country: Optional[str]) -> List[Dict[s
     return snippets
 
 
-def _step4_chapter99_lookup(hts_code: str, hts_footnotes: Optional[List[str]]) -> tuple[Optional[float], Optional[str]]:
+def _step4_chapter99_lookup(hts_code: str, hts_footnotes: Optional[List[str]], country: Optional[str] = None) -> tuple[Optional[float], Optional[str]]:
     """
     STEP 4: Footnote → Chapter 99 Lookup
 
@@ -329,13 +329,26 @@ def _step4_chapter99_lookup(hts_code: str, hts_footnotes: Optional[List[str]]) -
         for ch99_code in chapter99_codes:
             try:
                 cur.execute(
-                    "SELECT general_rate FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code = %s LIMIT 1",
+                    "SELECT general_rate, description FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code = %s LIMIT 1",
                     (ch99_code,),
                 )
                 row = cur.fetchone()
                 if row and row[0]:
                     try:
-                        rate = float(str(row[0]).strip().rstrip('%'))
+                        rate_str = str(row[0]).strip()
+                        desc_str = str(row[1] or "").lower() if len(row) > 1 else ""
+                        # Skip China-specific codes for non-China countries
+                        country_lower = (country or "").lower().strip()
+                        is_china = country_lower in ("china", "prc", "people's republic of china")
+                        if not is_china and "product of china" in desc_str:
+                            logger.debug("step4_skip_china_code ch99=%s country=%s", ch99_code, country)
+                            continue
+                        # Handle "The duty provided in the applicable subheading + X%"
+                        m = re.search(r"\+\s*(\d+(?:\.\d+)?)\s*%", rate_str)
+                        if m:
+                            rate = float(m.group(1))
+                        else:
+                            rate = float(rate_str.rstrip('%'))
                         if best_rate is None or rate > best_rate:
                             best_rate = rate
                             best_code = ch99_code
@@ -407,8 +420,15 @@ def _step5_notice_lookup(hts_code: str, country: Optional[str]) -> tuple[Optiona
                         (code,),
                     )
                     rows = cur.fetchall()
+                    country_lower_s5 = (country or "").lower().strip()
+                    is_china_s5 = country_lower_s5 in ("china", "prc", "people's republic of china")
                     for doc_num, snippet, title, pub_date in rows:
                         if not snippet:
+                            continue
+                        # Skip China-specific docs for non-China countries
+                        if not is_china_s5 and title and any(
+                            kw in (title or "").lower() for kw in ["china", "chinese", "people's republic"]
+                        ):
                             continue
                         snippets.append({
                             "document_number": doc_num,
@@ -482,6 +502,10 @@ def _step5_notice_lookup(hts_code: str, country: Optional[str]) -> tuple[Optiona
         if raw_rate is not None:
             try:
                 rate_val = float(raw_rate)
+                if raw_doc:
+                    for prefix in ("FR: ", "FR:", "FR "):
+                        if raw_doc.startswith(prefix):
+                            raw_doc = raw_doc[len(prefix):].strip()
                 if 0 <= rate_val <= 200 and raw_doc:
                     logger.info("step5_notice_found hts=%s rate=%.2f doc=%s", hts_code, rate_val, raw_doc)
                     return rate_val, raw_doc, basis
@@ -524,7 +548,7 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     # ─────────────────────────────────────────────────────────────────────────────
     # STEP 4: CHAPTER 99 FOOTNOTE LOOKUP (highest priority, most authoritative)
     # ─────────────────────────────────────────────────────────────────────────────
-    chapter99_adder, chapter99_doc = _step4_chapter99_lookup(hts_code, hts_footnotes)
+    chapter99_adder, chapter99_doc = _step4_chapter99_lookup(hts_code, hts_footnotes, country)
 
     # ─────────────────────────────────────────────────────────────────────────────
     # STEP 5: NOTICE_HTS_CODES LOOKUP (LLM-extracted from FR snippets)
