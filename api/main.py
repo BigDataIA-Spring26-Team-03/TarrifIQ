@@ -36,6 +36,7 @@ from api.tools.search_hts_vector import router as search_hts_vector_router
 from api.tools.debug_agents import router as debug_agents_router
 from services.chromadb_init import initialize_chromadb
 from agents.graph import run_pipeline
+from validation.rate_reconciliation import validate as validate_rates
 
 # Configure structlog so keyword-arg logging works consistently
 # across router.py, main.py, and any other structlog callers.
@@ -167,6 +168,18 @@ async def query(request: QueryRequest):
     try:
         result = run_pipeline(request.query)
 
+        # Validate rate arithmetic: base_rate + adder_rate ≈ total_duty
+        rate_rec = None
+        if result.get("base_rate") is not None and result.get("total_duty") is not None:
+            try:
+                rate_rec = validate_rates(
+                    result.get("base_rate") or 0.0,
+                    result.get("adder_rate") or 0.0,
+                    result.get("total_duty") or 0.0,
+                )
+            except Exception as e:
+                logger.warning("rate_validation_failed", error=str(e))
+
         # Short-circuit: query agent detected ambiguity
         if result.get("clarification_needed"):
             return {
@@ -213,6 +226,7 @@ async def query(request: QueryRequest):
             "query_intent": result.get("query_intent"),
             "hitl_required": result.get("hitl_required"),
             "hitl_reason": result.get("hitl_reason"),
+            "rate_reconciliation": rate_rec.model_dump() if rate_rec else None,
             "error": result.get("error"),
         }
     except Exception as e:
