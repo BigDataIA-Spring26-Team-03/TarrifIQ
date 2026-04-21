@@ -120,6 +120,9 @@ services:
     environment:
       CHROMADB_HOST: chromadb
       CHROMADB_PORT: 8000
+      CHROMA_MODE: http
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
       REDIS_URL: redis://redis:6379
       PYTHONPATH: /app
     volumes:

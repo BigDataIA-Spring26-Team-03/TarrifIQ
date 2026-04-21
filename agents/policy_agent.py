@@ -511,7 +511,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     # when retrieved via hybrid search but irrelevant to the tariff query.
     if len(chunks) > 8:
         bm25_query = f"{product} {hts_code} tariff duty section 301 {country}"
-        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=15, min_score_ratio=0.05)
+        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=15, min_score_ratio=0.15)
         logger.info("policy_agent_final_filter chunks_after=%d", len(chunks))
 
     # ── Step 3: LLM synthesis with numbered citations ─────────────────────────

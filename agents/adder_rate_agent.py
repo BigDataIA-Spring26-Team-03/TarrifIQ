@@ -156,8 +156,11 @@ def _fetch_notice_snippets(hts_code: str, country: Optional[str]) -> List[Dict[s
             codes_to_try.append(".".join(parts))
 
         for table, fr_table in [
-            ("NOTICE_HTS_CODES", "FEDERAL_REGISTER_NOTICES"),
+            ("NOTICE_HTS_CODES",     "FEDERAL_REGISTER_NOTICES"),
             ("CBP_NOTICE_HTS_CODES", "CBP_FEDERAL_REGISTER_NOTICES"),
+            ("NOTICE_HTS_CODES_ITC", "ITC_DOCUMENTS"),
+            ("NOTICE_HTS_CODES_EOP", "EOP_DOCUMENTS"),
+            ("ITA_NOTICE_HTS_CODES", "ITA_FEDERAL_REGISTER_NOTICES"),
         ]:
             for code in codes_to_try:
                 try:
@@ -178,19 +181,38 @@ def _fetch_notice_snippets(hts_code: str, country: Optional[str]) -> List[Dict[s
                     for doc_num, snippet, title, pub_date in rows:
                         if not snippet:
                             continue
-                        # For China-specific notices, filter by country
-                        if title and any(kw in title.lower() for kw in ["china", "chinese"]):
+                        if title and any(
+                            kw in title.lower()
+                            for kw in ["china", "chinese"]
+                        ):
                             if not is_china:
                                 continue
+
+                        if "CBP" in table:
+                            source_label = "CBP"
+                        elif "ITC" in table:
+                            source_label = "USITC"
+                        elif "EOP" in table:
+                            source_label = "EOP"
+                        elif "ITA" in table:
+                            source_label = "ITA"
+                        else:
+                            source_label = "USTR"
+
                         snippets.append({
                             "document_number": doc_num,
                             "chunk_text": snippet,
-                            "source": "CBP" if "CBP" in table else "USTR",
+                            "source": source_label,
                             "publication_date": str(pub_date) if pub_date else "",
                         })
                     if snippets:
-                        break  # Found results for this code, stop trying shorter prefixes
-                except Exception:
+                        break
+                except Exception as e:
+                    logger.debug(
+                        "adder_fetch_snippets_table_skip "
+                        "table=%s code=%s error=%s",
+                        table, code, e
+                    )
                     continue
             if snippets:
                 break
