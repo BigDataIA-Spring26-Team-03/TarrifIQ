@@ -351,7 +351,7 @@ def _format_top_importers_block(rows: Optional[List[Dict[str, Any]]]) -> str:
             except (TypeError, ValueError):
                 rate_txt = "see HTS"
         lines.append(
-            f"  {i}. {name} [Census CTY_CODE {cc}] — imports ~${usd:,.0f} — {rate_txt}"
+            f"  {i}. {name} [Census CTY_CODE {cc}] — imports ~USD {usd:,.0f} — {rate_txt}"
         )
     return "\n".join(lines) + "\n"
 

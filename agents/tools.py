@@ -20,6 +20,7 @@ TOOLS
   12. census_trade_flow(hts_code)
   13. fetch_top_importer_countries(hts_code, months=24, top_n=8)
   14. fetch_all_hts_linked_policy_chunks(hts_code) — all chunks for all docs referencing HTS
+  15. find_section301_rate_from_chunks(hts_code, country) — search Section 301 docs for HTS code
 
 Note: policy vector search and HTS vector search are handled by
 services/retrieval/hybrid.py (HybridRetriever) — not in this file.
@@ -1561,3 +1562,119 @@ def fetch_all_hts_linked_policy_chunks(hts_code: str) -> List[Dict[str, Any]]:
     finally:
         cur.close()
         conn.close()
+
+
+# ── TOOL 15 — find_section301_rate_from_chunks ───────────────────────────────────
+# Search Section 301 documents directly in CHUNKS table for HTS codes.
+# Uses known Section 301 FR documents that contain Annex A tables with chapter 99 rates.
+# Returns the rate and document number if HTS code found; None otherwise.
+
+def find_section301_rate_from_chunks(
+    hts_code: str,
+    country: str,
+) -> Optional[Dict]:
+    """
+    Find Section 301 adder rate by searching chunks of known Section 301
+    Federal Register documents for the HTS code.
+
+    Uses existing TARIFFIQ.RAW.CHUNKS table — no new ingestion required.
+
+    Logic:
+    1. Only applies to China
+    2. Search known Section 301 FR documents for the HTS code
+    3. Try progressively shorter HTS prefixes for matching
+    4. Return the chapter99_code, rate, and document_number for the
+       first match found (ordered by rate descending)
+    5. Return None if no match found
+
+    Args:
+        hts_code: e.g. "8471.30.01.00"
+        country: e.g. "China" or "China, People's Republic of"
+
+    Returns:
+        Dict with keys: chapter99_code, adder_rate, document_number,
+        list_name, basis
+        OR None if not found
+    """
+    country_lower = (country or "").lower().strip()
+    china_names = {"china", "prc", "people's republic of china"}
+    if country_lower not in china_names:
+        return None
+
+    # Known Section 301 documents ordered by rate descending
+    # so highest applicable rate is returned first.
+    # Format: (document_number, chapter99_code, rate, list_name)
+    SECTION_301_DOCS = [
+        ("2019-09990", "9903.88.03", 25.0, "List 3"),
+        ("2018-14820", "9903.88.02", 25.0, "List 2"),
+        ("2018-13248", "9903.88.01", 25.0, "List 1"),
+        ("2019-17230", "9903.88.15",  7.5, "List 4A"),
+    ]
+
+    # Try progressively shorter HTS prefixes
+    hts_clean = hts_code.replace(".", "")
+    search_patterns = []
+    search_patterns.append(hts_code)  # full: 8471.30.01.00
+    if len(hts_clean) >= 6:
+        search_patterns.append(
+            f"{hts_clean[:4]}.{hts_clean[4:6]}"  # 8471.30
+        )
+    if len(hts_clean) >= 4:
+        search_patterns.append(hts_clean[:4])    # 8471
+
+    try:
+        conn = _sf()
+        cur = conn.cursor()
+
+        for doc_num, ch99_code, rate, list_name in SECTION_301_DOCS:
+            for pattern in search_patterns:
+                try:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM TARIFFIQ.RAW.CHUNKS
+                        WHERE document_number = %s
+                        AND chunk_text LIKE %s
+                        LIMIT 1
+                        """,
+                        (doc_num, f"%{pattern}%"),
+                    )
+
+                    count = cur.fetchone()[0]
+                    if count > 0:
+                        cur.close()
+                        conn.close()
+                        logger.info(
+                            "section301_found_in_chunks "
+                            "hts=%s pattern=%s doc=%s rate=%.1f",
+                            hts_code, pattern, doc_num, rate,
+                        )
+                        return {
+                            "chapter99_code": ch99_code,
+                            "adder_rate": rate,
+                            "document_number": doc_num,
+                            "list_name": list_name,
+                            "basis": f"Section 301 {rate}% — {list_name}",
+                        }
+                except Exception as e:
+                    logger.debug(
+                        "section301_chunks_query_error "
+                        "doc=%s pattern=%s error=%s",
+                        doc_num, pattern, e,
+                    )
+                    continue
+
+        cur.close()
+        conn.close()
+        logger.info(
+            "section301_not_found_in_chunks hts=%s country=%s",
+            hts_code, country,
+        )
+        return None
+
+    except Exception as e:
+        logger.warning(
+            "section301_chunks_error hts=%s error=%s",
+            hts_code, e,
+        )
+        return None

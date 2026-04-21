@@ -1,16 +1,20 @@
 """
-TariffIQ — LangGraph pipeline
+TariffIQ — LangGraph pipeline (9 steps)
 
-7-step sequential pipeline:
-  query → classify → base_rate → policy → adder_rate → trade → synthesis
+Sequential pipeline:
+  1. query → 2. classify → 3. base_rate → 4. adder_rate → 5. policy → 6. trade → 7. synthesis
 
 HITL exits:
   - after classify:   confidence < 0.80  → hitl_step → END
   - after synthesis:  citation failure   → hitl_step → END
 
-hitl_node writes to TARIFFIQ.RAW.HITL_RECORDS via tools.write_hitl_record().
-Alias write-back (self-improvement) fires in base_rate_node after rate confirmed.
-Pipeline latency logged in ms on every run.
+Notes:
+  - adder_rate_step (Steps 4-7) now runs BEFORE policy_step
+    Reason: Steps 4-5 only need hts_code + hts_footnotes from base_rate_step
+  - policy_chunks are supplementary context; adder_rate_agent handles policy_chunks=None gracefully
+  - hitl_node writes to TARIFFIQ.RAW.HITL_RECORDS via tools.write_hitl_record()
+  - Alias write-back (self-improvement) fires in base_rate_node after rate confirmed
+  - Pipeline latency logged in ms on every run
 """
 
 import logging
@@ -146,9 +150,9 @@ def build_graph() -> StateGraph:
         "classify_step", after_classification,
         {"base_rate": "base_rate_step", "hitl": "hitl_step"},
     )
-    wf.add_edge("base_rate_step",  "policy_step")
-    wf.add_edge("policy_step",     "adder_rate_step")
-    wf.add_edge("adder_rate_step", "trade_step")
+    wf.add_edge("base_rate_step",  "adder_rate_step")
+    wf.add_edge("adder_rate_step", "policy_step")
+    wf.add_edge("policy_step",     "trade_step")
     wf.add_edge("trade_step",      "synthesis_step")
     wf.add_conditional_edges(
         "synthesis_step", after_synthesis,
@@ -174,8 +178,10 @@ def run_pipeline(query: str) -> Dict[str, Any]:
         "clarification_needed": None, "clarification_message": None, "clarification_suggestions": None,
         "hts_code": None, "hts_description": None, "classification_confidence": None,
         "base_rate": None, "mfn_rate": None, "fta_rate": None, "fta_program": None, "fta_applied": None, "rate_record_id": None, "hts_footnotes": None,
+        "chapter99_adder": None, "chapter99_doc": None,
+        "notice_adder": None, "notice_doc": None, "notice_basis": None,
         "policy_chunks": None, "policy_summary": None,
-        "adder_rate": None, "adder_doc": None, "adder_method": None, "total_duty": None,
+        "adder_rate": None, "adder_doc": None, "adder_basis": None, "adder_method": None, "total_duty": None,
         "import_value_usd": None, "import_quantity": None,
         "trade_period": None, "trade_country_code": None,
         "trade_suppressed": None,
