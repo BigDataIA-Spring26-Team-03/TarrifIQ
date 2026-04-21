@@ -42,7 +42,6 @@ HTS CLASSIFICATION: {hts_code} — {hts_description} (confidence: {confidence})
 VERIFIED DUTY RATE [HTS {record_id}]:
   {rate_line}
   Section 301/IEEPA:     {adder_rate:.2f}% {adder_source}
-{specific_duty_line}
   Total effective duty:  {total_duty:.2f}%
 {footnote_line}
 POLICY CHUNKS (full text per chunk until SYNTHESIS_* env budgets; cite ONLY these FR doc numbers: {valid_docs}):
@@ -351,7 +350,7 @@ def _format_top_importers_block(rows: Optional[List[Dict[str, Any]]]) -> str:
             except (TypeError, ValueError):
                 rate_txt = "see HTS"
         lines.append(
-            f"  {i}. {name} [Census CTY_CODE {cc}] — imports ~${usd:,.0f} — {rate_txt}"
+            f"  {i}. {name} [Census CTY_CODE {cc}] — imports ~USD {usd:,.0f} — {rate_txt}"
         )
     return "\n".join(lines) + "\n"
 
@@ -371,15 +370,8 @@ def _build_context(
     adder_rate = state.get("adder_rate") or 0.0
     total_duty = state.get("total_duty") or 0.0
     adder_doc = state.get("adder_doc")
-    adder_specific_duty = (state.get("adder_specific_duty") or "").strip()
 
     adder_source = f"(sourced from {adder_doc})" if adder_doc else "(source: not identified)"
-    specific_duty_line = ""
-    if adder_specific_duty:
-        if adder_doc:
-            specific_duty_line = f"  Chapter 99 specific duty: {adder_specific_duty} [{adder_doc}]"
-        else:
-            specific_duty_line = f"  Chapter 99 specific duty: {adder_specific_duty}"
 
     fta_applied = state.get("fta_applied", False)
     fta_program = state.get("fta_program")
@@ -445,7 +437,6 @@ def _build_context(
         base_rate=base_rate,
         adder_rate=adder_rate,
         adder_source=adder_source,
-        specific_duty_line=specific_duty_line,
         total_duty=total_duty,
         footnote_line=footnote_line,
         valid_docs=", ".join(sorted(valid_docs)) if valid_docs else "none",
@@ -614,13 +605,36 @@ def _build_country_comparison(
     current_country: Optional[str],
 ) -> List[Dict[str, Any]]:
     """
-    Run base rate lookup for key alternative sourcing countries.
-    Returns a list of {country, base_rate, fta_program, fta_applied, total_note}
-    sorted by effective rate ascending.
-    Skips the current country and countries that fail lookup.
+    Build country comparison with estimated total effective duty.
+    Uses base rate from HTS_CODES + known country-specific adder tiers.
+    Sorted by estimated total ascending so cheapest sourcing is first.
     """
     if not hts_code:
         return []
+
+    # Known IEEPA / Section 301 adder tiers by country (as of 2025-2026).
+    # These are country-level surcharges applied on top of MFN base rate.
+    # Source: Executive Orders 14257, 14259, 14266, 14329 and Section 301 actions.
+    # Not exhaustive — only major trading partners with active adders.
+    COUNTRY_ADDER_TIERS = {
+        "china":       {"adder": 145.0, "program": "Section 301 + IEEPA"},
+        "india":       {"adder": 26.0,  "program": "IEEPA (EO 14329)"},
+        "vietnam":     {"adder": 46.0,  "program": "IEEPA reciprocal"},
+        "taiwan":      {"adder": 32.0,  "program": "IEEPA reciprocal"},
+        "thailand":    {"adder": 36.0,  "program": "IEEPA reciprocal"},
+        "indonesia":   {"adder": 32.0,  "program": "IEEPA reciprocal"},
+        "bangladesh":  {"adder": 37.0,  "program": "IEEPA reciprocal"},
+        "cambodia":    {"adder": 49.0,  "program": "IEEPA reciprocal"},
+        "japan":       {"adder": 24.0,  "program": "IEEPA reciprocal"},
+        "south korea": {"adder": 25.0,  "program": "IEEPA reciprocal"},
+        # USMCA partners — no IEEPA adder on USMCA-qualifying goods
+        "canada":      {"adder": 0.0,   "program": None},
+        "mexico":      {"adder": 0.0,   "program": None},
+        # EU countries — framework agreement, reduced
+        "germany":     {"adder": 15.0,  "program": "US-EU Framework"},
+        "france":      {"adder": 15.0,  "program": "US-EU Framework"},
+        "italy":       {"adder": 15.0,  "program": "US-EU Framework"},
+    }
 
     results = []
     current_lower = (current_country or "").lower().strip()
@@ -632,22 +646,46 @@ def _build_country_comparison(
             rate_result = tools.hts_base_rate_lookup(hts_code, country=country)
             if rate_result is None:
                 continue
+
+            base = rate_result.get("base_rate", 0.0)
+            mfn = rate_result.get("mfn_rate", 0.0)
+            fta_program = rate_result.get("fta_program")
+            fta_applied = rate_result.get("fta_applied", False)
+
+            # Get known adder for this country
+            tier = COUNTRY_ADDER_TIERS.get(country.lower(), {})
+            adder = tier.get("adder", 0.0)
+            adder_program = tier.get("program")
+
+            # If FTA applied, base is already 0 — adder still applies on top
+            estimated_total = round(base + adder, 2)
+
+            # Sourcing note
+            if fta_applied and fta_program and adder == 0:
+                note = f"{fta_program} — {estimated_total:.1f}% total"
+            elif adder > 0 and adder_program:
+                note = f"{adder_program} +{adder:.0f}% adder — {estimated_total:.1f}% total"
+            elif estimated_total == 0:
+                note = "0% — cheapest source"
+            else:
+                note = f"{estimated_total:.1f}% total"
+
             results.append({
                 "country": country,
-                "base_rate": rate_result.get("base_rate", 0.0),
-                "mfn_rate": rate_result.get("mfn_rate", 0.0),
-                "fta_program": rate_result.get("fta_program"),
-                "fta_applied": rate_result.get("fta_applied", False),
-                # Note: adder rates not computed here (would require full pipeline per country)
-                "note": rate_result.get("fta_program") or "MFN rate",
+                "base_rate": round(base, 2),
+                "adder_rate": adder,
+                "adder_program": adder_program or ("FTA" if fta_applied else "None"),
+                "fta_program": fta_program,
+                "estimated_total": estimated_total,
+                "note": note,
             })
         except Exception as e:
             logger.debug("country_comparison_error country=%s error=%s", country, e)
             continue
 
-    # Sort by effective base rate ascending
-    results.sort(key=lambda x: x["base_rate"])
-    return results[:5]  # top 5 cheapest alternatives
+    # Sort by estimated total ascending — cheapest first
+    results.sort(key=lambda x: x["estimated_total"])
+    return results[:6]
 
 
 def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
@@ -681,15 +719,8 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
 
     # Fetch metadata for citation enrichment
     doc_metadata = _fetch_doc_metadata(valid_docs)
-    unverified_docs = candidate_docs - valid_docs
-    # Suppress unverified doc warning for chapter99_lookup sourced adder docs
-    adder_doc = state.get("adder_doc") or ""
-    adder_method = state.get("adder_method") or ""
-    if adder_method == "chapter99_lookup" and adder_doc in unverified_docs:
-        unverified_docs.discard(adder_doc)
-        logger.info("synthesis_chap99_doc_suppressed doc=%s", adder_doc)
-    if unverified_docs:
-        logger.warning("synthesis_unverified_docs=%s", unverified_docs)
+    if candidate_docs - valid_docs:
+        logger.warning("synthesis_unverified_docs=%s", candidate_docs - valid_docs)
 
     # Verify rate record
     record_id = state.get("rate_record_id")

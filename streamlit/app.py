@@ -803,10 +803,35 @@ def _render_assistant_details(
     # ── Country Comparison ──
     country_comparison = state.get("country_comparison") or []
     if country_comparison:
-        with st.expander("🌍 Country Comparison", expanded=False):
-            df = pd.DataFrame(country_comparison)
-            cols_order = [c for c in ["country", "base_rate", "mfn_rate", "fta_program", "fta_applied", "note"] if c in df.columns]
-            st.dataframe(df[cols_order] if cols_order else df, use_container_width=True, hide_index=True)
+        with st.expander("🌍 Country Comparison — Estimated Total Duty", expanded=False):
+            # Build display table
+            rows = []
+            for c in country_comparison:
+                total = c.get("estimated_total", c.get("base_rate", 0.0))
+                adder = c.get("adder_rate", 0.0)
+                fta = c.get("fta_program") or ""
+                note = c.get("note") or ""
+                rows.append({
+                    "Country": c["country"],
+                    "Base MFN": f"{c.get('base_rate', 0.0):.1f}%",
+                    "Adder": f"+{adder:.0f}%" if adder > 0 else "—",
+                    "Est. Total": f"{total:.1f}%",
+                    "Program": fta or c.get("adder_program") or "—",
+                    "Note": note,
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Cheapest recommendation
+            if rows:
+                cheapest = min(country_comparison, key=lambda x: x.get("estimated_total", 999))
+                total = cheapest.get("estimated_total", 0.0)
+                st.markdown(
+                    f'<div style="margin-top:10px;padding:10px 14px;background:#0a1f18;border:1px solid #065f46;border-radius:6px;font-family:\'IBM Plex Mono\',monospace;font-size:0.78rem;color:#34d399">'
+                    f'✓ Cheapest alternative: <strong>{cheapest["country"]}</strong> at <strong>{total:.1f}%</strong> estimated total duty'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # ── Top Importers ──
     top_importers = state.get("top_importers") or []

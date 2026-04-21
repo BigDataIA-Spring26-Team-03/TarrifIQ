@@ -1,23 +1,27 @@
 """
-Adder Rate Agent — Pipeline Step 5
+Adder Rate Agent — Pipeline Steps 4, 5, and 7
 
-Determines the Section 301 / IEEPA / Section 232 adder rate by having
-the LLM read the actual policy chunks retrieved by policy_agent.
+Determines the Section 301 / IEEPA / Section 232 adder rate through a 3-step process:
 
-Uses ModelRouter(TaskType.POLICY_ANALYSIS) — the same model (claude-haiku)
-and system prompt that policy_agent uses, which is correct since this is
-also a policy document reading task.
+STEP 4 — FOOTNOTE → CHAPTER 99 LOOKUP (most authoritative)
+  - Parse hts_footnotes for pattern: 9903\.\d{2}\.\d{2}
+  - Query HTS_CODES for matching chapter 99 codes
+  - Use highest general_rate as chapter99_adder (primary authority)
+  - If no footnotes, search NOTICE_HTS_CODES tables for chapter 99 references
 
-WHY THIS AGENT EXISTS
-──────────────────────
-The old rate_agent computed the adder by running a regex on a short
-context_snippet stored in NOTICE_HTS_CODES. That snippet often contains
-multiple percentages (2018 rate, 2019 escalation, 2025 IEEPA rate) and
-the regex blindly returned the first one.
+STEP 5 — NOTICE_HTS_CODES LOOKUP (LLM extraction from snippets)
+  - Search all 5 notice tables (USTR, CBP, USITC, EOP, ITA)
+  - Try progressively shorter HTS prefixes
+  - Pass context_snippets to LLM with specific prompt
+  - LLM returns notice_adder + document_number
 
-This agent reads the full policy chunks with an LLM and asks specifically:
-"what is the CURRENT effective adder for HTS X from country Y?"
-Falls back to regex on chunk text if the LLM fails or returns null.
+STEP 7 — RATE STACKING (priority-based selection)
+  - Priority order (highest to lowest):
+    1. chapter99_adder (direct from HTS schedule, most reliable)
+    2. notice_adder (LLM reading of FR notice snippets)
+    3. regex_fallback (last resort on policy chunk text)
+    4. 0.0 if nothing found
+  - Special case: if FTA applied, adder=0.0 (FTA exempt)
 
 Redis cache: 1-hour TTL keyed on (hts_code + country).
 """
@@ -225,145 +229,245 @@ def _fetch_notice_snippets(hts_code: str, country: Optional[str]) -> List[Dict[s
     return snippets
 
 
-def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
-    hts_code = (state.get("hts_code") or "").strip()
-    country = state.get("country")
-    base_rate = state.get("base_rate") or 0.0
-    policy_chunks = state.get("policy_chunks") or []
+def _step4_chapter99_lookup(hts_code: str, hts_footnotes: Optional[List[str]], country: Optional[str] = None) -> tuple[Optional[float], Optional[str]]:
+    """
+    STEP 4: Footnote → Chapter 99 Lookup
 
+    Sub-step 4a: Parse hts_footnotes for 9903\.\d{2}\.\d{2} pattern
+    Sub-step 4b: If found, query HTS_CODES for general_rate and use highest
+    Sub-step 4c: If no footnotes, search NOTICE_HTS_CODES tables for chapter 99 refs
+
+    Returns: (chapter99_adder, chapter99_doc) or (None, None)
+    """
     if not hts_code:
-        return {
-            "adder_rate": 0.0, "adder_doc": None,
-            "adder_method": "none",
-            "total_duty": base_rate,
-        }
+        return None, None
 
-    logger.info("adder_rate_agent_start hts=%s country=%s chunks=%d",
-                hts_code, country, len(policy_chunks))
-
-    # Cache check (recompute total_duty with current base_rate)
-    cached = _cache_get(hts_code, country)
-    if cached:
-        adder = cached.get("adder_rate") or 0.0
-        cached["total_duty"] = round(base_rate + adder, 4)
-        return cached
-
-    # ── Step 0: Chapter 99 footnote lookup (most reliable, pure SQL) ────────
-    # HTS_CODES footnotes contain Chapter 99 references like "See 9903.88.15"
-    # These map directly to the adder rate without any LLM or regex needed.
-    hts_footnotes = state.get("hts_footnotes") or []
     chapter99_codes = []
-    for fn in hts_footnotes:
-        # Footnotes are stored as str(dict) with single quotes — use ast.literal_eval
-        if isinstance(fn, dict):
-            value = fn.get("value", "") or ""
-        elif isinstance(fn, str):
-            try:
-                parsed = ast.literal_eval(fn)
-                value = parsed.get("value", "") if isinstance(parsed, dict) else fn
-            except (ValueError, SyntaxError):
-                value = fn  # fallback: run regex on raw string
-        else:
-            continue
-        matches = CHAP99_RE.findall(value)
-        chapter99_codes.extend(matches)
-        if matches:
-            logger.info("chap99_footnote_parsed value=%s codes=%s", value.strip(), matches)
 
-    if chapter99_codes:
-        ch99_result = tools.chapter99_lookup(chapter99_codes, country=country)
-        if ch99_result and ch99_result.get("adder_rate") == -1.0:
-            result = {
-                "adder_rate": 0.0,
-                "adder_specific_duty": ch99_result.get("adder_specific_duty", ""),
-                "adder_method": "chapter99_specific_duty",
-                "adder_doc": ch99_result.get("chapter99_code", ""),
-                "total_duty": round(base_rate, 4),
-            }
-            logger.info("chap99_specific_duty hts=%s duty=%s", hts_code, result["adder_specific_duty"])
-            _cache_set(hts_code, country, result)
-            return result
-        if ch99_result and ch99_result.get("adder_rate", 0) > 0:
-            adder_val = ch99_result["adder_rate"]
-            ch99_code = ch99_result["chapter99_code"]
-            total = round(base_rate + adder_val, 4)
-            logger.info("adder_rate_chapter99 hts=%s country=%s code=%s rate=%.1f",
-                        hts_code, country, ch99_code, adder_val)
-            result = {
-                "adder_rate": adder_val,
-                "adder_doc": ch99_code,
-                "adder_method": "chapter99_lookup",
-                "total_duty": total,
-            }
-            _cache_set(hts_code, country, result)
-            return result
+    # Sub-step 4a: Parse hts_footnotes
+    if hts_footnotes:
+        for fn in hts_footnotes:
+            # Footnotes may be str(dict) or dict or raw string
+            if isinstance(fn, dict):
+                value = fn.get("value", "") or ""
+            elif isinstance(fn, str):
+                try:
+                    parsed = ast.literal_eval(fn)
+                    value = parsed.get("value", "") if isinstance(parsed, dict) else fn
+                except (ValueError, SyntaxError):
+                    value = fn
+            else:
+                continue
+            matches = CHAP99_RE.findall(value)
+            chapter99_codes.extend(matches)
+            if matches:
+                logger.debug("step4_chap99_from_footnote codes=%s", matches)
 
-    # ── Step 1: Extract Chapter 99 codes from NOTICE_HTS_CODES snippets ────
-    # Even if hts_footnotes is empty, NOTICE_HTS_CODES context_snippets
-    # often contain Chapter 99 code references like "9903.88.03" or "9903.90.07"
-    # Extract those and look them up directly in HTS_CODES for the rate.
+    # Sub-step 4c: If no footnotes, scan NOTICE_HTS_CODES snippets for chapter 99 codes
     if not chapter99_codes:
-        notice_ch99 = tools.fetch_chapter99_from_notices(hts_code)
-        if notice_ch99:
-            chapter99_codes.extend(notice_ch99)
-            ch99_result = tools.chapter99_lookup(chapter99_codes, country=country)
-            if ch99_result and ch99_result.get("adder_rate") == -1.0:
-                result = {
-                    "adder_rate": 0.0,
-                    "adder_specific_duty": ch99_result.get("adder_specific_duty", ""),
-                    "adder_method": "chapter99_specific_duty",
-                    "adder_doc": ch99_result.get("chapter99_code", ""),
-                    "total_duty": round(base_rate, 4),
-                }
-                logger.info("chap99_specific_duty hts=%s duty=%s", hts_code, result["adder_specific_duty"])
-                _cache_set(hts_code, country, result)
-                return result
-            if ch99_result and ch99_result.get("adder_rate", 0) > 0:
-                adder_val = ch99_result["adder_rate"]
-                ch99_code = ch99_result["chapter99_code"]
-                total = round(base_rate + adder_val, 4)
-                logger.info("adder_rate_notice_ch99 hts=%s country=%s code=%s rate=%.1f",
-                            hts_code, country, ch99_code, adder_val)
-                result = {
-                    "adder_rate": adder_val,
-                    "adder_doc": ch99_code,
-                    "adder_method": "chapter99_lookup",
-                    "total_duty": total,
-                }
-                _cache_set(hts_code, country, result)
-                return result
+        try:
+            conn = tools._sf()
+            cur = conn.cursor()
+            codes_to_try = [hts_code]
+            parts = hts_code.split(".")
+            while len(parts) > 2:
+                parts = parts[:-1]
+                codes_to_try.append(".".join(parts))
 
-    # ── Step 2: Fetch targeted snippets from NOTICE_HTS_CODES + CBP tables ──
-    notice_snippets = _fetch_notice_snippets(hts_code, country)
-    if notice_snippets:
-        logger.info("adder_rate_notice_snippets hts=%s count=%d", hts_code, len(notice_snippets))
+            for code in codes_to_try:
+                for table in ["NOTICE_HTS_CODES", "CBP_NOTICE_HTS_CODES", "NOTICE_HTS_CODES_ITC", "NOTICE_HTS_CODES_EOP", "ITA_NOTICE_HTS_CODES"]:
+                    try:
+                        cur.execute(
+                            f"SELECT context_snippet FROM TARIFFIQ.RAW.{table} WHERE hts_code = %s LIMIT 10",
+                            (code,),
+                        )
+                        rows = cur.fetchall()
+                        for row in rows:
+                            snippet = row[0] if row else ""
+                            matches = CHAP99_RE.findall(snippet)
+                            chapter99_codes.extend(matches)
+                        if chapter99_codes:
+                            break
+                    except Exception:
+                        continue
+                if chapter99_codes:
+                    break
 
-    # Combine: notice snippets first (more targeted), then ChromaDB chunks
-    all_chunks = notice_snippets + policy_chunks
+            cur.close()
+            conn.close()
+            if chapter99_codes:
+                logger.debug("step4_chap99_from_notices codes=%s", chapter99_codes)
+        except Exception as e:
+            logger.debug("step4_notice_scan_error error=%s", e)
 
-    if not all_chunks:
-        result = {"adder_rate": 0.0, "adder_doc": None, "adder_method": "none",
-                  "total_duty": round(base_rate, 4)}
-        _cache_set(hts_code, country, result)
-        return result
+    # Step 4d — Search Section 301 chunks directly
+    # Runs only if footnotes were empty AND notice scan found no chapter 99 codes
+    if not chapter99_codes:
+        chunk_result = tools.find_section301_rate_from_chunks(hts_code, country)
+        if chunk_result:
+            chapter99_adder = chunk_result["adder_rate"]
+            chapter99_doc = chunk_result["document_number"]
+            logger.info(
+                "chapter99_from_chunks hts=%s rate=%.1f list=%s",
+                hts_code,
+                chapter99_adder,
+                chunk_result["list_name"],
+            )
+            return chapter99_adder, chapter99_doc
 
-    valid_docs: Set[str] = {
-        c.get("document_number", "") for c in all_chunks
-        if c.get("document_number")
-    }
-    # Use all_chunks for context, not just policy_chunks
-    policy_chunks = all_chunks
-    context = _build_context(all_chunks)
+    if not chapter99_codes:
+        return None, None
 
-    # LLM call via ModelRouter — POLICY_ANALYSIS task (claude-haiku)
-    from services.llm.router import get_router, TaskType
-    router = get_router()
+    # Sub-step 4b: Query HTS_CODES for matching chapter 99 codes
+    try:
+        conn = tools._sf()
+        cur = conn.cursor()
 
-    adder_rate: Optional[float] = None
-    adder_doc: Optional[str] = None
-    method = "none"
+        best_rate = None
+        best_code = None
+
+        for ch99_code in chapter99_codes:
+            try:
+                cur.execute(
+                    "SELECT general_rate, description FROM TARIFFIQ.RAW.HTS_CODES WHERE hts_code = %s LIMIT 1",
+                    (ch99_code,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    try:
+                        rate_str = str(row[0]).strip()
+                        desc_str = str(row[1] or "").lower() if len(row) > 1 else ""
+                        # Skip China-specific codes for non-China countries
+                        country_lower = (country or "").lower().strip()
+                        is_china = country_lower in ("china", "prc", "people's republic of china")
+                        if not is_china and "product of china" in desc_str:
+                            logger.debug("step4_skip_china_code ch99=%s country=%s", ch99_code, country)
+                            continue
+                        # Handle "The duty provided in the applicable subheading + X%"
+                        m = re.search(r"\+\s*(\d+(?:\.\d+)?)\s*%", rate_str)
+                        if m:
+                            rate = float(m.group(1))
+                        else:
+                            rate = float(rate_str.rstrip('%'))
+                        if best_rate is None or rate > best_rate:
+                            best_rate = rate
+                            best_code = ch99_code
+                        logger.debug("step4_hts_lookup ch99=%s rate=%.2f", ch99_code, rate)
+                    except (ValueError, TypeError):
+                        pass
+            except Exception as e:
+                logger.debug("step4_hts_lookup_error code=%s error=%s", ch99_code, e)
+
+        cur.close()
+        conn.close()
+
+        if best_rate is not None and best_code:
+            logger.info("step4_chapter99_found code=%s rate=%.2f", best_code, best_rate)
+            return best_rate, best_code
+
+    except Exception as e:
+        logger.debug("step4_lookup_error error=%s", e)
+
+    return None, None
+
+
+def _step5_notice_lookup(hts_code: str, country: Optional[str]) -> tuple[Optional[float], Optional[str], Optional[str]]:
+    """
+    STEP 5: NOTICE_HTS_CODES Lookup
+
+    Search all 5 notice tables, try shorter prefixes, collect snippets,
+    pass to LLM for extraction.
+
+    Returns: (notice_adder, notice_doc, notice_basis) or (None, None, None)
+    """
+    if not hts_code:
+        return None, None, None
+
+    snippets = []
 
     try:
+        conn = tools._sf()
+        cur = conn.cursor()
+
+        # Try progressively shorter HTS prefixes
+        codes_to_try = [hts_code]
+        parts = hts_code.split(".")
+        while len(parts) > 2:
+            parts = parts[:-1]
+            codes_to_try.append(".".join(parts))
+
+        # Search all 5 notice tables
+        for table, fr_table in [
+            ("NOTICE_HTS_CODES",     "FEDERAL_REGISTER_NOTICES"),
+            ("CBP_NOTICE_HTS_CODES", "CBP_FEDERAL_REGISTER_NOTICES"),
+            ("NOTICE_HTS_CODES_ITC", "ITC_DOCUMENTS"),
+            ("NOTICE_HTS_CODES_EOP", "EOP_DOCUMENTS"),
+            ("ITA_NOTICE_HTS_CODES", "ITA_FEDERAL_REGISTER_NOTICES"),
+        ]:
+            for code in codes_to_try:
+                try:
+                    cur.execute(
+                        f"""
+                        SELECT n.document_number, n.context_snippet,
+                               f.title, f.publication_date
+                        FROM TARIFFIQ.RAW.{table} n
+                        LEFT JOIN TARIFFIQ.RAW.{fr_table} f
+                            ON n.document_number = f.document_number
+                        WHERE n.hts_code = %s
+                        ORDER BY f.publication_date DESC NULLS LAST
+                        LIMIT 5
+                        """,
+                        (code,),
+                    )
+                    rows = cur.fetchall()
+                    country_lower_s5 = (country or "").lower().strip()
+                    is_china_s5 = country_lower_s5 in ("china", "prc", "people's republic of china")
+                    for doc_num, snippet, title, pub_date in rows:
+                        if not snippet:
+                            continue
+                        # Skip China-specific docs for non-China countries
+                        if not is_china_s5 and title and any(
+                            kw in (title or "").lower() for kw in ["china", "chinese", "people's republic"]
+                        ):
+                            continue
+                        snippets.append({
+                            "document_number": doc_num,
+                            "chunk_text": snippet,
+                            "source": (
+                                "CBP" if "CBP" in table else
+                                "USITC" if "ITC" in table else
+                                "EOP" if "EOP" in table else
+                                "ITA" if "ITA" in table else
+                                "USTR"
+                            ),
+                            "publication_date": str(pub_date) if pub_date else "",
+                        })
+                    if snippets:
+                        break
+                except Exception as e:
+                    logger.debug("step5_table_error table=%s code=%s error=%s", table, code, e)
+                    continue
+            if snippets:
+                break
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.debug("step5_query_error error=%s", e)
+
+    if not snippets:
+        logger.info("step5_no_snippets hts=%s", hts_code)
+        return None, None, None
+
+    logger.info("step5_snippets_found hts=%s count=%d", hts_code, len(snippets))
+
+    # Build context for LLM
+    context = _build_context(snippets)
+
+    # LLM call
+    try:
+        from services.llm.router import get_router, TaskType
+        router = get_router()
         loop = asyncio.new_event_loop()
         try:
             resp = loop.run_until_complete(
@@ -383,53 +487,121 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
             loop.close()
 
         raw = re.sub(r"```(?:json)?", "", resp.choices[0].message.content.strip()).strip()
-        # Find the first { and last } to extract the JSON object
-        # Handles trailing text and nested structures from the LLM
         start = raw.find("{")
         end = raw.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise ValueError(f"No JSON object found in response: {raw[:100]}")
+            logger.warning("step5_llm_no_json hts=%s", hts_code)
+            return None, None, None
+
         parsed = json.loads(raw[start:end+1])
 
         raw_rate = parsed.get("adder_rate")
         raw_doc = parsed.get("document_number")
+        basis = parsed.get("basis", "").strip()
 
         if raw_rate is not None:
             try:
                 rate_val = float(raw_rate)
-                if 0 <= rate_val <= 200:
-                    adder_rate = rate_val
-                    method = "llm_policy"
+                if raw_doc:
+                    for prefix in ("FR: ", "FR:", "FR "):
+                        if raw_doc.startswith(prefix):
+                            raw_doc = raw_doc[len(prefix):].strip()
+                if 0 <= rate_val <= 200 and raw_doc:
+                    logger.info("step5_notice_found hts=%s rate=%.2f doc=%s", hts_code, rate_val, raw_doc)
+                    return rate_val, raw_doc, basis
             except (ValueError, TypeError):
                 pass
 
-        # Validate doc number against retrieved chunks only
-        if raw_doc and raw_doc in valid_docs:
-            adder_doc = raw_doc
-        elif raw_doc:
-            logger.warning("adder_rate_hallucinated_doc doc=%s — rejecting", raw_doc)
-
-        logger.info("adder_rate_llm hts=%s country=%s rate=%s doc=%s basis=%s",
-                    hts_code, country, adder_rate, adder_doc,
-                    str(parsed.get("basis", ""))[:80])
-
     except Exception as e:
-        logger.warning("adder_rate_llm_failed hts=%s error=%s", hts_code, e)
+        logger.debug("step5_llm_error hts=%s error=%s", hts_code, e)
 
-    # Regex fallback if LLM failed or returned null
-    if adder_rate is None:
-        adder_rate = _regex_fallback(policy_chunks, hts_code)
-        method = "regex_fallback" if adder_rate > 0 else "none"
+    return None, None, None
 
-    total_duty = round(base_rate + (adder_rate or 0.0), 4)
 
-    logger.info("adder_rate_agent_done hts=%s country=%s base=%.4f adder=%.4f total=%.4f method=%s",
-                hts_code, country, base_rate, adder_rate or 0.0, total_duty, method)
+def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
+    hts_code = (state.get("hts_code") or "").strip()
+    country = state.get("country")
+    base_rate = state.get("base_rate") or 0.0
+    fta_applied = state.get("fta_applied", False)
+    fta_rate = state.get("fta_rate")
+    mfn_rate = state.get("mfn_rate") or base_rate
+    hts_footnotes = state.get("hts_footnotes") or []
+    policy_chunks = state.get("policy_chunks") or []
+
+    if not hts_code:
+        return {
+            "chapter99_adder": None, "chapter99_doc": None,
+            "notice_adder": None, "notice_doc": None, "notice_basis": None,
+            "adder_rate": 0.0, "adder_doc": None, "adder_basis": "none",
+            "total_duty": base_rate,
+        }
+
+    logger.info("adder_rate_agent_start hts=%s country=%s fta=%s", hts_code, country, fta_applied)
+
+    # Cache check (recompute total_duty with current base_rate)
+    cached = _cache_get(hts_code, country)
+    if cached:
+        adder = cached.get("adder_rate") or 0.0
+        cached["total_duty"] = round(base_rate + adder, 4)
+        return cached
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # STEP 4: CHAPTER 99 FOOTNOTE LOOKUP (highest priority, most authoritative)
+    # ─────────────────────────────────────────────────────────────────────────────
+    chapter99_adder, chapter99_doc = _step4_chapter99_lookup(hts_code, hts_footnotes, country)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # STEP 5: NOTICE_HTS_CODES LOOKUP (LLM-extracted from FR snippets)
+    # ─────────────────────────────────────────────────────────────────────────────
+    notice_adder, notice_doc, notice_basis = _step5_notice_lookup(hts_code, country)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # STEP 7: RATE STACKING (priority-based selection)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    # Special case: if FTA applied, adder is 0 (FTA exempt)
+    if fta_applied:
+        final_adder = 0.0
+        final_doc = None
+        final_basis = "fta_exempt"
+        effective_base = fta_rate or 0.0
+        logger.info("step7_fta_exempt hts=%s fta_rate=%.2f", hts_code, effective_base)
+    else:
+        # Priority order: chapter99 > notice > regex > 0.0
+        if chapter99_adder is not None:
+            final_adder = chapter99_adder
+            final_doc = chapter99_doc
+            final_basis = "chapter99"
+            logger.info("step7_chapter99_selected hts=%s rate=%.2f", hts_code, final_adder)
+        elif notice_adder is not None:
+            final_adder = notice_adder
+            final_doc = notice_doc
+            final_basis = "notice_llm"
+            logger.info("step7_notice_selected hts=%s rate=%.2f doc=%s", hts_code, final_adder, final_doc)
+        else:
+            # Regex fallback on policy_chunks (last resort)
+            final_adder = _regex_fallback(policy_chunks, hts_code) if policy_chunks else 0.0
+            final_doc = None
+            final_basis = "regex_fallback" if final_adder > 0 else "none"
+            logger.info("step7_regex_fallback hts=%s rate=%.2f", hts_code, final_adder)
+
+        effective_base = mfn_rate
+
+    total_duty = round(effective_base + final_adder, 4)
+
+    logger.info("adder_rate_agent_done hts=%s country=%s ch99=%s notice=%s final=%.4f basis=%s total=%.4f",
+                hts_code, country, chapter99_adder, notice_adder, final_adder, final_basis, total_duty)
 
     result = {
-        "adder_rate": adder_rate or 0.0,
-        "adder_doc": adder_doc,
-        "adder_method": method,
+        "chapter99_adder": chapter99_adder,
+        "chapter99_doc": chapter99_doc,
+        "notice_adder": notice_adder,
+        "notice_doc": notice_doc,
+        "notice_basis": notice_basis,
+        "adder_rate": final_adder,
+        "adder_doc": final_doc,
+        "adder_basis": final_basis,
+        "adder_method": final_basis,  # Backwards compat
         "total_duty": total_duty,
     }
     _cache_set(hts_code, country, result)
