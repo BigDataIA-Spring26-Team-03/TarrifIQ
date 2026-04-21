@@ -15,7 +15,7 @@ TOOLS
   7.  alias_write(product, hts_code, confidence)
   8.  fetch_doc_numbers_for_hts(hts_code)
   9.  fetch_bm25_corpus(hts_code, hts_chapter)
-  10. verify_fr_doc(doc_number)
+  10. verify_docs_batch(doc_numbers) — batch verify against all notice tables
   11. write_hitl_record(query, reason, hts, conf)
   12. census_trade_flow(hts_code)
   13. fetch_top_importer_countries(hts_code, months=24, top_n=8)
@@ -623,90 +623,55 @@ def fetch_bm25_corpus(hts_code: str, hts_chapter: str) -> List[Dict[str, Any]]:
         conn.close()
 
 
-# ── TOOL 10 — verify_fr_doc ───────────────────────────────────────────────────
+# ── TOOL 10 — verify_docs_batch ───────────────────────────────────────────────
 
-def verify_fr_doc(doc_number: str) -> bool:
-    """Check USTR + CBP Federal Register tables."""
-    conn = _sf()
-    cur = conn.cursor()
+def verify_docs_batch(doc_numbers: Set[str]) -> Set[str]:
+    """
+    Batch verify all doc numbers against all notice tables in a single
+    Snowflake connection. Returns set of verified doc numbers.
+    Much more efficient than one connection per doc.
+    """
+    if not doc_numbers:
+        return set()
+
+    docs_list = list(doc_numbers)
+    ph = ",".join(["%s"] * len(docs_list))
+    verified: Set[str] = set()
+
     try:
-        cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES "
-            "WHERE document_number=%s LIMIT 1",
-            (doc_number,),
-        )
-        if cur.fetchone():
-            return True
-        cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES "
-            "WHERE document_number=%s LIMIT 1",
-            (doc_number,),
-        )
-        return cur.fetchone() is not None
+        conn = _sf()
+        cur = conn.cursor()
+        try:
+            tables = [
+                "TARIFFIQ.RAW.FEDERAL_REGISTER_NOTICES",
+                "TARIFFIQ.RAW.CBP_FEDERAL_REGISTER_NOTICES",
+                "TARIFFIQ.RAW.ITC_DOCUMENTS",
+                "TARIFFIQ.RAW.EOP_DOCUMENTS",
+                "TARIFFIQ.RAW.ITA_FEDERAL_REGISTER_NOTICES",
+            ]
+
+            for table in tables:
+                try:
+                    cur.execute(
+                        f"SELECT DISTINCT DOCUMENT_NUMBER FROM {table} "
+                        f"WHERE DOCUMENT_NUMBER IN ({ph})",
+                        docs_list,
+                    )
+                    for (doc,) in cur.fetchall():
+                        if doc:
+                            verified.add(str(doc))
+                except Exception as e:
+                    logger.debug("verify_docs_batch_table_error table=%s error=%s", table, e)
+                    continue
+
+            logger.info("verify_docs_batch total=%d verified=%d", len(docs_list), len(verified))
+        finally:
+            cur.close()
+            conn.close()
     except Exception as e:
-        logger.error("verify_fr_doc_error doc=%s error=%s", doc_number, e)
-        return True  # fail open
-    finally:
-        cur.close()
-        conn.close()
+        logger.warning("verify_docs_batch_error error=%s", e)
 
-
-def verify_itc_doc(doc_number: str) -> bool:
-    """Check ITC_DOCUMENTS table for USITC notices."""
-    conn = _sf()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.ITC_DOCUMENTS "
-            "WHERE document_number=%s LIMIT 1",
-            (doc_number,),
-        )
-        return cur.fetchone() is not None
-    except Exception as e:
-        # Table may not exist — fail open
-        logger.debug("verify_itc_doc_error doc=%s error=%s", doc_number, e)
-        return False
-    finally:
-        cur.close()
-        conn.close()
-
-
-def verify_eop_doc(doc_number: str) -> bool:
-    """Check EOP_DOCUMENTS for Executive Office notices."""
-    conn = _sf()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.EOP_DOCUMENTS "
-            "WHERE document_number=%s LIMIT 1",
-            (doc_number,),
-        )
-        return cur.fetchone() is not None
-    except Exception as e:
-        logger.debug("verify_eop_doc_error doc=%s error=%s", doc_number, e)
-        return False
-    finally:
-        cur.close()
-        conn.close()
-
-
-def verify_ita_doc(doc_number: str) -> bool:
-    """Check ITA_FEDERAL_REGISTER_NOTICES."""
-    conn = _sf()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT 1 FROM TARIFFIQ.RAW.ITA_FEDERAL_REGISTER_NOTICES "
-            "WHERE document_number=%s LIMIT 1",
-            (doc_number,),
-        )
-        return cur.fetchone() is not None
-    except Exception as e:
-        logger.debug("verify_ita_doc_error doc=%s error=%s", doc_number, e)
-        return False
-    finally:
-        cur.close()
-        conn.close()
+    return verified
 
 
 # ── TOOL 11 — write_hitl_record ───────────────────────────────────────────────
