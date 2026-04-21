@@ -22,8 +22,4 @@ redis_data/
 CLAUDE.md
 DEPLOYMENT_CHECKLIST.md
 PIPELINE_STATUS.md
-.md.venv311/
-.venv/
-
 .venv311/
-.venv/
