@@ -48,12 +48,22 @@ class TariffState(TypedDict):
     policy_chunks: Optional[List[Dict[str, Any]]]
     policy_summary: Optional[str]
 
-    # Step 5 — Adder Rate Agent  (LLM reads policy_chunks)
-    adder_rate: Optional[float]       # Section 301 / IEEPA / Section 232 adder
+    # Step 4 — Chapter 99 Lookup
+    chapter99_adder: Optional[float]  # Rate from HTS Chapter 99 codes (highest priority)
+    chapter99_doc: Optional[str]      # HTS Chapter 99 code e.g. "9903.88.03"
+
+    # Step 5 — Notice HTS Codes Lookup
+    notice_adder: Optional[float]     # Rate from NOTICE_HTS_CODES LLM extraction
+    notice_doc: Optional[str]         # FR document number from notice snippets
+    notice_basis: Optional[str]       # One-sentence explanation from LLM
+
+    # Step 7 — Rate Stacking (final adder computation)
+    adder_rate: Optional[float]       # Final Section 301 / IEEPA / Section 232 adder (after stacking priority)
     adder_specific_duty: Optional[str]  # e.g. "66.6¢/kg" for specific duty codes
-    adder_doc: Optional[str]          # FR document that sourced the adder
-    adder_method: Optional[str]       # "llm_policy" | "regex_fallback" | "none"
-    total_duty: Optional[float]       # base_rate + adder_rate
+    adder_doc: Optional[str]          # FR document that sourced the final adder
+    adder_basis: Optional[str]        # "chapter99" | "notice_llm" | "regex_fallback" | "fta_exempt" | "none"
+    adder_method: Optional[str]       # Deprecated, kept for backwards compat: maps to adder_basis
+    total_duty: Optional[float]       # base_rate + adder_rate (or just base_rate if FTA exempt)
 
     # Step 6 — Trade Agent  (Census Bureau)
     import_value_usd: Optional[float]
