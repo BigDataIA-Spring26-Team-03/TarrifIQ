@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agents.graph import run_pipeline
+from agents.graph import run_pipeline, run_comparison_pipeline, run_pipeline_auto
 
 st.set_page_config(
     layout="wide",
@@ -685,23 +685,52 @@ def _render_duty_gauge(state: Dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    # Rate chips
-    chips_html = ""
-    chips_html += f'<span class="rate-chip"><span class="dot" style="background:#3b82f6"></span>Base MFN {_fmt_pct(base)}</span>'
-    if adder and float(adder) > 0:
-        src = adder_method.upper().replace("_", " ")
-        chips_html += f'<span class="rate-chip"><span class="dot" style="background:#ef4444"></span>Adder {_fmt_pct(adder)} · {src}</span>'
-    if fta_applied and fta_program:
-        chips_html += f'<span class="rate-chip"><span class="dot" style="background:#10b981"></span>{fta_program} applied</span>'
 
-    st.markdown(f"<div>{chips_html}</div>", unsafe_allow_html=True)
+def _render_comparison_result(state: Dict[str, Any]) -> None:
+    """Render side-by-side country comparison pipeline results."""
+    product = state.get("product") or "Product"
+    hts_code = state.get("hts_code") or "—"
+    hts_desc = state.get("hts_description") or ""
+    comparison = state.get("comparison") or []
+    cheapest = state.get("cheapest_country")
 
-    if fta_applied and fta_program:
-        st.markdown(
-            f'<div class="fta-badge">✓ {fta_program} preferential rate applied — {_fmt_pct(state.get("fta_rate"))}</div>',
-            unsafe_allow_html=True,
-        )
+    st.markdown('<div class="section-header">Country Comparison</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='tiq-hts'><span style='color:#60a5fa'>{html.escape(str(product))}</span>"
+        f"<span style='color:#4a5568'> · </span>{html.escape(str(hts_code))}"
+        f"<span style='color:#4a5568'> · </span>{html.escape(str(hts_desc))}</div>",
+        unsafe_allow_html=True,
+    )
 
+    if not comparison:
+        st.info("No comparison results returned.")
+        return
+
+    rows = []
+    for c in comparison:
+        rows.append({
+            "Country": c.get("country", "—"),
+            "Base MFN": f"{float(c.get('mfn_rate', c.get('base_rate', 0.0)) or 0.0):.1f}%",
+            "Adder": f"+{float(c.get('adder_rate', 0.0) or 0.0):.1f}%",
+            "Section122": f"+{float(c.get('section122_adder', 0.0) or 0.0):.1f}%",
+            "Total Duty": f"{float(c.get('total_duty', 0.0) or 0.0):.1f}%",
+            "Doc": c.get("adder_doc") or "—",
+            "Method": c.get("adder_method") or "—",
+            "FTA": c.get("fta_program") if c.get("fta_applied") else "No",
+        })
+
+    cols = ["Country", "Base MFN", "Adder", "Section122", "Total Duty", "Doc", "Method", "FTA"]
+    st.markdown(_html_table(rows, cols), unsafe_allow_html=True)
+
+    if cheapest:
+        st.success(f"Cheapest country: {cheapest}")
+
+    # Show policy summary for each country
+    for c in comparison:
+        if c.get("policy_summary"):
+            with st.expander(f"📄 Policy Summary — {c['country']}", expanded=False):
+                cleaned = re.sub(r"https?://\S+", "", str(c["policy_summary"])).strip()
+                st.markdown(cleaned)
 
 # ── Citation renderer ──────────────────────────────────────────────────────────
 
@@ -1007,7 +1036,7 @@ def _run_pipeline_with_status(text: str, status_ph) -> Dict[str, Any]:
 
     def _worker() -> None:
         try:
-            result_holder[0] = run_pipeline(text)
+            result_holder[0] = run_pipeline_auto(text)
         except Exception as exc:
             error_holder[0] = exc
 
@@ -1059,6 +1088,16 @@ def _run_pipeline_response(text: str) -> None:
             st.error(err)
             st.session_state.messages.append(
                 {"role": "assistant", "content": err, "state": {"error": str(exc)}, "query": text}
+            )
+            return
+
+        if isinstance(state, dict) and state.get("comparison") is not None:
+            content = "Country comparison generated."
+            _emit_answer(content)
+            _render_comparison_result(state)
+            st.markdown(_query_footer_html(text), unsafe_allow_html=True)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": content, "state": state, "query": text}
             )
             return
 

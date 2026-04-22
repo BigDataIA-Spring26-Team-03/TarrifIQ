@@ -26,6 +26,7 @@ class TariffState(TypedDict):
     product: Optional[str]
     country: Optional[str]
     query_intent: Optional[str]   # "rate_change" | "country_compare" | "exemption_check" | None
+    query_intent_note: Optional[str]      # Context note for synthesis based on intent
     clarification_needed: Optional[bool]       # True if product too broad
     clarification_message: Optional[str]       # Human-readable message
     clarification_suggestions: Optional[List[Dict[str, str]]]  # [{label, query}]
@@ -63,6 +64,8 @@ class TariffState(TypedDict):
     adder_doc: Optional[str]          # FR document that sourced the final adder
     adder_basis: Optional[str]        # "chapter99" | "notice_llm" | "regex_fallback" | "fta_exempt" | "none"
     adder_method: Optional[str]       # Deprecated, kept for backwards compat: maps to adder_basis
+    section122_adder: Optional[float] # Section 122 universal surcharge (stacked on top)
+    section122_doc: Optional[str]     # FR document for Section 122 surcharge
     total_duty: Optional[float]       # base_rate + adder_rate (or just base_rate if FTA exempt)
 
     # Step 6 — Trade Agent  (Census Bureau)

@@ -246,3 +246,91 @@ def run_pipeline(query: str) -> Dict[str, Any]:
     logger.info("pipeline_done query=%s hitl=%s latency_ms=%d",
                 query[:60], result.get("hitl_required"), elapsed_ms)
     return result
+
+
+def run_comparison_pipeline(query: str, countries: list) -> Dict[str, Any]:
+    """
+    Run the pipeline for multiple countries and return side-by-side comparison.
+    Used for queries like "is it cheaper to import steel from China or Germany?"
+
+    Returns a dict with:
+    - product, hts_code, hts_description
+    - comparison: list of {country, base_rate, adder_rate, total_duty, adder_doc, fta_applied}
+    - cheapest_country: country with lowest total_duty
+    """
+    from agents.query_agent import run_query_agent
+
+    # First parse the query to get the product
+    initial = {"query": query}
+    parsed = run_query_agent(initial)
+    product = parsed.get("product")
+
+    if not product:
+        return {"error": "Could not parse product from query"}
+
+    logger.info("comparison_pipeline_start product=%s countries=%s", product, countries)
+
+    comparison = []
+    hts_code = None
+    hts_description = None
+
+    for country in countries:
+        country_query = f"{product} from {country}"
+        result = run_pipeline(country_query)
+
+        if not hts_code:
+            hts_code = result.get("hts_code")
+            hts_description = result.get("hts_description")
+
+        comparison.append({
+            "country": country,
+            "base_rate": result.get("base_rate") or 0.0,
+            "mfn_rate": result.get("mfn_rate") or 0.0,
+            "adder_rate": result.get("adder_rate") or 0.0,
+            "section122_adder": result.get("section122_adder") or 0.0,
+            "total_duty": result.get("total_duty") or 0.0,
+            "adder_doc": result.get("adder_doc"),
+            "adder_method": result.get("adder_method"),
+            "fta_applied": result.get("fta_applied", False),
+            "fta_program": result.get("fta_program"),
+            "policy_summary": result.get("policy_summary"),
+            "hitl_required": result.get("hitl_required", False),
+        })
+
+    # Sort by total_duty ascending
+    comparison.sort(key=lambda x: x["total_duty"])
+    cheapest = comparison[0]["country"] if comparison else None
+
+    logger.info(
+        "comparison_pipeline_done product=%s countries=%d cheapest=%s",
+        product, len(countries), cheapest
+    )
+
+    return {
+        "product": product,
+        "hts_code": hts_code,
+        "hts_description": hts_description,
+        "comparison": comparison,
+        "cheapest_country": cheapest,
+        "query": query,
+    }
+
+
+def run_pipeline_auto(query: str) -> Dict[str, Any]:
+    """
+    Auto-detects comparison queries and routes appropriately.
+    Falls back to standard run_pipeline for non-comparison queries.
+    """
+    import re
+    # Detect patterns like "China or Germany", "China vs Germany", "China vs. Mexico"
+    compare_match = re.search(
+        r'\b(from|between)\s+([A-Z][a-z]+)\s+(?:or|vs\.?)\s+([A-Z][a-z]+)\b',
+        query, re.IGNORECASE
+    )
+    if compare_match:
+        country1 = compare_match.group(2)
+        country2 = compare_match.group(3)
+        logger.info("auto_routing comparison country1=%s country2=%s", country1, country2)
+        return run_comparison_pipeline(query, [country1, country2])
+
+    return run_pipeline(query)
