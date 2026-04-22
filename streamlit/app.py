@@ -6,6 +6,7 @@ import html
 import json
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -33,135 +34,161 @@ def _inject_styles() -> None:
     st.markdown(
         """
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+            @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
 
             /* ── Base ── */
             html, body, .stApp {
-                background: #060a10 !important;
-                color: #c9d1d9;
-                font-family: 'IBM Plex Sans', sans-serif;
+                background: #0a0e27 !important;
+                color: #e0e7ff;
+                font-family: 'Poppins', sans-serif;
             }
 
             /* ── Sidebar ── */
             [data-testid="stSidebar"] {
-                background: #0a0f18 !important;
-                border-right: 1px solid #1a2332 !important;
+                background: #0f1535 !important;
+                border-right: 1px solid #1e3a5f !important;
             }
-            [data-testid="stSidebar"] * { color: #8b96a5 !important; }
+            [data-testid="stSidebar"] * { color: #94a3b8 !important; }
             [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
-            [data-testid="stSidebar"] h3 { color: #e2e8f0 !important; }
+            [data-testid="stSidebar"] h3 {
+                color: #e0e7ff !important;
+                font-weight: 600 !important;
+            }
 
             /* ── Header ── */
             .tiq-header {
                 padding: 2rem 0 1.5rem;
-                border-bottom: 1px solid #1a2332;
+                background: transparent;
+                border-bottom: 1px solid #1e3a5f;
                 margin-bottom: 2rem;
             }
             .tiq-title {
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 1.6rem;
-                font-weight: 600;
-                color: #e2e8f0;
+                font-family: 'Space Mono', monospace;
+                font-size: 2.2rem;
+                font-weight: 700;
+                background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
                 letter-spacing: -0.02em;
             }
-            .tiq-title span { color: #3b82f6; }
+            .tiq-title span { color: #60a5fa; }
             .tiq-subtitle {
-                font-size: 0.8rem;
-                color: #4a5568;
-                font-family: 'IBM Plex Mono', monospace;
-                letter-spacing: 0.08em;
+                font-size: 0.75rem;
+                color: #64748b;
+                font-family: 'Poppins', sans-serif;
+                letter-spacing: 0.1em;
                 text-transform: uppercase;
-                margin-top: 0.25rem;
+                margin-top: 0.5rem;
+                font-weight: 600;
             }
 
             /* ── Cards ── */
             .tiq-card {
-                background: #0d1520;
-                border: 1px solid #1a2332;
-                border-radius: 8px;
-                padding: 16px 20px;
-                margin-bottom: 12px;
-                transition: border-color 0.2s;
+                background: #0f1535;
+                border: 1px solid #1e3a5f;
+                border-radius: 10px;
+                padding: 18px 22px;
+                margin-bottom: 14px;
+                transition: all 0.2s ease;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
             }
-            .tiq-card:hover { border-color: #2d3f55; }
+            .tiq-card:hover {
+                border-color: #3b82f6;
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.15);
+            }
 
             .tiq-card-accent {
-                background: linear-gradient(135deg, #0d1520 0%, #0f1e2e 100%);
-                border: 1px solid #1e3a5f;
-                border-radius: 8px;
-                padding: 16px 20px;
-                margin-bottom: 12px;
+                background: #1a2553;
+                border: 1px solid #3b82f6;
+                border-radius: 10px;
+                padding: 18px 22px;
+                margin-bottom: 14px;
+                box-shadow: 0 2px 8px rgba(59, 130, 246, 0.1);
             }
 
             /* ── HTS Code block ── */
             .tiq-hts {
-                background: #080d14;
-                border: 1px solid #1a2332;
-                border-left: 3px solid #3b82f6;
-                border-radius: 6px;
-                padding: 12px 16px;
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 0.88rem;
-                color: #93c5fd;
-                line-height: 1.5;
+                background: #0f1535;
+                border: 1px solid #1e3a5f;
+                border-radius: 10px;
+                padding: 16px 20px;
+                font-family: 'Space Mono', monospace;
+                font-size: 0.9rem;
+                color: #60a5fa;
+                line-height: 1.6;
+                font-weight: 600;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+                letter-spacing: 0.5px;
             }
 
             /* ── Duty gauge ── */
             .duty-gauge-wrap {
                 display: flex;
                 align-items: center;
-                gap: 16px;
-                padding: 16px 20px;
-                background: #0d1520;
-                border: 1px solid #1a2332;
-                border-radius: 8px;
-                margin-bottom: 12px;
+                gap: 20px;
+                padding: 24px 28px;
+                background: #0f1535;
+                border: 1px solid #1e3a5f;
+                border-radius: 12px;
+                margin-bottom: 18px;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
             }
             .duty-number {
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 2.4rem;
-                font-weight: 600;
+                font-family: 'Space Mono', monospace;
+                font-size: 2.8rem;
+                font-weight: 700;
                 line-height: 1;
-                min-width: 100px;
+                min-width: 110px;
+                letter-spacing: -0.02em;
             }
-            .duty-number.high { color: #ef4444; }
+            .duty-number.high { color: #dc2626; }
             .duty-number.medium { color: #f59e0b; }
-            .duty-number.low { color: #10b981; }
-            .duty-number.zero { color: #3b82f6; }
+            .duty-number.low { color: #059669; }
+            .duty-number.zero { color: #0284c7; }
             .duty-label {
-                font-size: 0.72rem;
-                color: #4a5568;
-                font-family: 'IBM Plex Mono', monospace;
+                font-size: 0.7rem;
+                color: #64748b;
+                font-family: 'Poppins', sans-serif;
                 text-transform: uppercase;
-                letter-spacing: 0.1em;
-                margin-top: 4px;
+                letter-spacing: 0.12em;
+                margin-top: 6px;
+                font-weight: 600;
             }
             .duty-bar-track {
                 flex: 1;
-                height: 6px;
-                background: #1a2332;
-                border-radius: 3px;
+                height: 8px;
+                background: #1a2553;
+                border-radius: 4px;
                 overflow: hidden;
+                box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3);
             }
             .duty-bar-fill {
                 height: 100%;
-                border-radius: 3px;
-                transition: width 0.8s ease;
+                border-radius: 4px;
+                transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
             }
 
             /* ── Rate breakdown chips ── */
             .rate-chip {
                 display: inline-flex;
                 align-items: center;
-                gap: 6px;
-                background: #111827;
-                border: 1px solid #1f2937;
+                gap: 8px;
+                background: #1a2553;
+                border: 1px solid #3b82f6;
                 border-radius: 20px;
-                padding: 4px 12px;
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 0.78rem;
-                color: #9ca3af;
-                margin: 3px;
+                padding: 6px 14px;
+                font-family: 'Space Mono', monospace;
+                font-size: 0.8rem;
+                color: #60a5fa;
+                margin: 4px;
+                transition: all 0.2s ease;
+                font-weight: 500;
+            }
+            .rate-chip:hover {
+                border-color: #60a5fa;
+                background: #0f1535;
+                box-shadow: 0 2px 8px rgba(59, 130, 246, 0.15);
             }
             .rate-chip .dot {
                 width: 6px; height: 6px;
@@ -171,37 +198,43 @@ def _inject_styles() -> None:
 
             /* ── Citation cards ── */
             .cit-card {
-                background: #080d14;
-                border: 1px solid #1a2332;
-                border-radius: 6px;
-                padding: 12px 14px;
-                margin-bottom: 8px;
+                background: #0f1535;
+                border: 1px solid #1e3a5f;
+                border-radius: 8px;
+                padding: 14px 16px;
+                margin-bottom: 10px;
                 display: flex;
                 gap: 12px;
                 align-items: flex-start;
+                transition: all 0.2s ease;
+            }
+            .cit-card:hover {
+                border-color: #3b82f6;
+                background: #1a2553;
+                box-shadow: 0 2px 8px rgba(59, 130, 246, 0.1);
             }
             .cit-badge {
-                font-family: 'IBM Plex Mono', monospace;
+                font-family: 'Space Mono', monospace;
                 font-size: 0.65rem;
                 font-weight: 600;
                 letter-spacing: 0.06em;
                 text-transform: uppercase;
-                padding: 3px 8px;
-                border-radius: 4px;
+                padding: 4px 10px;
+                border-radius: 6px;
                 white-space: nowrap;
                 flex-shrink: 0;
                 margin-top: 2px;
             }
-            .cit-badge.ustr { background: #1e3a5f; color: #60a5fa; }
-            .cit-badge.cbp  { background: #1a3326; color: #34d399; }
-            .cit-badge.hts  { background: #1e2a4a; color: #818cf8; }
-            .cit-badge.eop  { background: #2d1f3d; color: #c084fc; }
-            .cit-badge.census { background: #1f2937; color: #9ca3af; }
-            .cit-badge.default { background: #1f2937; color: #9ca3af; }
+            .cit-badge.ustr { background: #1a2553; color: #60a5fa; }
+            .cit-badge.cbp  { background: #1a3a2a; color: #10b981; }
+            .cit-badge.hts  { background: #2d1f3a; color: #a78bfa; }
+            .cit-badge.eop  { background: #3a1f3a; color: #d946ef; }
+            .cit-badge.census { background: #1a2332; color: #94a3b8; }
+            .cit-badge.default { background: #1a2332; color: #94a3b8; }
             .cit-body { flex: 1; min-width: 0; }
             .cit-title {
                 font-size: 0.82rem;
-                color: #cbd5e1;
+                color: #e0e7ff;
                 line-height: 1.4;
                 margin-bottom: 4px;
                 overflow: hidden;
@@ -210,14 +243,14 @@ def _inject_styles() -> None:
                 -webkit-box-orient: vertical;
             }
             .cit-meta {
-                font-family: 'IBM Plex Mono', monospace;
+                font-family: 'Space Mono', monospace;
                 font-size: 0.7rem;
-                color: #4a5568;
+                color: #64748b;
             }
             .cit-link {
-                font-family: 'IBM Plex Mono', monospace;
+                font-family: 'Space Mono', monospace;
                 font-size: 0.72rem;
-                color: #3b82f6;
+                color: #60a5fa;
                 text-decoration: none;
                 display: inline-flex;
                 align-items: center;
@@ -235,90 +268,122 @@ def _inject_styles() -> None:
                 margin-bottom: 12px;
             }
             .metric-box {
-                background: #0d1520;
-                border: 1px solid #1a2332;
-                border-radius: 8px;
-                padding: 14px 16px;
+                background: #0f1535;
+                border: 1px solid #1e3a5f;
+                border-radius: 10px;
+                padding: 16px 18px;
                 text-align: center;
+                transition: all 0.2s ease;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+            }
+            .metric-box:hover {
+                border-color: #3b82f6;
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.1);
             }
             .metric-val {
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 1.2rem;
-                font-weight: 600;
-                color: #e2e8f0;
+                font-family: 'Space Mono', monospace;
+                font-size: 1.3rem;
+                font-weight: 700;
+                color: #60a5fa;
+                letter-spacing: -0.01em;
             }
             .metric-lbl {
-                font-size: 0.7rem;
-                color: #4a5568;
+                font-size: 0.68rem;
+                color: #64748b;
                 text-transform: uppercase;
-                letter-spacing: 0.08em;
-                margin-top: 3px;
-                font-family: 'IBM Plex Mono', monospace;
+                letter-spacing: 0.1em;
+                margin-top: 6px;
+                font-family: 'Poppins', sans-serif;
+                font-weight: 600;
             }
 
             /* ── Intent tag ── */
             .intent-tag {
                 display: inline-flex;
                 align-items: center;
-                gap: 6px;
-                background: #0f1e2e;
-                border: 1px solid #1e3a5f;
-                border-radius: 4px;
-                padding: 3px 10px;
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 0.72rem;
+                gap: 8px;
+                background: #1a2553;
+                border: 1px solid #3b82f6;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-family: 'Space Mono', monospace;
+                font-size: 0.75rem;
                 color: #60a5fa;
-                margin-bottom: 10px;
+                margin-bottom: 12px;
+                font-weight: 600;
+                letter-spacing: 0.05em;
+                box-shadow: 0 1px 3px rgba(59, 130, 246, 0.1);
             }
 
             /* ── FTA badge ── */
             .fta-badge {
                 display: inline-flex;
                 align-items: center;
-                gap: 6px;
-                background: #0a1f18;
-                border: 1px solid #065f46;
-                border-radius: 4px;
-                padding: 5px 12px;
-                font-family: 'IBM Plex Mono', monospace;
-                font-size: 0.78rem;
-                color: #34d399;
-                margin-bottom: 10px;
+                gap: 8px;
+                background: #1a3a2a;
+                border: 1px solid #10b981;
+                border-radius: 8px;
+                padding: 8px 14px;
+                font-family: 'Space Mono', monospace;
+                font-size: 0.8rem;
+                color: #10b981;
+                margin-bottom: 12px;
+                font-weight: 600;
+                box-shadow: 0 1px 3px rgba(16, 185, 129, 0.1);
             }
 
             /* ── Chat messages ── */
             [data-testid="stChatMessage"] {
                 background: transparent !important;
                 border: none !important;
+                padding: 14px 0 !important;
             }
             .stChatMessage [data-testid="stMarkdownContainer"] p {
-                color: #c9d1d9;
-                line-height: 1.7;
+                color: #e0e7ff;
+                line-height: 1.6;
+                font-size: 0.95rem;
             }
 
             /* ── Chat input ── */
             [data-testid="stChatInput"] {
-                background: #0a0f18 !important;
-                border-top: 1px solid #1a2332 !important;
+                background: transparent !important;
+                border-top: none !important;
+                padding: 16px 0 0 0 !important;
+                margin-top: 16px !important;
             }
             [data-testid="stChatInputTextArea"] {
-                background: #0d1520 !important;
-                border: 1px solid #1a2332 !important;
-                border-radius: 8px !important;
-                color: #e2e8f0 !important;
-                font-family: 'IBM Plex Sans', sans-serif !important;
+                background: #0f1535 !important;
+                border: 1px solid #1e3a5f !important;
+                border-radius: 10px !important;
+                color: #e0e7ff !important;
+                font-family: 'Poppins', sans-serif !important;
+                font-size: 0.95rem !important;
+                padding: 12px 16px !important;
+                transition: all 0.2s ease !important;
+            }
+            [data-testid="stChatInputTextArea"]:focus {
+                border-color: #3b82f6 !important;
+                box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1), 0 1px 3px rgba(0, 0, 0, 0.3) !important;
             }
 
             /* ── Expanders ── */
             [data-testid="stExpander"] {
-                background: #0d1520 !important;
-                border: 1px solid #1a2332 !important;
-                border-radius: 8px !important;
+                background: #0f1535 !important;
+                border: 1px solid #1e3a5f !important;
+                border-radius: 10px !important;
+                transition: all 0.2s ease !important;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3) !important;
+            }
+            [data-testid="stExpander"]:hover {
+                border-color: #3b82f6 !important;
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.1) !important;
             }
             [data-testid="stExpander"] summary {
-                color: #8b96a5 !important;
-                font-family: 'IBM Plex Mono', monospace !important;
-                font-size: 0.82rem !important;
+                color: #e0e7ff !important;
+                font-family: 'Poppins', sans-serif !important;
+                font-size: 0.85rem !important;
+                font-weight: 600 !important;
+                padding: 12px 16px !important;
             }
 
             /* ── Dataframe ── */
@@ -330,42 +395,46 @@ def _inject_styles() -> None:
 
             /* ── Buttons ── */
             .stButton button {
-                background: #0d1520 !important;
-                border: 1px solid #1a2332 !important;
-                color: #8b96a5 !important;
-                border-radius: 6px !important;
-                font-family: 'IBM Plex Mono', monospace !important;
-                font-size: 0.78rem !important;
-                transition: all 0.2s !important;
+                background: #0f1535 !important;
+                border: 1px solid #3b82f6 !important;
+                color: #60a5fa !important;
+                border-radius: 8px !important;
+                font-family: 'Poppins', sans-serif !important;
+                font-size: 0.9rem !important;
+                font-weight: 600 !important;
+                transition: all 0.2s ease !important;
+                padding: 10px 18px !important;
+                box-shadow: 0 1px 3px rgba(59, 130, 246, 0.1) !important;
             }
             .stButton button:hover {
-                border-color: #3b82f6 !important;
-                color: #60a5fa !important;
-                background: #0f1e2e !important;
+                border-color: #60a5fa !important;
+                background: #1a2553 !important;
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2) !important;
             }
 
             /* ── Confidence badge ── */
-            .conf-high { color: #10b981; }
-            .conf-medium { color: #f59e0b; }
-            .conf-low { color: #ef4444; }
+            .conf-high { color: #059669; }
+            .conf-medium { color: #d97706; }
+            .conf-low { color: #dc2626; }
 
             /* ── Section headers ── */
             .section-header {
-                font-family: 'IBM Plex Mono', monospace;
+                font-family: 'Space Mono', monospace;
                 font-size: 0.7rem;
                 text-transform: uppercase;
                 letter-spacing: 0.12em;
-                color: #4a5568;
-                margin: 16px 0 8px;
+                color: #64748b;
+                margin: 18px 0 12px;
                 display: flex;
                 align-items: center;
-                gap: 8px;
+                gap: 10px;
+                font-weight: 700;
             }
             .section-header::after {
                 content: '';
                 flex: 1;
                 height: 1px;
-                background: #1a2332;
+                background: #1e3a5f;
             }
 
             /* ── Scrollbar ── */
@@ -393,12 +462,20 @@ def _inject_styles() -> None:
             #MainMenu, footer, header { visibility: hidden !important; display: none !important; }
             .stDeployButton { display: none !important; }
 
+            /* Hide all chat avatars */
+            [data-testid="stChatMessageAvatarUser"],
+            [data-testid="stChatMessageAvatarAssistant"],
+            [data-testid*="ChatMessageAvatar"],
+            .stChatMessage img,
+            div[data-testid="stChatMessage"] img {
+                display: none !important;
+            }
+
             /* ── Kill ALL white backgrounds ── */
             .stApp > div, .main, .block-container,
             [data-testid="stAppViewContainer"],
             [data-testid="stVerticalBlock"],
             [data-testid="stHorizontalBlock"],
-            section[data-testid="stSidebar"] > div,
             .element-container, .stMarkdown,
             div[data-testid="stChatMessageContent"],
             div[data-testid="stChatMessage"],
@@ -441,10 +518,10 @@ def _inject_styles() -> None:
             /* ── Alert/info boxes ── */
             [data-testid="stAlert"],
             .stInfo, .stWarning, .stError, .stSuccess {
-                background: #0d1520 !important;
-                border: 1px solid #1a2332 !important;
+                background: #0f1535 !important;
+                border: 1px solid #1e3a5f !important;
                 border-radius: 8px !important;
-                color: #c9d1d9 !important;
+                color: #e0e7ff !important;
             }
         </style>
         """,
@@ -462,7 +539,6 @@ def _ensure_state() -> None:
 def _new_conversation() -> None:
     st.session_state.messages = []
     st.session_state.pop(_PENDING_PIPELINE_QUERY, None)
-    st.rerun()
 
 
 def _last_state() -> Optional[Dict[str, Any]]:
@@ -526,6 +602,34 @@ def _stream_text(text: str) -> Iterable[str]:
 def _confidence_color(conf: Optional[str]) -> str:
     mapping = {"HIGH": "conf-high", "MEDIUM": "conf-medium", "LOW": "conf-low"}
     return mapping.get((conf or "").upper(), "")
+
+
+def _html_table(rows: list, cols: list) -> str:
+    """Render a dark-themed HTML table (replaces st.dataframe which goes invisible on dark CSS)."""
+    th = (
+        "padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:0.72rem;"
+        "text-transform:uppercase;letter-spacing:0.06em;color:#4a5568;"
+        "border-bottom:1px solid #1a2332;text-align:left;white-space:nowrap"
+    )
+    td = (
+        "padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:0.8rem;"
+        "color:#c9d1d9;border-bottom:1px solid #0d1520"
+    )
+    header = "".join(f'<th style="{th}">{html.escape(str(c))}</th>' for c in cols)
+    body = ""
+    for row in rows:
+        cells = "".join(
+            f'<td style="{td}">{html.escape(str(row.get(c) if row.get(c) is not None else "—"))}</td>'
+            for c in cols
+        )
+        body += f'<tr style="background:#080d14">{cells}</tr>'
+    return (
+        f'<div style="overflow-x:auto;border:1px solid #1a2332;border-radius:6px;margin-bottom:10px">'
+        f'<table style="width:100%;border-collapse:collapse">'
+        f'<thead style="background:#0a0f18"><tr>{header}</tr></thead>'
+        f'<tbody>{body}</tbody>'
+        f'</table></div>'
+    )
 
 
 def _parse_json_response(text: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -767,15 +871,6 @@ def _render_assistant_details(
     if state.get("hitl_required") and not _is_low_confidence_stop(state):
         st.warning(f"⚑ Flagged for review: {state.get('hitl_reason') or ''}")
 
-    # ── Policy Context ──
-    policy_summary = state.get("policy_summary")
-    if policy_summary:
-        with st.expander("📋 Policy Context", expanded=False):
-            st.markdown(
-                f"<div style='font-size:0.85rem;color:#9ca3af;line-height:1.7'>{policy_summary}</div>",
-                unsafe_allow_html=True,
-            )
-
     # ── Trade Metrics ──
     period = state.get("trade_period")
     import_val = state.get("import_value_usd")
@@ -800,8 +895,9 @@ def _render_assistant_details(
                 unsafe_allow_html=True,
             )
 
-    # ── Country Comparison ──
-    country_comparison = state.get("country_comparison") or []
+    # ── Country Comparison — disabled (hardcoded adder tiers removed) ──
+    # country_comparison = state.get("country_comparison") or []
+    country_comparison = []  # disabled
     if country_comparison:
         with st.expander("🌍 Country Comparison — Estimated Total Duty", expanded=False):
             # Build display table
@@ -819,8 +915,8 @@ def _render_assistant_details(
                     "Program": fta or c.get("adder_program") or "—",
                     "Note": note,
                 })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            _cc_cols = ["Country", "Base MFN", "Adder", "Est. Total", "Program", "Note"]
+            st.markdown(_html_table(rows, _cc_cols), unsafe_allow_html=True)
 
             # Cheapest recommendation
             if rows:
@@ -837,16 +933,34 @@ def _render_assistant_details(
     top_importers = state.get("top_importers") or []
     if top_importers:
         with st.expander("📊 Top Import Partners (Census, 24-month)", expanded=False):
-            df = pd.DataFrame(top_importers)
-            display_cols = [c for c in ["census_country_name", "imports_usd_trailing", "base_rate", "mfn_rate", "fta_program"] if c in df.columns]
-            st.dataframe(df[display_cols] if display_cols else df, use_container_width=True, hide_index=True)
-
-    # ── Rate Change History ──
-    rate_history = state.get("rate_change_history") or []
-    if rate_history:
-        with st.expander("⏱ Rate Change History", expanded=False):
-            df = pd.DataFrame(rate_history)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            _KEY_LABELS = {
+                "census_country_name":  "Country",
+                "imports_usd_trailing": "Import Value",
+                "base_rate":            "Base Rate",
+                "mfn_rate":             "MFN Rate",
+                "fta_program":          "FTA Program",
+            }
+            _PREF_KEYS = ["census_country_name", "imports_usd_trailing", "base_rate", "mfn_rate", "fta_program"]
+            avail_keys = [k for k in _PREF_KEYS if any(k in r for r in top_importers)]
+            disp_cols = [_KEY_LABELS[k] for k in avail_keys]
+            rows_disp = []
+            for r in top_importers:
+                row_d = {}
+                for k in avail_keys:
+                    val = r.get(k)
+                    if k == "imports_usd_trailing" and val is not None:
+                        try:
+                            val = _fmt_usd(float(val))
+                        except Exception:
+                            pass
+                    elif k in ("base_rate", "mfn_rate") and val is not None:
+                        try:
+                            val = f"{float(val):.2f}%"
+                        except Exception:
+                            pass
+                    row_d[_KEY_LABELS[k]] = val if val is not None else "—"
+                rows_disp.append(row_d)
+            st.markdown(_html_table(rows_disp, disp_cols), unsafe_allow_html=True)
 
     # ── Citations ──
     citations = state.get("citations") or []
@@ -855,38 +969,122 @@ def _render_assistant_details(
 
 # ── Pipeline runner ────────────────────────────────────────────────────────────
 
+_PIPELINE_STEPS = [
+    (3,  "Parsing query and detecting intent"),
+    (8,  "Classifying product to HTS code"),
+    (4,  "Looking up base MFN and FTA rates"),
+    (10, "Fetching Federal Register policy context"),
+    (5,  "Computing Section 301 / 232 / IEEPA adders"),
+    (7,  "Pulling Census Bureau trade data"),
+    (12, "Synthesizing final answer"),
+]
+
+
+def _query_header_html(query: str) -> str:
+    """Render query text above the answer."""
+    return (
+        f'<div style="font-style:italic;color:#4a5568;font-size:0.85rem;'
+        f'padding:0 0 10px;border-bottom:1px solid #1a2332;margin-bottom:14px;'
+        f'font-family:\'IBM Plex Sans\',sans-serif;line-height:1.4">'
+        f'{html.escape(query)}'
+        f'</div>'
+    )
+
+
+def _query_footer_html(query: str) -> str:
+    """Render query text below the answer."""
+    return (
+        f'<div style="margin-top:14px;padding-top:8px;border-top:1px solid #1a2332;'
+        f'font-family:\'IBM Plex Mono\',monospace;font-size:0.7rem;color:#4a5568;'
+        f'letter-spacing:0.04em">↑ {html.escape(query)}</div>'
+    )
+
+
+def _run_pipeline_with_status(text: str, status_ph) -> Dict[str, Any]:
+    """Run pipeline in a background thread; animate step labels in the main thread."""
+    result_holder: list = [None]
+    error_holder: list = [None]
+
+    def _worker() -> None:
+        try:
+            result_holder[0] = run_pipeline(text)
+        except Exception as exc:
+            error_holder[0] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    # Build cumulative tick boundaries for each step
+    cum: list = []
+    acc = 0
+    for ticks, lbl in _PIPELINE_STEPS:
+        acc += ticks
+        cum.append((acc, lbl))
+
+    tick = 0
+    while thread.is_alive():
+        step_label = _PIPELINE_STEPS[-1][1]
+        for threshold, lbl in cum:
+            if tick < threshold:
+                step_label = lbl
+                break
+        dots = "·" * ((tick % 3) + 1)
+        status_ph.markdown(
+            f'<div style="padding:8px 0;font-family:\'IBM Plex Mono\',monospace;'
+            f'font-size:0.82rem;color:#60a5fa">'
+            f'<span style="color:#4a5568;margin-right:8px">▶</span>'
+            f'{step_label}{dots}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        time.sleep(0.3)
+        tick += 1
+
+    thread.join()
+    status_ph.empty()
+
+    if error_holder[0]:
+        raise error_holder[0]
+    return result_holder[0]
+
+
 def _run_pipeline_response(text: str) -> None:
     with st.chat_message("assistant"):
+        st.markdown(_query_header_html(text), unsafe_allow_html=True)
+        status_ph = st.empty()
         try:
-            state = run_pipeline(text)
-            content = _render_answer_text(state)
-            _emit_answer(content)
-
-            show_followups = bool(
-                state.get("clarification_needed") or _is_low_confidence_stop(state)
-            )
-            if not show_followups:
-                conf = (state.get("pipeline_confidence") or "UNKNOWN").upper()
-                color_cls = _confidence_color(conf)
-                st.markdown(
-                    f'<span class="{color_cls}" style="font-family:\'IBM Plex Mono\',monospace;font-size:0.72rem;letter-spacing:0.06em">◆ Confidence: {conf}</span>',
-                    unsafe_allow_html=True,
-                )
-
-            _render_assistant_details(
-                state,
-                show_clarification_actions=show_followups,
-                widget_key_prefix=f"live_{len(st.session_state.messages)}",
-            )
-            st.session_state.messages.append(
-                {"role": "assistant", "content": content, "state": state}
-            )
+            state = _run_pipeline_with_status(text, status_ph)
         except Exception as exc:
             err = f"Pipeline error: {exc}"
             st.error(err)
             st.session_state.messages.append(
-                {"role": "assistant", "content": err, "state": {"error": str(exc)}}
+                {"role": "assistant", "content": err, "state": {"error": str(exc)}, "query": text}
             )
+            return
+
+        content = _render_answer_text(state)
+        _emit_answer(content)
+
+        show_followups = bool(
+            state.get("clarification_needed") or _is_low_confidence_stop(state)
+        )
+        if not show_followups:
+            conf = (state.get("pipeline_confidence") or "UNKNOWN").upper()
+            color_cls = _confidence_color(conf)
+            st.markdown(
+                f'<span class="{color_cls}" style="font-family:\'IBM Plex Mono\',monospace;font-size:0.72rem;letter-spacing:0.06em">◆ Confidence: {conf}</span>',
+                unsafe_allow_html=True,
+            )
+
+        _render_assistant_details(
+            state,
+            show_clarification_actions=show_followups,
+            widget_key_prefix=f"live_{len(st.session_state.messages)}",
+        )
+        st.markdown(_query_footer_html(text), unsafe_allow_html=True)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": content, "state": state, "query": text}
+        )
 
 
 def _append_user_and_run(text: str) -> None:
@@ -903,6 +1101,9 @@ def _queue_followup_pipeline(text: str) -> None:
 def _render_message(msg: Dict[str, Any], *, show_clarification_actions: bool = False, widget_key_prefix: str = "msg") -> None:
     role = msg["role"]
     with st.chat_message(role):
+        query = msg.get("query", "") if role == "assistant" else ""
+        if query:
+            st.markdown(_query_header_html(query), unsafe_allow_html=True)
         st.markdown(msg.get("content", ""))
         if role == "assistant" and msg.get("state"):
             _render_assistant_details(
@@ -910,6 +1111,8 @@ def _render_message(msg: Dict[str, Any], *, show_clarification_actions: bool = F
                 show_clarification_actions=show_clarification_actions,
                 widget_key_prefix=widget_key_prefix,
             )
+        if query:
+            st.markdown(_query_footer_html(query), unsafe_allow_html=True)
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -947,21 +1150,6 @@ def _render_sidebar() -> None:
                 unsafe_allow_html=True,
             )
 
-            # Example queries
-            st.markdown(
-                "<div style='margin-top:16px;font-family:\"IBM Plex Mono\",monospace;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin-bottom:8px'>Example queries</div>",
-                unsafe_allow_html=True,
-            )
-            examples = [
-                "semiconductors from China",
-                "electric vehicles from China",
-                "washing machines from South Korea",
-                "has the tariff on lithium batteries changed?",
-                "cheaper to import laptops from China or Vietnam?",
-            ]
-            for ex in examples:
-                if st.button(ex, key=f"ex_{ex}", use_container_width=True):
-                    _append_user_and_run(ex)
             return
 
         # Show last query stats

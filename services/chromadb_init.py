@@ -86,27 +86,56 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         documents, metadatas, ids = [], [], []
 
         # USTR chunks
-        cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter FROM CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+        cur.execute("""
+            SELECT c.chunk_id, c.document_number, c.chunk_index, c.chunk_text,
+                   c.section, c.hts_code, c.hts_chapter,
+                   f.publication_date::VARCHAR
+            FROM CHUNKS c
+            LEFT JOIN FEDERAL_REGISTER_NOTICES f ON c.document_number = f.document_number
+            WHERE c.chunk_text IS NOT NULL ORDER BY c.chunk_id
+        """)
         for i, row in enumerate(cur.fetchall()):
-            chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
-            documents.append(text)
+            chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, pub_date = row
+            dated_text = f"[{pub_date}] {text}" if pub_date else text
+            documents.append(dated_text)
             ids.append(f"USTR_{chunk_id}" if chunk_id else f"USTR_{i}")
-            metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
-                               "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
-                               "source": "USTR", "section": section or ""})
+            metadatas.append({
+                "chunk_id": chunk_id or "",
+                "document_number": doc_num or "",
+                "hts_chapter": hts_chapter or "",
+                "hts_code": hts_code or "",
+                "source": "USTR",
+                "section": section or "",
+                "publication_date": pub_date or "",
+            })
         logger.info("chroma_init: loaded %d USTR chunks", len(documents))
 
         # CBP chunks
         cbp_start = len(documents)
         try:
-            cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter, general_rate FROM CBP_CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+            cur.execute("""
+                SELECT c.chunk_id, c.document_number, c.chunk_index, c.chunk_text,
+                       c.section, c.hts_code, c.hts_chapter, c.general_rate,
+                       f.publication_date::VARCHAR
+                FROM CBP_CHUNKS c
+                LEFT JOIN CBP_FEDERAL_REGISTER_NOTICES f ON c.document_number = f.document_number
+                WHERE c.chunk_text IS NOT NULL ORDER BY c.chunk_id
+            """)
             for i, row in enumerate(cur.fetchall()):
-                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, gen_rate = row
-                documents.append(text)
+                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, gen_rate, pub_date = row
+                dated_text = f"[{pub_date}] {text}" if pub_date else text
+                documents.append(dated_text)
                 ids.append(f"CBP_{chunk_id}" if chunk_id else f"CBP_{i}")
-                metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
-                                   "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
-                                   "source": "CBP", "section": section or "", "general_rate": gen_rate or ""})
+                metadatas.append({
+                    "chunk_id": chunk_id or "",
+                    "document_number": doc_num or "",
+                    "hts_chapter": hts_chapter or "",
+                    "hts_code": hts_code or "",
+                    "source": "CBP",
+                    "section": section or "",
+                    "general_rate": gen_rate or "",
+                    "publication_date": pub_date or "",
+                })
             logger.info("chroma_init: loaded %d CBP chunks", len(documents) - cbp_start)
         except Exception as e:
             logger.warning("chroma_init: CBP_CHUNKS unavailable: %s", e)
@@ -114,14 +143,28 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         # ITC chunks
         itc_start = len(documents)
         try:
-            cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter FROM ITC_CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+            cur.execute("""
+                SELECT c.chunk_id, c.document_number, c.chunk_index, c.chunk_text,
+                       c.section, c.hts_code, c.hts_chapter,
+                       f.publication_date::VARCHAR
+                FROM ITC_CHUNKS c
+                LEFT JOIN ITC_DOCUMENTS f ON c.document_number = f.document_number
+                WHERE c.chunk_text IS NOT NULL ORDER BY c.chunk_id
+            """)
             for i, row in enumerate(cur.fetchall()):
-                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
-                documents.append(text)
+                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, pub_date = row
+                dated_text = f"[{pub_date}] {text}" if pub_date else text
+                documents.append(dated_text)
                 ids.append(f"USITC_{chunk_id}" if chunk_id else f"USITC_{i}")
-                metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
-                                   "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
-                                   "source": "USITC", "section": section or ""})
+                metadatas.append({
+                    "chunk_id": chunk_id or "",
+                    "document_number": doc_num or "",
+                    "hts_chapter": hts_chapter or "",
+                    "hts_code": hts_code or "",
+                    "source": "USITC",
+                    "section": section or "",
+                    "publication_date": pub_date or "",
+                })
             logger.info("chroma_init: loaded %d ITC chunks", len(documents) - itc_start)
         except Exception as e:
             logger.warning("chroma_init: ITC_CHUNKS unavailable: %s", e)
@@ -129,14 +172,28 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         # ITA chunks
         ita_start = len(documents)
         try:
-            cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter FROM ITA_CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+            cur.execute("""
+                SELECT c.chunk_id, c.document_number, c.chunk_index, c.chunk_text,
+                       c.section, c.hts_code, c.hts_chapter,
+                       f.publication_date::VARCHAR
+                FROM ITA_CHUNKS c
+                LEFT JOIN ITA_FEDERAL_REGISTER_NOTICES f ON c.document_number = f.document_number
+                WHERE c.chunk_text IS NOT NULL ORDER BY c.chunk_id
+            """)
             for i, row in enumerate(cur.fetchall()):
-                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
-                documents.append(text)
+                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, pub_date = row
+                dated_text = f"[{pub_date}] {text}" if pub_date else text
+                documents.append(dated_text)
                 ids.append(f"ITA_{chunk_id}" if chunk_id else f"ITA_{i}")
-                metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
-                                   "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
-                                   "source": "ITA", "section": section or ""})
+                metadatas.append({
+                    "chunk_id": chunk_id or "",
+                    "document_number": doc_num or "",
+                    "hts_chapter": hts_chapter or "",
+                    "hts_code": hts_code or "",
+                    "source": "ITA",
+                    "section": section or "",
+                    "publication_date": pub_date or "",
+                })
             logger.info("chroma_init: loaded %d ITA chunks", len(documents) - ita_start)
         except Exception as e:
             logger.warning("chroma_init: ITA_CHUNKS unavailable: %s", e)
@@ -144,17 +201,44 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         # EOP chunks
         eop_start = len(documents)
         try:
-            cur.execute("SELECT chunk_id, document_number, chunk_index, chunk_text, section, hts_code, hts_chapter FROM EOP_CHUNKS WHERE chunk_text IS NOT NULL ORDER BY chunk_id")
+            cur.execute("""
+                SELECT c.chunk_id, c.document_number, c.chunk_index, c.chunk_text,
+                       c.section, c.hts_code, c.hts_chapter,
+                       f.publication_date::VARCHAR
+                FROM EOP_CHUNKS c
+                LEFT JOIN EOP_DOCUMENTS f ON c.document_number = f.document_number
+                WHERE c.chunk_text IS NOT NULL ORDER BY c.chunk_id
+            """)
             for i, row in enumerate(cur.fetchall()):
-                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter = row
-                documents.append(text)
+                chunk_id, doc_num, idx, text, section, hts_code, hts_chapter, pub_date = row
+                dated_text = f"[{pub_date}] {text}" if pub_date else text
+                documents.append(dated_text)
                 ids.append(f"EOP_{chunk_id}" if chunk_id else f"EOP_{i}")
-                metadatas.append({"chunk_id": chunk_id or "", "document_number": doc_num or "",
-                                   "hts_chapter": hts_chapter or "", "hts_code": hts_code or "",
-                                   "source": "EOP", "section": section or ""})
+                metadatas.append({
+                    "chunk_id": chunk_id or "",
+                    "document_number": doc_num or "",
+                    "hts_chapter": hts_chapter or "",
+                    "hts_code": hts_code or "",
+                    "source": "EOP",
+                    "section": section or "",
+                    "publication_date": pub_date or "",
+                })
             logger.info("chroma_init: loaded %d EOP chunks", len(documents) - eop_start)
         except Exception as e:
             logger.warning("chroma_init: EOP_CHUNKS unavailable: %s", e)
+
+        # Deduplicate by ID before upserting — prevents batch failure on duplicate chunk_ids
+        seen_ids = set()
+        deduped_documents, deduped_ids, deduped_metadatas = [], [], []
+        for doc, id_, meta in zip(documents, ids, metadatas):
+            if id_ not in seen_ids:
+                seen_ids.add(id_)
+                deduped_documents.append(doc)
+                deduped_ids.append(id_)
+                deduped_metadatas.append(meta)
+
+        documents, ids, metadatas = deduped_documents, deduped_ids, deduped_metadatas
+        logger.info("chroma_init: after dedup total=%d", len(documents))
 
         # Embed and upsert
         batch_size = 32

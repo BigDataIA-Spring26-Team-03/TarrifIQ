@@ -20,7 +20,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.census.gov/data/timeseries/intltrade/imports/hs"
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 5
 CACHE_TTL_SEC = 86400
 _GET_VARS = (
     "GEN_VAL_MO,GEN_VAL_YR,CON_VAL_MO,CAL_DUT_MO,CAL_DUT_YR,"
@@ -231,6 +231,12 @@ def _fetch_census_raw(
     except requests.Timeout:
         logger.error("census_request_timeout commodity=%s time=%s", commodity, time)
         return -1, None
+    except requests.exceptions.SSLError:
+        logger.warning("census_ssl_error commodity=%s time=%s — skipping", commodity, time)
+        return -3, None
+    except requests.exceptions.ConnectionError:
+        logger.warning("census_connection_error commodity=%s time=%s — skipping", commodity, time)
+        return -3, None
     except Exception as e:
         logger.error("census_request_error commodity=%s time=%s err=%s", commodity, time, e)
         return -2, None
@@ -286,6 +292,15 @@ def get_trade_flow(hts_code: str, time: str | None = None) -> dict[str, Any]:
     source, status, payload, rows = _attempt(commodity, comm_lvl)
     if source == "cache" and isinstance(payload, dict):
         return payload
+    if status in (500, 503, 429, -3):
+        logger.warning("census_api_unavailable status=%s — skipping retries", status)
+        return {
+            "hts_code": commodity,
+            "resolved_level": comm_lvl,
+            "comm_lvl": comm_lvl,
+            "time": resolved_time,
+            "rows": [],
+        }
 
     # HS10 fallback chain: HS10 -> HS6 -> HS4
     if comm_lvl == "HS10" and (status == 204 or not rows):

@@ -53,12 +53,19 @@ Return ONLY valid JSON:
 
 Rules:
 - adder_rate is a percentage NUMBER (e.g. 25.0 for 25%) — not the base MFN rate
-- If multiple rates exist, return the MOST RECENT currently effective one
+- If multiple rates exist across documents, return the rate from the most recently dated excerpt (dates shown in brackets like [2025-06-09])
+- If a recent excerpt says rates were increased from X% to Y%, return Y%
+- Section 232 duties on "all steel articles" or "all aluminum articles" apply universally
+  to ALL HTS codes within that product category, regardless of specific subheading.
+  If excerpts mention a duty rate on "steel articles" generally, that rate applies to
+  the queried steel HTS code.
+- Section 232 duties apply to ALL countries unless the excerpt specifically exempts a country.
+  If no country exemption is mentioned, assume the rate applies to the queried country.
 - If this country is not subject to additional duties, return adder_rate: 0
-- If context is insufficient, return adder_rate: null
+- If no excerpt contains a specific percentage rate, return adder_rate: null
 - document_number must come from the excerpts — never fabricate one
 
-Federal Register excerpts:
+Federal Register excerpts (ordered newest first):
 {context}"""
 
 
@@ -107,7 +114,7 @@ def _cache_set(hts_code: str, country: Optional[str], result: Dict) -> None:
 
 def _build_context(chunks: List[Dict[str, Any]]) -> str:
     lines = []
-    for i, chunk in enumerate(chunks[:5], start=1):
+    for i, chunk in enumerate(chunks[:8], start=1):
         doc = chunk.get("document_number", "UNKNOWN")
         src = chunk.get("source", "USTR").upper()
         pub = chunk.get("publication_date", "") or ""
@@ -518,6 +525,242 @@ def _step5_notice_lookup(hts_code: str, country: Optional[str]) -> tuple[Optiona
     return None, None, None
 
 
+def _step4b_global_adder_lookup(
+    hts_code: str,
+    country: Optional[str],
+) -> tuple[Optional[float], Optional[str]]:
+    """
+    Global adder lookup for non-China countries via ChromaDB + LLM.
+    No SQL, no hardcoded document numbers.
+    Searches ChromaDB for relevant policy chunks, passes to LLM for rate extraction.
+    """
+    if not hts_code or not country:
+        return None, None
+
+    country_lower = (country or "").lower().strip()
+    if country_lower in ("china", "prc", "people's republic of china"):
+        return None, None
+
+    hts_2digit = hts_code.replace(".", "")[:2]
+
+    CHAPTER_PRODUCT = {
+        "72": "steel articles",
+        "73": "steel articles",
+        "76": "aluminum articles",
+        "74": "copper articles",
+    }
+    product_label = CHAPTER_PRODUCT.get(hts_2digit, "imported goods")
+
+    chunks = tools.fetch_adder_chunks_from_all_agencies(
+        hts_code, country, product_label
+    )
+
+    if not chunks:
+        logger.info("step4b_no_chunks hts=%s country=%s", hts_code, country)
+        return None, None
+
+    logger.info(
+        "step4b_chunks_found hts=%s country=%s chunks=%d",
+        hts_code,
+        country,
+        len(chunks),
+    )
+
+    from services.llm.router import get_router, TaskType
+
+    context = _build_context(chunks)
+    router = get_router()
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            resp = loop.run_until_complete(
+                router.complete(
+                    task=TaskType.POLICY_ANALYSIS,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": ADDER_PROMPT.format(
+                                hts_code=hts_code,
+                                country=country or "unspecified",
+                                context=context,
+                            ),
+                        }
+                    ],
+                )
+            )
+        finally:
+            loop.close()
+
+        raw = re.sub(
+            r"```(?:json)?", "", resp.choices[0].message.content.strip()
+        ).strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end > start:
+            parsed = json.loads(raw[start : end + 1])
+            raw_rate = parsed.get("adder_rate")
+            raw_doc = parsed.get("document_number")
+            # Strip agency prefix from document number if present
+            if raw_doc:
+                raw_doc = str(raw_doc)
+                for prefix in (
+                    "FR: ",
+                    "FR:",
+                    "FR ",
+                    "EOP ",
+                    "USTR ",
+                    "CBP ",
+                    "ITA ",
+                    "USITC ",
+                    "EOP: ",
+                    "USTR: ",
+                ):
+                    if raw_doc.startswith(prefix):
+                        raw_doc = raw_doc[len(prefix):].strip()
+                        break
+            if raw_rate is not None:
+                try:
+                    rate_val = float(raw_rate)
+                    if 0 < rate_val <= 200:
+                        doc_str = str(raw_doc) if raw_doc else None
+                        logger.info(
+                            "step4b_llm_found hts=%s country=%s rate=%.1f doc=%s",
+                            hts_code,
+                            country,
+                            rate_val,
+                            raw_doc,
+                        )
+                        return rate_val, doc_str
+                except (ValueError, TypeError):
+                    pass
+
+    except Exception as e:
+        logger.debug("step4b_llm_error hts=%s error=%s", hts_code, e)
+
+    return None, None
+
+
+def _step4c_universal_surcharge_lookup(
+    hts_code: str,
+    country: Optional[str],
+    fta_applied: bool,
+) -> tuple[Optional[float], Optional[str]]:
+    """
+    Universal country surcharge lookup (e.g., balance-of-payments style actions).
+    Uses ChromaDB + LLM extraction with the same JSON contract as other adder lookups.
+    """
+    if not hts_code or not country:
+        return None, None
+
+    country_lower = (country or "").lower().strip()
+    hts_2digit = hts_code.replace(".", "")[:2]
+
+    # Skip USMCA countries when FTA is applied.
+    if fta_applied and country_lower in ("canada", "mexico"):
+        logger.info("step4c_skip_usmca hts=%s country=%s", hts_code, country)
+        return None, None
+
+    # Skip Section 232 product chapters.
+    if hts_2digit in ("72", "73", "74", "76"):
+        logger.info("step4c_skip_section232_product hts=%s chapter=%s", hts_code, hts_2digit)
+        return None, None
+
+    try:
+        from services.retrieval.hybrid import get_retriever
+        from services.llm.router import get_router, TaskType
+
+        retriever = get_retriever()
+        query = (
+            f"import surcharge balance of payments {country} "
+            "all products ad valorem temporary"
+        )
+        chunks = retriever.search_policy(
+            query=query,
+            hts_chapter=None,
+            source=None,
+            top_k=15,
+        )
+        if not chunks:
+            logger.info("step4c_no_chunks hts=%s country=%s", hts_code, country)
+            return None, None
+
+        logger.info(
+            "step4c_chunks_found hts=%s country=%s chunks=%d",
+            hts_code,
+            country,
+            len(chunks),
+        )
+
+        context = _build_context(chunks)
+        router = get_router()
+        loop = asyncio.new_event_loop()
+        try:
+            resp = loop.run_until_complete(
+                router.complete(
+                    task=TaskType.POLICY_ANALYSIS,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": ADDER_PROMPT.format(
+                                hts_code=hts_code,
+                                country=country or "unspecified",
+                                context=context,
+                            ),
+                        }
+                    ],
+                )
+            )
+        finally:
+            loop.close()
+
+        raw = re.sub(
+            r"```(?:json)?", "", resp.choices[0].message.content.strip()
+        ).strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end > start:
+            parsed = json.loads(raw[start : end + 1])
+            raw_rate = parsed.get("adder_rate")
+            raw_doc = parsed.get("document_number")
+            if raw_doc:
+                raw_doc = str(raw_doc)
+                for prefix in (
+                    "FR: ",
+                    "FR:",
+                    "FR ",
+                    "EOP ",
+                    "USTR ",
+                    "CBP ",
+                    "ITA ",
+                    "USITC ",
+                    "EOP: ",
+                    "USTR: ",
+                ):
+                    if raw_doc.startswith(prefix):
+                        raw_doc = raw_doc[len(prefix):].strip()
+                        break
+            if raw_rate is not None:
+                try:
+                    rate_val = float(raw_rate)
+                    if 0 < rate_val <= 200:
+                        doc_str = str(raw_doc) if raw_doc else None
+                        logger.info(
+                            "step4c_universal_found hts=%s country=%s rate=%.1f doc=%s",
+                            hts_code,
+                            country,
+                            rate_val,
+                            raw_doc,
+                        )
+                        return rate_val, doc_str
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        logger.debug("step4c_universal_error hts=%s country=%s error=%s", hts_code, country, e)
+
+    return None, None
+
+
 def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     hts_code = (state.get("hts_code") or "").strip()
     country = state.get("country")
@@ -550,10 +793,26 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     # ─────────────────────────────────────────────────────────────────────────────
     chapter99_adder, chapter99_doc = _step4_chapter99_lookup(hts_code, hts_footnotes, country)
 
+    # ── STEP 4b: DATABASE-DRIVEN GLOBAL ADDER LOOKUP ─────────────────────────────
+    # Fires when footnote lookup found nothing.
+    # Catches Section 232 steel/aluminum and IEEPA reciprocal tariffs
+    # that apply globally and don't appear in product-level footnotes.
+    if chapter99_adder is None:
+        chapter99_adder, chapter99_doc = _step4b_global_adder_lookup(hts_code, country)
+
     # ─────────────────────────────────────────────────────────────────────────────
     # STEP 5: NOTICE_HTS_CODES LOOKUP (LLM-extracted from FR snippets)
     # ─────────────────────────────────────────────────────────────────────────────
     notice_adder, notice_doc, notice_basis = _step5_notice_lookup(hts_code, country)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # STEP 4c: UNIVERSAL COUNTRY SURCHARGE LOOKUP (stackable)
+    # ─────────────────────────────────────────────────────────────────────────────
+    section122_adder, section122_doc = _step4c_universal_surcharge_lookup(
+        hts_code=hts_code,
+        country=country,
+        fta_applied=bool(fta_applied),
+    )
 
     # ─────────────────────────────────────────────────────────────────────────────
     # STEP 7: RATE STACKING (priority-based selection)
@@ -587,10 +846,20 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
 
         effective_base = mfn_rate
 
-    total_duty = round(effective_base + final_adder, 4)
+    stacked_surcharge = section122_adder or 0.0
+    total_duty = round(effective_base + final_adder + stacked_surcharge, 4)
 
-    logger.info("adder_rate_agent_done hts=%s country=%s ch99=%s notice=%s final=%.4f basis=%s total=%.4f",
-                hts_code, country, chapter99_adder, notice_adder, final_adder, final_basis, total_duty)
+    logger.info(
+        "adder_rate_agent_done hts=%s country=%s ch99=%s notice=%s section122=%s final=%.4f basis=%s total=%.4f",
+        hts_code,
+        country,
+        chapter99_adder,
+        notice_adder,
+        section122_adder,
+        final_adder,
+        final_basis,
+        total_duty,
+    )
 
     result = {
         "chapter99_adder": chapter99_adder,
@@ -598,7 +867,9 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
         "notice_adder": notice_adder,
         "notice_doc": notice_doc,
         "notice_basis": notice_basis,
-        "adder_rate": final_adder,
+        "section122_adder": section122_adder,
+        "section122_doc": section122_doc,
+        "adder_rate": round(final_adder + stacked_surcharge, 4),
         "adder_doc": final_doc,
         "adder_basis": final_basis,
         "adder_method": final_basis,  # Backwards compat

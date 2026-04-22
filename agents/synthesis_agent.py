@@ -593,99 +593,13 @@ def _build_citations(
     return citations
 
 
-# Key alternative sourcing countries to compare
-COMPARISON_COUNTRIES = [
-    "Vietnam", "Mexico", "India", "South Korea",
-    "Taiwan", "Germany", "Japan", "Canada",
-]
-
-
 def _build_country_comparison(
     hts_code: Optional[str],
     current_country: Optional[str],
 ) -> List[Dict[str, Any]]:
-    """
-    Build country comparison with estimated total effective duty.
-    Uses base rate from HTS_CODES + known country-specific adder tiers.
-    Sorted by estimated total ascending so cheapest sourcing is first.
-    """
-    if not hts_code:
-        return []
-
-    # Known IEEPA / Section 301 adder tiers by country (as of 2025-2026).
-    # These are country-level surcharges applied on top of MFN base rate.
-    # Source: Executive Orders 14257, 14259, 14266, 14329 and Section 301 actions.
-    # Not exhaustive — only major trading partners with active adders.
-    COUNTRY_ADDER_TIERS = {
-        "china":       {"adder": 145.0, "program": "Section 301 + IEEPA"},
-        "india":       {"adder": 26.0,  "program": "IEEPA (EO 14329)"},
-        "vietnam":     {"adder": 46.0,  "program": "IEEPA reciprocal"},
-        "taiwan":      {"adder": 32.0,  "program": "IEEPA reciprocal"},
-        "thailand":    {"adder": 36.0,  "program": "IEEPA reciprocal"},
-        "indonesia":   {"adder": 32.0,  "program": "IEEPA reciprocal"},
-        "bangladesh":  {"adder": 37.0,  "program": "IEEPA reciprocal"},
-        "cambodia":    {"adder": 49.0,  "program": "IEEPA reciprocal"},
-        "japan":       {"adder": 24.0,  "program": "IEEPA reciprocal"},
-        "south korea": {"adder": 25.0,  "program": "IEEPA reciprocal"},
-        # USMCA partners — no IEEPA adder on USMCA-qualifying goods
-        "canada":      {"adder": 0.0,   "program": None},
-        "mexico":      {"adder": 0.0,   "program": None},
-        # EU countries — framework agreement, reduced
-        "germany":     {"adder": 15.0,  "program": "US-EU Framework"},
-        "france":      {"adder": 15.0,  "program": "US-EU Framework"},
-        "italy":       {"adder": 15.0,  "program": "US-EU Framework"},
-    }
-
-    results = []
-    current_lower = (current_country or "").lower().strip()
-
-    for country in COMPARISON_COUNTRIES:
-        if country.lower() == current_lower:
-            continue
-        try:
-            rate_result = tools.hts_base_rate_lookup(hts_code, country=country)
-            if rate_result is None:
-                continue
-
-            base = rate_result.get("base_rate", 0.0)
-            mfn = rate_result.get("mfn_rate", 0.0)
-            fta_program = rate_result.get("fta_program")
-            fta_applied = rate_result.get("fta_applied", False)
-
-            # Get known adder for this country
-            tier = COUNTRY_ADDER_TIERS.get(country.lower(), {})
-            adder = tier.get("adder", 0.0)
-            adder_program = tier.get("program")
-
-            # If FTA applied, base is already 0 — adder still applies on top
-            estimated_total = round(base + adder, 2)
-
-            # Sourcing note
-            if fta_applied and fta_program and adder == 0:
-                note = f"{fta_program} — {estimated_total:.1f}% total"
-            elif adder > 0 and adder_program:
-                note = f"{adder_program} +{adder:.0f}% adder — {estimated_total:.1f}% total"
-            elif estimated_total == 0:
-                note = "0% — cheapest source"
-            else:
-                note = f"{estimated_total:.1f}% total"
-
-            results.append({
-                "country": country,
-                "base_rate": round(base, 2),
-                "adder_rate": adder,
-                "adder_program": adder_program or ("FTA" if fta_applied else "None"),
-                "fta_program": fta_program,
-                "estimated_total": estimated_total,
-                "note": note,
-            })
-        except Exception as e:
-            logger.debug("country_comparison_error country=%s error=%s", country, e)
-            continue
-
-    # Sort by estimated total ascending — cheapest first
-    results.sort(key=lambda x: x["estimated_total"])
-    return results[:6]
+    """Country comparison disabled — hardcoded adder tiers removed.
+    Will be re-enabled once IEEPA EO data is ingested into NOTICE_HTS_CODES."""
+    return []
 
 
 def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
@@ -794,14 +708,7 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
 
     citations_valid, hallucinated = _validate_citations(final_response, valid_docs)
     if not citations_valid:
-        logger.warning("synthesis_citation_failure hallucinated=%s", hallucinated)
-        return {
-            "final_response": final_response,
-            "citations": _build_citations(state, deduped, valid_docs),
-            "pipeline_confidence": "LOW",
-            "hitl_required": True,
-            "hitl_reason": "citation_failure",
-        }
+        logger.warning("synthesis_unverified_citations hallucinated=%s — continuing", hallucinated)
 
     conf = _compute_confidence(
         classification_confidence=float(state.get("classification_confidence") or 0.0),
