@@ -227,6 +227,19 @@ def build_policy_notices_collection(chroma: chromadb.HttpClient) -> int:
         except Exception as e:
             logger.warning("chroma_init: EOP_CHUNKS unavailable: %s", e)
 
+        # Deduplicate by ID before upserting — prevents batch failure on duplicate chunk_ids
+        seen_ids = set()
+        deduped_documents, deduped_ids, deduped_metadatas = [], [], []
+        for doc, id_, meta in zip(documents, ids, metadatas):
+            if id_ not in seen_ids:
+                seen_ids.add(id_)
+                deduped_documents.append(doc)
+                deduped_ids.append(id_)
+                deduped_metadatas.append(meta)
+
+        documents, ids, metadatas = deduped_documents, deduped_ids, deduped_metadatas
+        logger.info("chroma_init: after dedup total=%d", len(documents))
+
         # Embed and upsert
         batch_size = 32
         total = len(documents)
