@@ -106,8 +106,7 @@ def _cache_set(hts_code: str, country: Optional[str], result: Dict) -> None:
     if not r:
         return
     try:
-        if result.get("adder_method") in ("llm_policy", "none"):
-            r.setex(_cache_key(hts_code, country), CACHE_TTL, json.dumps(result))
+        r.setex(_cache_key(hts_code, country), CACHE_TTL, json.dumps(result))
     except Exception:
         pass
 
@@ -548,6 +547,14 @@ def _step4b_global_adder_lookup(
         "73": "steel articles",
         "76": "aluminum articles",
         "74": "copper articles",
+        "44": "timber lumber wood products",
+        "87": "motor vehicles automobiles",
+        "84": "machinery computers electronics",
+        "85": "electrical equipment electronics",
+        "61": "apparel clothing",
+        "62": "apparel clothing woven",
+        "94": "furniture",
+        "95": "toys games",
     }
     product_label = CHAPTER_PRODUCT.get(hts_2digit, "imported goods")
 
@@ -785,7 +792,8 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     cached = _cache_get(hts_code, country)
     if cached:
         adder = cached.get("adder_rate") or 0.0
-        cached["total_duty"] = round(base_rate + adder, 4)
+        section122 = cached.get("section122_adder") or 0.0
+        cached["total_duty"] = round(base_rate + adder + section122, 4)
         return cached
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -804,15 +812,6 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
     # STEP 5: NOTICE_HTS_CODES LOOKUP (LLM-extracted from FR snippets)
     # ─────────────────────────────────────────────────────────────────────────────
     notice_adder, notice_doc, notice_basis = _step5_notice_lookup(hts_code, country)
-
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 4c: UNIVERSAL COUNTRY SURCHARGE LOOKUP (stackable)
-    # ─────────────────────────────────────────────────────────────────────────────
-    section122_adder, section122_doc = _step4c_universal_surcharge_lookup(
-        hts_code=hts_code,
-        country=country,
-        fta_applied=bool(fta_applied),
-    )
 
     # ─────────────────────────────────────────────────────────────────────────────
     # STEP 7: RATE STACKING (priority-based selection)
@@ -846,6 +845,17 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
 
         effective_base = mfn_rate
 
+    # Only check Section 122 if we found a primary adder
+    # (Section 122 stacks on top of existing duties, not standalone)
+    if final_adder > 0 and not fta_applied:
+        section122_adder, section122_doc = _step4c_universal_surcharge_lookup(
+            hts_code=hts_code,
+            country=country,
+            fta_applied=bool(fta_applied),
+        )
+    else:
+        section122_adder, section122_doc = None, None
+
     stacked_surcharge = section122_adder or 0.0
     total_duty = round(effective_base + final_adder + stacked_surcharge, 4)
 
@@ -867,9 +877,9 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
         "notice_adder": notice_adder,
         "notice_doc": notice_doc,
         "notice_basis": notice_basis,
+        "adder_rate": round(final_adder, 4),
         "section122_adder": section122_adder,
         "section122_doc": section122_doc,
-        "adder_rate": round(final_adder + stacked_surcharge, 4),
         "adder_doc": final_doc,
         "adder_basis": final_basis,
         "adder_method": final_basis,  # Backwards compat

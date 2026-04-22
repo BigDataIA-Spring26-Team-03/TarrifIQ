@@ -52,7 +52,8 @@ CITATION RULES (strictly enforced):
 4. If a CBP ruling covers country-of-origin, say so explicitly
 5. If context is insufficient: "Insufficient policy context for this query."
 6. Use NO knowledge outside the provided documents
-7. Maximum 8-12 sentences; mention each distinct notice (agency + date) when relevant."""
+7. Maximum 8-12 sentences; mention each distinct notice (agency + date) when relevant.
+8. The CONFIRMED RATE section above is authoritative — always reference those confirmed figures when stating duty rates."""
 
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
@@ -484,6 +485,10 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
         if raw_exhaustive:
             bm25_query = f"{product} {hts_code} tariff duty {country}"
             exhaustive = _bm25_rerank_exhaustive(raw_exhaustive, bm25_query, top_n=10)
+            if notice_doc and exhaustive:
+                priority = [c for c in exhaustive if c.get("document_number") == notice_doc]
+                rest = [c for c in exhaustive if c.get("document_number") != notice_doc]
+                exhaustive = priority + rest
             logger.info(
                 "policy_agent_hts_exhaustive raw=%d reranked=%d",
                 len(raw_exhaustive), len(exhaustive),
@@ -521,9 +526,25 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     router = get_router()
 
     chunks_for_llm, trim_note = _trim_chunks_for_policy_llm(chunks, POLICY_CONTEXT_MAX_CHARS)
+    # Inject confirmed adder rate as authoritative context for LLM
+    adder_rate = state.get("adder_rate")
+    total_duty = state.get("total_duty")
+    adder_doc = state.get("adder_doc")
+    base_rate = state.get("base_rate") or 0.0
+
+    confirmed_rate_note = ""
+    if adder_rate is not None and total_duty is not None:
+        confirmed_rate_note = (
+            f"\n\nCONFIRMED RATE (from HTS schedule, authoritative):\n"
+            f"  Base MFN rate: {base_rate}%\n"
+            f"  Additional duty (Section 301/232/IEEPA): {adder_rate}%\n"
+            f"  Total effective rate: {total_duty}%\n"
+            f"  Source document: {adder_doc or 'HTS Schedule'}\n"
+            f"  When summarizing the duty rate, use these confirmed figures.\n"
+        )
     context_block, index_to_doc = _build_numbered_context(chunks_for_llm)
     user_content = (
-        f"Question: {query}{trim_note}\n\n"
+        f"Question: {query}{confirmed_rate_note}{trim_note}\n\n"
         f"Numbered excerpts:\n{context_block}"
         f"\n\n{POLICY_PROMPT_SUFFIX}"
     )

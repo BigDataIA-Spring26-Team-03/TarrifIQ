@@ -38,12 +38,14 @@ def _redis():
         return None
 
 
-def _cache_get(hts_code: str) -> Optional[Dict]:
+def _cache_get(hts_code: str, country: Optional[str] = None) -> Optional[Dict]:
     r = _redis()
     if not r:
         return None
     try:
-        raw = r.get(f"tariffiq:base_rate:{hts_code}")
+        raw = r.get(
+            f"tariffiq:base_rate:{hts_code}:{(country or 'ALL').lower().replace(' ', '_')}"
+        )
         if raw:
             logger.info("base_rate_cache_hit hts=%s", hts_code)
             return json.loads(raw)
@@ -52,13 +54,17 @@ def _cache_get(hts_code: str) -> Optional[Dict]:
     return None
 
 
-def _cache_set(hts_code: str, result: Dict) -> None:
+def _cache_set(hts_code: str, result: Dict, country: Optional[str] = None) -> None:
     r = _redis()
     if not r:
         return
     try:
         if result.get("rate_record_id"):
-            r.setex(f"tariffiq:base_rate:{hts_code}", CACHE_TTL, json.dumps(result))
+            r.setex(
+                f"tariffiq:base_rate:{hts_code}:{(country or 'ALL').lower().replace(' ', '_')}",
+                CACHE_TTL,
+                json.dumps(result),
+            )
     except Exception:
         pass
 
@@ -77,7 +83,7 @@ def run_base_rate_agent(state: TariffState) -> Dict[str, Any]:
 
     logger.info("base_rate_agent_start hts=%s country=%s", hts_code, country)
 
-    cached = _cache_get(hts_code)
+    cached = _cache_get(hts_code, country)
     if cached:
         return cached
 
@@ -109,5 +115,5 @@ def run_base_rate_agent(state: TariffState) -> Dict[str, Any]:
         "rate_record_id": result["hts_code"],
         "hts_footnotes": result.get("footnotes", []),
     }
-    _cache_set(hts_code, out)
+    _cache_set(hts_code, out, country)
     return out
