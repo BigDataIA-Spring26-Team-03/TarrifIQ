@@ -21,9 +21,9 @@ TOOLS
   13. fetch_top_importer_countries(hts_code, months=24, top_n=8)
   14. fetch_all_hts_linked_policy_chunks(hts_code) — all chunks for all docs referencing HTS
   15. find_section301_rate_from_chunks(hts_code, country) — search Section 301 docs for HTS code
+  16. fetch_adder_chunks_from_all_agencies(hts_code, country, product) — HybridRetriever policy chunks for LLM adder extraction
 
-Note: policy vector search and HTS vector search are handled by
-services/retrieval/hybrid.py (HybridRetriever) — not in this file.
+Note: HTS vector search lives in services/retrieval/hybrid.py; tool 16 calls HybridRetriever.search_policy for adder fallback.
 """
 
 import logging
@@ -1676,3 +1676,97 @@ def find_section301_rate_from_chunks(
             hts_code, e,
         )
         return None
+
+
+def _extract_date_from_chunk(chunk: Dict[str, Any]) -> str:
+    # Try metadata first
+    pub_date = chunk.get("publication_date") or ""
+    if pub_date:
+        return str(pub_date)
+    # Try extracting from chunk text prefix [YYYY-MM-DD]
+    text = chunk.get("chunk_text") or ""
+    m = re.match(r"^\[(\d{4}-\d{2}-\d{2})\]", text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+# ── TOOL 16 — fetch_adder_chunks_from_all_agencies ───────────────────────────
+
+def fetch_adder_chunks_from_all_agencies(
+    hts_code: str,
+    country: str,
+    product: str,
+) -> List[Dict[str, Any]]:
+    """
+    Search ChromaDB for chunks relevant to this product/country combination.
+    Uses existing HybridRetriever — no SQL, no hardcoded document numbers.
+    Returns list of chunks for LLM rate extraction.
+    """
+    if not hts_code or not product:
+        return []
+
+    hts_2digit = hts_code.replace(".", "")[:2]
+
+    is_china = (country or "").lower().strip() in (
+        "china",
+        "prc",
+        "people's republic of china",
+    )
+
+    try:
+        from services.retrieval.hybrid import get_retriever
+
+        retriever = get_retriever()
+
+        # Use HyDE to generate a semantically rich query
+        # Same mechanism used by policy_agent — no hardcoding
+        try:
+            from services.retrieval.hyde import get_enhancer
+
+            query = get_enhancer().enhance_sync(
+                query=f"additional duty rate on {product} from {country}",
+                product=product,
+                country=country,
+                hts_chapter=hts_2digit,
+            )
+        except Exception:
+            # Fallback to simple query if HyDE fails
+            query = (
+                f"{product} {country} additional duty tariff rate "
+                f"ad valorem percent HTS chapter {hts_2digit}"
+            )
+
+        chunks = retriever.search_policy(
+            query=query,
+            hts_chapter=hts_2digit,
+            source=None,
+            top_k=15,
+        )
+
+        if not is_china:
+            chunks = [
+                c
+                for c in chunks
+                if not any(
+                    kw in (c.get("chunk_text") or "").lower()
+                    for kw in ["section 301", "people's republic of china"]
+                )
+            ]
+
+        # Sort by date (metadata or [YYYY-MM-DD] prefix in chunk text) — most recent first
+        chunks.sort(key=_extract_date_from_chunk, reverse=True)
+
+        logger.info(
+            "fetch_adder_chunks_from_all_agencies hts=%s country=%s chunks=%d",
+            hts_code,
+            country,
+            len(chunks),
+        )
+        return chunks
+
+    except Exception as e:
+        logger.warning(
+            "fetch_adder_chunks_error hts=%s error=%s", hts_code, e
+        )
+        return []
