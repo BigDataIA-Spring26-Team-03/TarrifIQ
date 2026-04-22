@@ -272,6 +272,7 @@ class HybridRetriever:
                     "hts_code": metadata.get("hts_code", ""),
                     "source": metadata.get("source", ""),
                     "section": metadata.get("section", ""),
+                    "publication_date": metadata.get("publication_date", ""),
                     "dense_distance": distance
                 })
 
@@ -340,6 +341,7 @@ class HybridRetriever:
                     "hts_code": metadata.get("hts_code", ""),
                     "source": metadata.get("source", ""),
                     "section": metadata.get("section", ""),
+                    "publication_date": metadata.get("publication_date", ""),
                     "bm25_score": score
                 })
 

@@ -71,11 +71,14 @@ Your paragraph MUST:
 - Reference HTS chapter {hts_chapter} or specific subheadings within that chapter
 - Use legal language like "ad valorem rate of duty", "entered for consumption", "subchapter III of chapter 99"
 - Mention the likely tariff action type for this product/country
+- If the product is steel (chapter 72-73), aluminum (chapter 76), or copper (chapter 74),
+  mention Section 232 and that tariff rates have been increased or modified
+- If the product is from China, mention Section 301 or IEEPA duties
+- For other countries with steel/aluminum, mention Section 232 duty modifications
 - Sound like it was copied from an actual Federal Register notice
 
 Do NOT:
 - Invent specific Federal Register document numbers
-- Make up exact percentage rates unless very well known
 - Write more than 4 sentences
 - Add any introduction or explanation
 
