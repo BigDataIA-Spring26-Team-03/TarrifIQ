@@ -895,8 +895,9 @@ def _render_assistant_details(
                 unsafe_allow_html=True,
             )
 
-    # ── Country Comparison ──
-    country_comparison = state.get("country_comparison") or []
+    # ── Country Comparison — disabled (hardcoded adder tiers removed) ──
+    # country_comparison = state.get("country_comparison") or []
+    country_comparison = []  # disabled
     if country_comparison:
         with st.expander("🌍 Country Comparison — Estimated Total Duty", expanded=False):
             # Build display table
