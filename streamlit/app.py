@@ -999,6 +999,168 @@ def _render_citations(citations: list) -> None:
     st.markdown(all_cit_html, unsafe_allow_html=True)
 
 
+# ── NEW VIZ 1: Tariff Composition Stacked Bar (for comparison) ───────────────
+
+def _render_tariff_stacked_bar(comp: list) -> None:
+    """Stacked bar showing base MFN + adder = total per country."""
+    if not comp or len(comp) < 2:
+        return
+    max_total = max(float(c.get("total_duty") or 0) for c in comp) or 1
+    bar_w = 420
+    bar_h = 36
+    gap = 14
+    label_w = 90
+    svg_h = (bar_h + gap) * len(comp) + 40
+
+    bars = ""
+    legend = (
+        f'<rect x="0" y="{svg_h-18}" width="12" height="12" fill="#3b82f6" rx="2"/>'
+        f'<text x="16" y="{svg_h-8}" font-family="Space Mono,monospace" font-size="9" fill="#64748b">Base MFN</text>'
+        f'<rect x="90" y="{svg_h-18}" width="12" height="12" fill="#ef4444" rx="2"/>'
+        f'<text x="106" y="{svg_h-8}" font-family="Space Mono,monospace" font-size="9" fill="#64748b">Section 301/232/IEEPA Adder</text>'
+    )
+    for i, c in enumerate(comp):
+        y = i * (bar_h + gap) + 20
+        base = float(c.get("base_rate") or c.get("mfn_rate") or 0)
+        adder = float(c.get("adder_rate") or 0)
+        total = float(c.get("total_duty") or 0)
+        base_w = (base / max_total) * bar_w
+        adder_w = (adder / max_total) * bar_w
+        country = c.get("country", "")
+        fta = c.get("fta_program") if c.get("fta_applied") else ""
+        fta_tag = f' · {fta}' if fta else ""
+        bars += (
+            f'<text x="{label_w-4}" y="{y+bar_h//2+4}" text-anchor="end" '
+            f'font-family="Poppins,sans-serif" font-size="11" fill="#e0e7ff" font-weight="500">{html.escape(str(country))}</text>'
+            f'<rect x="{label_w}" y="{y}" width="{bar_w}" height="{bar_h}" fill="#1a2553" rx="4"/>'
+        )
+        if base_w > 0:
+            bars += f'<rect x="{label_w}" y="{y}" width="{base_w:.1f}" height="{bar_h}" fill="#3b82f6" rx="4"/>'
+        if adder_w > 0:
+            rx = "0" if base_w > 0 else "4"
+            bars += f'<rect x="{label_w+base_w:.1f}" y="{y}" width="{adder_w:.1f}" height="{bar_h}" fill="#ef4444" rx="0" style="border-radius:0 4px 4px 0"/>'
+        bars += (
+            f'<text x="{label_w+base_w+adder_w+6:.1f}" y="{y+bar_h//2+4}" '
+            f'font-family="Space Mono,monospace" font-size="11" fill="#e0e7ff" font-weight="700">{total:.1f}%{html.escape(fta_tag)}</text>'
+        )
+    svg = f'<svg viewBox="0 0 {label_w+bar_w+80} {svg_h}" xmlns="http://www.w3.org/2000/svg">{bars}{legend}</svg>'
+    st.markdown(
+        f'<div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;padding:18px 20px;margin-bottom:12px">'
+        f'<div style="font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#64748b;margin-bottom:14px;font-weight:700">Tariff Composition by Country</div>'
+        f'{svg}</div>',
+        unsafe_allow_html=True
+    )
+
+
+# ── NEW VIZ 2: Top Importers Treemap ─────────────────────────────────────────
+
+def _render_importers_treemap(top_importers: list) -> None:
+    """Treemap visualization of top import partners by USD value."""
+    if not top_importers or len(top_importers) < 2:
+        return
+    items = []
+    for r in top_importers[:8]:
+        name = (r.get("census_country_name") or r.get("lookup_country") or "").title()
+        val = float(r.get("imports_usd_trailing") or 0)
+        fta = bool(r.get("fta_applied"))
+        if val > 0:
+            items.append({"name": name, "val": val, "fta": fta})
+    if not items:
+        return
+    total = sum(i["val"] for i in items)
+    colors = ["#2563eb","#1d4ed8","#1e40af","#1e3a8a","#1d4ed8","#2563eb","#3b82f6","#60a5fa"]
+    # Simple squarified layout — row-based
+    W, H = 500, 220
+    rects = ""
+    x, y = 0, 0
+    row_h = H // 2
+    row_items = [items[:4], items[4:]]
+    for ri, row in enumerate(row_items):
+        if not row:
+            continue
+        row_total = sum(i["val"] for i in row)
+        cx = 0
+        rh = row_h - 2
+        for j, item in enumerate(row):
+            w = int((item["val"] / row_total) * W) - 2
+            color = colors[(ri*4+j) % len(colors)]
+            fta_mark = "★ " if item["fta"] else ""
+            pct = item["val"]/total*100
+            name_short = item["name"][:12]
+            rects += (
+                f'<rect x="{cx+1}" y="{ri*row_h+1}" width="{w}" height="{rh}" fill="{color}" '
+                f'fill-opacity="0.85" rx="4" stroke="#0a0e27" stroke-width="2"/>'
+                f'<text x="{cx+w//2+1}" y="{ri*row_h+rh//2-6}" text-anchor="middle" '
+                f'font-family="Poppins,sans-serif" font-size="11" fill="#ffffff" font-weight="600">{html.escape(fta_mark+name_short)}</text>'
+                f'<text x="{cx+w//2+1}" y="{ri*row_h+rh//2+10}" text-anchor="middle" '
+                f'font-family="Space Mono,monospace" font-size="9" fill="rgba(255,255,255,0.7)">{_fmt_usd(item["val"])}</text>'
+                f'<text x="{cx+w//2+1}" y="{ri*row_h+rh//2+24}" text-anchor="middle" '
+                f'font-family="Space Mono,monospace" font-size="9" fill="rgba(255,255,255,0.5)">{pct:.1f}%</text>'
+            )
+            cx += w + 2
+    svg = f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">{rects}</svg>'
+    st.markdown(
+        f'<div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;padding:18px 20px;margin-bottom:12px">'
+        f'<div style="font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#64748b;margin-bottom:12px;font-weight:700">Import Market Share — Top Partners (24-Month) · ★ FTA</div>'
+        f'{svg}</div>',
+        unsafe_allow_html=True
+    )
+
+
+# ── NEW VIZ 3: Duty Escalation Ladder ────────────────────────────────────────
+
+def _render_duty_escalation(state: Dict[str, Any]) -> None:
+    """Visual ladder showing how duty builds up: Free → Base MFN → +Adder → Total."""
+    base = float(state.get("base_rate") or 0)
+    adder = float(state.get("adder_rate") or 0)
+    total = float(state.get("total_duty") or 0)
+    fta = state.get("fta_applied", False)
+    fta_rate = float(state.get("fta_rate") or 0) if fta else None
+    fta_program = state.get("fta_program") or ""
+    adder_doc = state.get("adder_doc") or ""
+    adder_method = (state.get("adder_method") or "").upper().replace("_"," ")
+    if total == 0 and not fta:
+        return
+
+    steps = [("Free (0%)", 0, "#4a5568", "Starting point — no duty")]
+    if fta and fta_rate is not None:
+        steps.append((f"{fta_program} Rate", fta_rate, "#10b981", f"FTA preferential rate"))
+    steps.append((f"Base MFN", base, "#3b82f6", f"Standard most-favored-nation rate"))
+    if adder > 0:
+        steps.append((f"+{adder_method or 'Adder'}", base+adder, "#ef4444", f"{adder_doc} — Section 301/232/IEEPA"))
+    
+    max_val = max(s[1] for s in steps) or 1
+    W, H_step = 560, 52
+    svg_h = H_step * len(steps) + 20
+    items_svg = ""
+    bar_x, bar_w_max = 160, 260
+
+    for i, (label, val, color, note) in enumerate(steps):
+        y = i * H_step + 10
+        filled_w = (val / max_val) * bar_w_max if max_val > 0 else 0
+        connector = (f'<line x1="{bar_x + (steps[i-1][1]/max_val)*bar_w_max:.0f}" y1="{y}" '
+                     f'x2="{bar_x + (steps[i-1][1]/max_val)*bar_w_max:.0f}" y2="{y+4}" '
+                     f'stroke="#1e3a5f" stroke-width="1" stroke-dasharray="3,2"/>') if i > 0 else ""
+        items_svg += (
+            f'{connector}'
+            f'<text x="{bar_x-6}" y="{y+H_step//2+4}" text-anchor="end" font-family="Poppins,sans-serif" '
+            f'font-size="11" fill="#94a3b8" font-weight="500">{html.escape(label)}</text>'
+            f'<rect x="{bar_x}" y="{y+8}" width="{bar_w_max}" height="20" fill="#1a2553" rx="3"/>'
+            f'<rect x="{bar_x}" y="{y+8}" width="{filled_w:.1f}" height="20" fill="{color}" rx="3"/>'
+            f'<text x="{bar_x+bar_w_max+8}" y="{y+H_step//2+4}" font-family="Space Mono,monospace" '
+            f'font-size="11" fill="{color}" font-weight="700">{val:.1f}%</text>'
+            f'<text x="{bar_x}" y="{y+H_step-2}" font-family="Space Mono,monospace" '
+            f'font-size="8" fill="#4a5568">{html.escape(note)}</text>'
+        )
+    svg = f'<svg viewBox="0 0 {W} {svg_h}" xmlns="http://www.w3.org/2000/svg">{items_svg}</svg>'
+    st.markdown(
+        f'<div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;padding:18px 20px;margin-bottom:12px">'
+        f'<div style="font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#64748b;margin-bottom:12px;font-weight:700">Duty Escalation Ladder</div>'
+        f'{svg}</div>',
+        unsafe_allow_html=True
+    )
+
+
 # ── Main answer renderer ───────────────────────────────────────────────────────
 
 def _render_answer_text(state: Dict[str, Any]) -> str:
@@ -1176,11 +1338,55 @@ def _render_assistant_details(
     if state.get("total_duty") is not None:
         st.markdown('<div class="section-header">Duty Breakdown</div>', unsafe_allow_html=True)
         _render_duty_gauge(state)
-        _render_duty_donut(state)  # NEW
+        _render_duty_donut(state)
+        _render_duty_escalation(state)
+
+    # ── Exposure Score ──
+    if state.get("total_duty") is not None:
+        _render_exposure_score(state)
+
+    # ── Sourcing Recommendation ──
+    _render_sourcing_recommendation(state)
 
     # ── HITL warning ──
     if state.get("hitl_required") and not _is_low_confidence_stop(state):
         st.warning(f"⚑ Flagged for review: {state.get('hitl_reason') or ''}")
+
+    # ── Country Comparison — only from comparison pipeline result ──
+    _raw_comp = state.get("country_comparison") if state.get("_is_comparison") else None
+    # Filter out bad country entries (e.g. "from" captured by regex)
+    comp = [c for c in (_raw_comp or []) if len(c.get("country","")) > 3 and c.get("country","").lower() not in ("from","none","null","all")] or None
+    if comp:
+        st.markdown('<div class="section-header">Country Comparison</div>', unsafe_allow_html=True)
+        cheapest = state.get("cheapest_country") or (min(comp, key=lambda x: x.get("total_duty") or x.get("estimated_total") or 0).get("country") if comp else None)
+        max_duty = max((float(c.get("total_duty") or c.get("estimated_total") or 0)) for c in comp) or 1
+        bars_html = ""
+        for c in comp:
+            duty = float(c.get("total_duty") or c.get("estimated_total") or 0)
+            w = (duty / max_duty) * 100
+            col = _bar_color(duty)
+            country_name = c.get("country", "—")
+            bars_html += f"""<div style="margin-bottom:10px">
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                    <span style="font-family:'Poppins',sans-serif;font-size:0.82rem;color:#e0e7ff">{html.escape(str(country_name))}</span>
+                    <span style="font-family:'Space Mono',monospace;font-size:0.82rem;color:{col};font-weight:700">{duty:.1f}%</span>
+                </div>
+                <div style="height:6px;background:#1a2553;border-radius:3px"><div style="height:100%;width:{w:.1f}%;background:{col};border-radius:3px"></div></div>
+            </div>"""
+        st.markdown(f'<div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;padding:18px 20px;margin-bottom:12px">{bars_html}</div>', unsafe_allow_html=True)
+        rows = []
+        for c in comp:
+            rows.append({
+                "Country": c.get("country", "—"),
+                "Base MFN": f"{float(c.get('base_rate') or c.get('mfn_rate') or 0):.1f}%",
+                "Adder": f"+{float(c.get('adder_rate') or 0):.1f}%",
+                "Total Duty": f"{float(c.get('total_duty') or c.get('estimated_total') or 0):.1f}%",
+                "FTA": c.get("fta_program") if c.get("fta_applied") else "—",
+            })
+        st.markdown(_html_table(rows, ["Country", "Base MFN", "Adder", "Total Duty", "FTA"]), unsafe_allow_html=True)
+        _render_tariff_stacked_bar(comp)
+        if cheapest:
+            st.success(f"✓ Cheapest source: **{cheapest}**")
 
     # ── Trade Metrics ──
     period = state.get("trade_period")
@@ -1210,7 +1416,7 @@ def _render_assistant_details(
     top_importers = state.get("top_importers") or []
     if top_importers:
         st.markdown('<div class="section-header">Top Import Partners</div>', unsafe_allow_html=True)
-        _render_importers_chart(top_importers)
+        _render_importers_treemap(top_importers)
         with st.expander("📊 Full Partner Table", expanded=False):
             _KEY_LABELS = {
                 "census_country_name":  "Country",
@@ -1252,6 +1458,9 @@ def _render_assistant_details(
                 f"<div style='font-size:0.85rem;color:#94a3b8;line-height:1.7'>{policy_summary}</div>",
                 unsafe_allow_html=True,
             )
+
+    # ── What-If Calculator ──
+    _render_whatif_slider(state, widget_key_prefix=widget_key_prefix)
 
     # ── Citations (now with agency colors) ──
     _render_citations(citations_list)
@@ -1349,15 +1558,15 @@ def _run_pipeline_response(text: str) -> None:
             )
             return
 
-        if isinstance(state, dict) and state.get("comparison") is not None:
-            content = "Country comparison generated."
-            _emit_answer(content)
-            _render_comparison_result(state)
-            st.markdown(_query_footer_html(text), unsafe_allow_html=True)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": content, "state": state, "query": text}
-            )
-            return
+        # Merge comparison data into state for _render_assistant_details
+        if state.get("comparison") is not None:
+            comp_list = state.get("comparison", [])
+            cheapest = state.get("cheapest_country")
+            state = dict(state)
+            state["country_comparison"] = comp_list
+            state["cheapest_country"] = cheapest
+            state["query_intent"] = "country_compare"
+            state["_is_comparison"] = True
 
         content = _render_answer_text(state)
         _emit_answer(content)
@@ -1386,6 +1595,12 @@ def _run_pipeline_response(text: str) -> None:
 
 def _append_user_and_run(text: str) -> None:
     st.session_state.messages.append({"role": "user", "content": text, "state": None})
+    # Track query history
+    if "query_history" not in st.session_state:
+        st.session_state.query_history = []
+    if text not in st.session_state.query_history:
+        st.session_state.query_history.insert(0, text)
+        st.session_state.query_history = st.session_state.query_history[:5]
     _run_pipeline_response(text)
 
 
@@ -1412,6 +1627,270 @@ def _render_message(msg: Dict[str, Any], *, show_clarification_actions: bool = F
             st.markdown(_query_footer_html(query), unsafe_allow_html=True)
 
 
+# ── FEATURE 1: Sourcing Recommendation Card ─────────────────────────────────
+
+def _render_sourcing_recommendation(state: Dict[str, Any]) -> None:
+    """Best alternative source card based on top_importers."""
+    country = (state.get("country") or "").lower()
+    total_duty = float(state.get("total_duty") or 0)
+    top_importers = state.get("top_importers") or []
+    if not top_importers or total_duty == 0:
+        return
+    # Find best alternative (lowest base_rate, not same country)
+    alternatives = [
+        r for r in top_importers
+        if (r.get("census_country_name") or "").lower() != country
+        and (r.get("lookup_country") or "").lower() != country
+    ]
+    if not alternatives:
+        return
+    best = min(alternatives, key=lambda r: float(r.get("base_rate") or r.get("mfn_rate") or 0))
+    best_name = (best.get("census_country_name") or best.get("lookup_country") or "").title()
+    best_rate = float(best.get("base_rate") or best.get("mfn_rate") or 0)
+    best_fta = best.get("fta_program") or ""
+    savings = total_duty - best_rate
+    if savings <= 0:
+        return
+    fta_note = f" · {best_fta} preferential rate" if best_fta else ""
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0a2a1a,#0f1535);border:1px solid #10b981;
+                border-radius:10px;padding:16px 20px;margin-bottom:12px">
+        <div style="font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;
+                    letter-spacing:0.1em;color:#10b981;margin-bottom:8px;font-weight:700">
+            ✦ Sourcing Recommendation
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+            <div>
+                <div style="font-size:1rem;color:#e0e7ff;font-weight:600;margin-bottom:2px">
+                    Consider sourcing from <span style="color:#10b981">{html.escape(best_name)}</span>
+                </div>
+                <div style="font-size:0.78rem;color:#64748b;font-family:Poppins,sans-serif">
+                    {best_rate:.1f}% effective rate{html.escape(fta_note)} vs {total_duty:.1f}% current
+                </div>
+            </div>
+            <div style="text-align:right">
+                <div style="font-family:Space Mono,monospace;font-size:1.4rem;font-weight:700;color:#10b981">
+                    -{savings:.1f}%
+                </div>
+                <div style="font-size:0.65rem;color:#64748b;font-family:Space Mono,monospace">DUTY SAVING</div>
+            </div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+
+# ── FEATURE 2: Section 301 Exposure Score ────────────────────────────────────
+
+def _render_exposure_score(state: Dict[str, Any]) -> None:
+    """0-100 risk score combining adder rate, country risk, and trade volume."""
+    total = float(state.get("total_duty") or 0)
+    adder = float(state.get("adder_rate") or 0)
+    country = (state.get("country") or "").lower()
+    import_val = float(state.get("import_value_usd") or 0)
+    trend = state.get("trade_trend_pct") or 0
+
+    if total == 0:
+        return
+
+    # Score components (0-100)
+    rate_score = min(adder / 1.5, 40)  # max 40 pts from adder rate
+    country_risk = 35 if "china" in country else 20 if country in ("russia","iran","north korea") else 5
+    volume_score = min(import_val / 5_000_000 * 15, 15)  # max 15 pts
+    trend_score = 10 if float(trend or 0) < -20 else 0  # declining = risky supply
+
+    score = int(rate_score + country_risk + volume_score + trend_score)
+    score = min(score, 100)
+
+    if score >= 70:
+        color, label, desc = "#ef4444", "HIGH RISK", "Significant tariff exposure — consider diversifying supply chain"
+    elif score >= 40:
+        color, label, desc = "#f59e0b", "MEDIUM RISK", "Moderate exposure — monitor policy changes closely"
+    else:
+        color, label, desc = "#10b981", "LOW RISK", "Manageable tariff exposure at current rates"
+
+    arc_pct = score / 100
+    import math
+    r, cx, cy = 40, 50, 50
+    circ = 2 * math.pi * r
+    filled = arc_pct * circ * 0.75  # 270 deg arc
+    gap = circ - filled
+
+    st.markdown(f"""
+    <div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;
+                padding:16px 20px;margin-bottom:12px;display:flex;align-items:center;gap:20px">
+        <svg width="100" height="100" viewBox="0 0 100 100">
+            <circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="#1a2553" stroke-width="10"
+                    stroke-dasharray="{circ*0.75:.1f} {circ*0.25:.1f}"
+                    stroke-dashoffset="-{circ*0.125:.1f}" transform="rotate(0 {cx} {cy})"/>
+            <circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}" stroke-width="10"
+                    stroke-linecap="round"
+                    stroke-dasharray="{filled:.1f} {circ:.1f}"
+                    stroke-dashoffset="-{circ*0.125:.1f}" transform="rotate(0 {cx} {cy})"/>
+            <text x="{cx}" y="{cy-4}" text-anchor="middle" font-family="Space Mono,monospace"
+                  font-size="18" font-weight="700" fill="{color}">{score}</text>
+            <text x="{cx}" y="{cy+12}" text-anchor="middle" font-family="Poppins,sans-serif"
+                  font-size="7" fill="#64748b">/100</text>
+        </svg>
+        <div style="flex:1">
+            <div style="font-family:Space Mono,monospace;font-size:0.7rem;font-weight:700;
+                        color:{color};margin-bottom:4px">TARIFF EXPOSURE · {label}</div>
+            <div style="font-size:0.78rem;color:#94a3b8;font-family:Poppins,sans-serif;
+                        line-height:1.4;margin-bottom:8px">{html.escape(desc)}</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#64748b;
+                             background:#1a2553;padding:2px 6px;border-radius:3px">
+                    Rate: {int(rate_score)}/40
+                </span>
+                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#64748b;
+                             background:#1a2553;padding:2px 6px;border-radius:3px">
+                    Country: {country_risk}/35
+                </span>
+                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#64748b;
+                             background:#1a2553;padding:2px 6px;border-radius:3px">
+                    Volume: {int(volume_score)}/15
+                </span>
+            </div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+
+# ── FEATURE 3: What-If Tariff Slider ─────────────────────────────────────────
+
+def _render_whatif_slider(state: Dict[str, Any], widget_key_prefix: str = "whatif") -> None:
+    """Interactive what-if slider to recalculate duty at different adder rates."""
+    base = float(state.get("base_rate") or 0)
+    adder = float(state.get("adder_rate") or 0)
+    total = float(state.get("total_duty") or 0)
+    if adder == 0 or total == 0:
+        return
+
+    with st.expander("🔧 What-If Calculator — Adjust Tariff Rate", expanded=False):
+        new_adder = st.slider(
+            "Hypothetical adder rate (%)",
+            min_value=0.0, max_value=float(max(adder * 2, 100)),
+            value=float(adder), step=2.5,
+            key=f"{widget_key_prefix}_slider"
+        )
+        new_total = base + new_adder
+        delta = new_total - total
+        delta_color = "#ef4444" if delta > 0 else "#10b981"
+        delta_sign = "+" if delta > 0 else ""
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""<div class='metric-box'>
+                <div class='metric-val' style='color:#64748b;text-decoration:line-through'>{total:.1f}%</div>
+                <div class='metric-lbl'>Current Total</div></div>""", unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"""<div class='metric-box'>
+                <div class='metric-val' style='color:#60a5fa'>{new_total:.1f}%</div>
+                <div class='metric-lbl'>New Total</div></div>""", unsafe_allow_html=True)
+        with col3:
+            st.markdown(f"""<div class='metric-box'>
+                <div class='metric-val' style='color:{delta_color}'>{delta_sign}{delta:.1f}%</div>
+                <div class='metric-lbl'>Change</div></div>""", unsafe_allow_html=True)
+
+        if st.session_state.get("calc_import_val"):
+            import_v = float(st.session_state.get("calc_import_val", 10000))
+            old_duty = import_v * (total / 100)
+            new_duty = import_v * (new_total / 100)
+            saving = old_duty - new_duty
+            if abs(saving) > 0:
+                s_color = "#10b981" if saving > 0 else "#ef4444"
+                s_label = f"saves ${abs(saving):,.0f}" if saving > 0 else f"costs ${abs(saving):,.0f} more"
+                st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:{s_color};margin-top:8px'>On ${import_v:,.0f} import value → {s_label}</div>", unsafe_allow_html=True)
+
+
+# ── Recent Policy Changes Sidebar Widget ─────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def _fetch_recent_fr_notices() -> list:
+    try:
+        import requests as _req
+        params = {
+            "per_page": "6",
+            "order": "newest",
+            "conditions[term]": "tariff",
+            "conditions[agencies][]": [
+                "trade-representative-office-of-united-states",
+                "executive-office-of-the-president",
+                "u-s-customs-and-border-protection",
+            ],
+            "fields[]": ["document_number","title","publication_date","agencies","html_url"],
+        }
+        resp = _req.get("https://www.federalregister.gov/api/v1/documents.json", params=params, timeout=8)
+        if resp.ok:
+            return resp.json().get("results", [])[:6]
+    except Exception:
+        pass
+    return []
+
+
+def _render_recent_policy_main() -> None:
+    """Render recent policy changes in main pane with descriptions and links."""
+    st.markdown('<div class="section-header">Recent Trade Policy Changes</div>', unsafe_allow_html=True)
+    notices = _fetch_recent_fr_notices()
+    if not notices:
+        st.info("Could not load recent notices — Federal Register API unavailable.")
+        return
+    colors = {
+        "trade-representative-office-of-united-states": ("#1e3a5f","#60a5fa","USTR"),
+        "executive-office-of-the-president": ("#3a2a1a","#f59e0b","EOP"),
+        "u-s-customs-and-border-protection": ("#1a3a2a","#10b981","CBP"),
+    }
+    for n in notices:
+        title = (n.get("title") or "")
+        pub = (n.get("publication_date") or "")[:10]
+        url = n.get("html_url") or ""
+        doc_num = n.get("document_number") or ""
+        abstract = (n.get("abstract") or n.get("excerpt") or "")[:300]
+        slug = ((n.get("agencies") or [{}])[0].get("slug") or "")
+        agency_name = ((n.get("agencies") or [{}])[0].get("name") or "Federal Register")
+        bg, fg, label = colors.get(slug, ("#1a2332","#94a3b8","FR"))
+        link_html = f'<a href="{html.escape(url)}" target="_blank" style="font-family:Space Mono,monospace;font-size:0.72rem;color:#60a5fa;text-decoration:none">↗ View on Federal Register</a>' if url else ""
+        st.markdown(f"""
+        <div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;padding:16px 20px;margin-bottom:12px">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+                <span style="background:{bg};color:{fg};font-family:Space Mono,monospace;font-size:0.65rem;font-weight:700;padding:3px 8px;border-radius:5px">{label}</span>
+                <span style="font-family:Space Mono,monospace;font-size:0.7rem;color:#64748b">{html.escape(pub)}</span>
+                <span style="font-family:Space Mono,monospace;font-size:0.65rem;color:#4a5568">{html.escape(doc_num)}</span>
+            </div>
+            <div style="font-size:0.9rem;color:#e0e7ff;font-weight:600;margin-bottom:6px">{html.escape(title)}</div>
+            <div style="font-size:0.78rem;color:#64748b;font-family:Poppins,sans-serif;margin-bottom:8px;line-height:1.5">{html.escape(agency_name)}</div>
+            {link_html}
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_recent_policy_sidebar() -> None:
+    notices = _fetch_recent_fr_notices()
+    if not notices:
+        st.markdown("<div style='font-size:0.72rem;color:#4a5568;padding:4px 0'>Unable to load notices.</div>", unsafe_allow_html=True)
+        return
+    colors = {
+        "trade-representative-office-of-united-states": ("#1e3a5f","#60a5fa","USTR"),
+        "executive-office-of-the-president": ("#3a2a1a","#f59e0b","EOP"),
+        "u-s-customs-and-border-protection": ("#1a3a2a","#10b981","CBP"),
+    }
+    items_html = ""
+    for n in notices:
+        title = (n.get("title") or "")[:72]
+        pub = (n.get("publication_date") or "")[:10]
+        url = n.get("html_url") or ""
+        doc_num = n.get("document_number") or ""
+        slug = ((n.get("agencies") or [{}])[0].get("slug") or "")
+        bg, fg, label = colors.get(slug, ("#1a2332","#94a3b8","FR"))
+        link_open = f'<a href="{html.escape(url)}" target="_blank" style="text-decoration:none">' if url else ""
+        link_close = "</a>" if url else ""
+        items_html += f"""<div style="padding:8px 0;border-bottom:1px solid #1e3a5f">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+                <span style="background:{bg};color:{fg};font-family:Space Mono,monospace;font-size:0.55rem;font-weight:700;padding:2px 5px;border-radius:3px">{label}</span>
+                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#4a5568">{html.escape(pub)}</span>
+            </div>
+            {link_open}<div style="font-size:0.72rem;color:#94a3b8;line-height:1.3;margin-bottom:2px">{html.escape(title)}</div>{link_close}
+            <div style="font-family:Space Mono,monospace;font-size:0.6rem;color:#4a5568">{html.escape(doc_num)}</div>
+        </div>"""
+    st.markdown(f'<div>{items_html}</div>', unsafe_allow_html=True)
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 
 def _render_sidebar() -> None:
@@ -1431,6 +1910,14 @@ def _render_sidebar() -> None:
         )
 
         st.button("＋ New Conversation", use_container_width=True, on_click=_new_conversation)
+
+        # ── Query History ──
+        if st.session_state.get("query_history"):
+            st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin:12px 0 6px;font-weight:700'>Recent Queries</div>", unsafe_allow_html=True)
+            for i, q in enumerate(st.session_state.get("query_history", [])):
+                short = q[:38] + "…" if len(q) > 38 else q
+                if st.button(short, key=f"hist_q_{i}", use_container_width=True):
+                    _append_user_and_run(q)
 
         state = _last_state()
         if state:
@@ -1458,7 +1945,34 @@ def _render_sidebar() -> None:
             )
             with st.expander("Pipeline JSON", expanded=False):
                 st.json(state)
+
+            # ── Tariff Calculator ──
+            total_rate = state.get("total_duty")
+            if total_rate is not None:
+                try:
+                    rate_f = float(total_rate) / 100
+                    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin:14px 0 6px;font-weight:700'>Duty Calculator</div>", unsafe_allow_html=True)
+                    import_val = st.number_input("Import value (USD)", min_value=0.0, value=10000.0, step=1000.0, format="%.0f", key="calc_import_val", label_visibility="collapsed")
+                    if import_val > 0:
+                        duty_amt = import_val * rate_f
+                        total_landed = import_val + duty_amt
+                        st.markdown(f"""<div style='background:#0f1535;border:1px solid #1e3a5f;border-radius:8px;padding:12px 14px;font-family:Space Mono,monospace;font-size:0.75rem'>
+                            <div style='color:#64748b;margin-bottom:4px'>Import Value</div>
+                            <div style='color:#e0e7ff;font-weight:700'>${import_val:,.0f}</div>
+                            <div style='color:#64748b;margin:6px 0 4px'>Duty ({total_rate:.1f}%)</div>
+                            <div style='color:#ef4444;font-weight:700'>+${duty_amt:,.0f}</div>
+                            <div style='border-top:1px solid #1e3a5f;margin-top:8px;padding-top:8px;color:#64748b'>Landed Cost</div>
+                            <div style='color:#60a5fa;font-weight:700;font-size:0.9rem'>${total_landed:,.0f}</div>
+                        </div>""", unsafe_allow_html=True)
+                except Exception:
+                    pass
             st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+
+        # Recent policy changes button at bottom
+        st.markdown("<div style='margin-top:auto;padding-top:16px'></div>", unsafe_allow_html=True)
+        if st.button("📋 Recent Policy Changes", use_container_width=True, key="recent_policy_btn"):
+            st.session_state["show_recent_policy"] = True
+            st.rerun()
 
         # HTS Code Search
         st.markdown(
@@ -1491,17 +2005,41 @@ def _render_sidebar() -> None:
             except Exception:
                 st.markdown("<div style='font-size:0.75rem;color:#ef4444'>Search unavailable</div>", unsafe_allow_html=True)
 
-        # NEW FEATURE 4: Categorized example queries
-        st.markdown(
-            "<div style='font-family:\"Space Mono\",monospace;font-size:0.6rem;text-transform:uppercase;"
-            "letter-spacing:0.1em;color:#4a5568;margin:12px 0 8px;font-weight:700'>Example Queries</div>",
-            unsafe_allow_html=True,
-        )
+
+
+        # ── Example Queries ──
+        st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin:16px 0 8px;font-weight:700'>Example Queries</div>", unsafe_allow_html=True)
         for category, queries in EXAMPLE_QUERIES.items():
+            if category == "📈 Rate Changes":
+                continue
             st.markdown(f"<div class='eq-category'>{html.escape(category)}</div>", unsafe_allow_html=True)
             for q in queries:
                 if st.button(q, key=f"eq_{q}", use_container_width=True):
                     _append_user_and_run(q)
+
+        # ── Demo Scenarios at bottom ──
+        st.markdown("<div style='border-top:1px solid #1e3a5f;margin:20px 0 12px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin-bottom:8px;font-weight:700'>🎯 Demo Scenarios</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='eq-category'>🔍 Ambiguous Product Classification</div>", unsafe_allow_html=True)
+        _AMB = {
+            "What tariff applies to batteries?": "batteries",
+            "Import duty on steel products?": "steel",
+            "Tariff rate for electric motors?": "motors",
+            "What is the duty on pipes?": "pipes",
+        }
+        for label, q in _AMB.items():
+            if st.button(label, key=f"demo_amb_{q}", use_container_width=True):
+                _append_user_and_run(q)
+
+        st.markdown("<div class='eq-category'>⚠️ HITL — Human Review Triggered</div>", unsafe_allow_html=True)
+        _HITL = {
+            "What is the tariff on metal parts from Germany?": "metal parts from Germany",
+            "Import duty on industrial machinery parts?": "machinery parts",
+        }
+        for label, q in _HITL.items():
+            if st.button(label, key=f"demo_hitl_{q}", use_container_width=True):
+                _append_user_and_run(q)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1533,6 +2071,13 @@ def main() -> None:
             and (st_obj.get("clarification_needed") or _is_low_confidence_stop(st_obj))
         )
         _render_message(msg, show_clarification_actions=show_actions, widget_key_prefix=f"hist_{i}")
+
+    # Recent policy changes panel
+    if st.session_state.get("show_recent_policy"):
+        _render_recent_policy_main()
+        if st.button("✕ Close", key="close_policy"):
+            st.session_state["show_recent_policy"] = False
+            st.rerun()
 
     pending = st.session_state.pop(_PENDING_PIPELINE_QUERY, None)
     if pending:
