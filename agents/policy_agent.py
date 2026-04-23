@@ -507,6 +507,24 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
         logger.warning("policy_agent_no_chunks product=%s hts=%s", product, hts_code)
         return {"policy_chunks": [], "policy_summary": "No policy context found."}
 
+    # ── Step 2b2: Drop chunks from wrong HTS chapter ─────────────────────────────
+    if hts_chapter:
+        before = len(chunks)
+        def _keep(c):
+            c_hts = (c.get("hts_code") or "").replace(".","")[:2]
+            c_chap = (c.get("hts_chapter") or "").strip().lstrip("0")
+            # No HTS info on chunk — keep it (generic policy doc)
+            if not c_hts and not c_chap:
+                return True
+            # Has HTS info — must match query chapter
+            if c_hts and c_hts != hts_chapter:
+                return False
+            if c_chap and c_chap != hts_chapter.lstrip("0") and c_chap != str(int(hts_chapter)):
+                return False
+            return True
+        chunks = [c for c in chunks if _keep(c)]
+        logger.info("policy_agent_chapter_filter before=%d after=%d chapter=%s", before, len(chunks), hts_chapter)
+
     # ── Step 2c: Cross-reference resolution ───────────────────────────────────
     # Scan chunk text for FR doc references, fetch those docs if in corpus
     existing_doc_numbers = {c.get("document_number", "") for c in chunks}
@@ -518,7 +536,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     # when retrieved via hybrid search but irrelevant to the tariff query.
     if len(chunks) > 8:
         bm25_query = f"{product} {hts_code} tariff duty section 301 {country}"
-        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=15, min_score_ratio=0.15)
+        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=15, min_score_ratio=0.25)
         logger.info("policy_agent_final_filter chunks_after=%d", len(chunks))
 
     # ── Step 3: LLM synthesis with numbered citations ─────────────────────────
