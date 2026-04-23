@@ -260,7 +260,11 @@ def run_comparison_pipeline(query: str, countries: list) -> Dict[str, Any]:
     """
     from agents.query_agent import run_query_agent
 
-    clean_query = __import__("re").sub(r"\s+(vs\.?|or)\s+\w.*", "", query, flags=__import__("re").IGNORECASE).strip()
+    import re as _re
+    # Strip "vs/or COUNTRY" but keep the product + first country intact
+    clean_query = _re.sub(r'\s+(vs\.?|or)\s+\S+.*$', '', query, flags=_re.IGNORECASE).strip()
+    # Also strip trailing "?" 
+    clean_query = clean_query.rstrip('?').strip()
     initial = {"query": clean_query}
     parsed = run_query_agent(initial)
     product = parsed.get("product")
@@ -322,15 +326,26 @@ def run_pipeline_auto(query: str) -> Dict[str, Any]:
     Falls back to standard run_pipeline for non-comparison queries.
     """
     import re
-    # Detect patterns like "China or Germany", "China vs Germany", "China vs. Mexico"
-    compare_match = re.search(
+
+    # Pattern 1: "from X vs/or Y"
+    m = re.search(
         r'\bfrom\s+([A-Za-z][a-z]+(?:\s[A-Za-z][a-z]+)?)\s+(?:or|vs\.?)\s+([A-Za-z][a-z]+(?:\s[A-Za-z][a-z]+)?)',
         query, re.IGNORECASE
     )
-    if compare_match:
-        country1 = compare_match.group(1)
-        country2 = compare_match.group(2)
-        logger.info("auto_routing comparison country1=%s country2=%s", country1, country2)
-        return run_comparison_pipeline(query, [country1, country2])
+    if m:
+        return run_comparison_pipeline(query, [m.group(1), m.group(2)])
+
+    # Pattern 2: any "X or Y" / "X vs Y" where both are capitalized country-like words
+    m2 = re.search(
+        r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s+(?:or|vs\.?)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)',
+        query
+    )
+    if m2:
+        c1, c2 = m2.group(1), m2.group(2)
+        # Skip common non-country words
+        skip = {"the", "and", "for", "not", "but", "with", "from", "this", "that"}
+        if c1.lower() not in skip and c2.lower() not in skip and len(c1) > 2 and len(c2) > 2:
+            logger.info("auto_routing comparison c1=%s c2=%s", c1, c2)
+            return run_comparison_pipeline(query, [c1, c2])
 
     return run_pipeline(query)
