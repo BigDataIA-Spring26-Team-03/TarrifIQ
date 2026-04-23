@@ -35,7 +35,7 @@ from api.tools.search_policy_vector import router as search_policy_router
 from api.tools.search_hts_vector import router as search_hts_vector_router
 from api.tools.debug_agents import router as debug_agents_router
 from services.chromadb_init import initialize_chromadb
-from agents.graph import run_pipeline
+from agents.graph import run_pipeline, run_pipeline_auto
 from validation.rate_reconciliation import validate as validate_rates
 
 # Configure structlog so keyword-arg logging works consistently
@@ -180,6 +180,31 @@ async def query(request: QueryRequest):
             except Exception as e:
                 logger.warning("rate_validation_failed", error=str(e))
 
+        # Short-circuit: comparison pipeline result
+        if result.get("comparison") is not None:
+            return {
+                "status": "ok",
+                "query": request.query,
+                "product": result.get("product"),
+                "country": None,
+                "hts_code": result.get("hts_code"),
+                "hts_description": result.get("hts_description"),
+                "base_rate": None, "mfn_rate": None, "fta_rate": None,
+                "fta_program": None, "fta_applied": None, "hts_footnotes": None,
+                "adder_rate": None, "adder_doc": None, "adder_method": None,
+                "total_duty": None, "policy_summary": None, "policy_chunks": [],
+                "policy_chunks_count": 0, "pipeline_confidence": None,
+                "import_value_usd": None, "trade_period": None,
+                "trade_suppressed": None, "trade_trend_pct": None, "trade_trend_label": None,
+                "final_response": result.get("cheapest_country"),
+                "citations": None,
+                "country_comparison": result.get("comparison", []),
+                "top_importers": None, "rate_change_history": None,
+                "query_intent": "country_compare",
+                "hitl_required": False, "hitl_reason": None,
+                "rate_reconciliation": None, "error": result.get("error"),
+                "cheapest_country": result.get("cheapest_country"),
+            }
         # Short-circuit: query agent detected ambiguity
         if result.get("clarification_needed"):
             return {

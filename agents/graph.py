@@ -260,8 +260,8 @@ def run_comparison_pipeline(query: str, countries: list) -> Dict[str, Any]:
     """
     from agents.query_agent import run_query_agent
 
-    # First parse the query to get the product
-    initial = {"query": query}
+    clean_query = __import__("re").sub(r"\s+(?:vs\.?|or)\s+\w+.*", "", query, flags=__import__("re").IGNORECASE).strip()
+    initial = {"query": clean_query}
     parsed = run_query_agent(initial)
     product = parsed.get("product")
 
@@ -324,12 +324,12 @@ def run_pipeline_auto(query: str) -> Dict[str, Any]:
     import re
     # Detect patterns like "China or Germany", "China vs Germany", "China vs. Mexico"
     compare_match = re.search(
-        r'\b(from|between)\s+([A-Z][a-z]+)\s+(?:or|vs\.?)\s+([A-Z][a-z]+)\b',
+        r'\b(from|between)\s+([A-Za-z][a-z]+(?:\ [A-Za-z][a-z]+)*)\s+(?:or|vs\.?)\s+([A-Za-z][a-z]+(?:\ [A-Za-z][a-z]+)*)\b',
         query, re.IGNORECASE
     )
     if compare_match:
-        country1 = compare_match.group(2)
-        country2 = compare_match.group(3)
+        country1 = compare_match.group(1)
+        country2 = compare_match.group(2)
         logger.info("auto_routing comparison country1=%s country2=%s", country1, country2)
         return run_comparison_pipeline(query, [country1, country2])
 

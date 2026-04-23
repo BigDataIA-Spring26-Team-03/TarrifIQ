@@ -837,11 +837,10 @@ def run_adder_rate_agent(state: TariffState) -> Dict[str, Any]:
             final_basis = "notice_llm"
             logger.info("step7_notice_selected hts=%s rate=%.2f doc=%s", hts_code, final_adder, final_doc)
         else:
-            # Regex fallback on policy_chunks (last resort)
-            final_adder = _regex_fallback(policy_chunks, hts_code) if policy_chunks else 0.0
+            final_adder = 0.0
             final_doc = None
-            final_basis = "regex_fallback" if final_adder > 0 else "none"
-            logger.info("step7_regex_fallback hts=%s rate=%.2f", hts_code, final_adder)
+            final_basis = "none"
+            logger.info("step7_no_adder hts=%s country=%s", hts_code, country)
 
         effective_base = mfn_rate
 
