@@ -166,7 +166,11 @@ async def query(request: QueryRequest):
     """Full LangGraph pipeline: query → classify → base_rate → policy → adder_rate → trade → synthesize."""
     logger.info("query_received", query=request.query)
     try:
-        result = run_pipeline(request.query)
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = await loop.run_in_executor(pool, run_pipeline_auto, request.query)
 
         # Validate rate arithmetic: base_rate + adder_rate ≈ total_duty
         rate_rec = None

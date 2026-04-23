@@ -483,6 +483,19 @@ def _inject_styles() -> None:
                 background: #1e3a5f;
             }
 
+            /* ── HTS Search input ── */
+            [data-testid="stTextInput"] input {
+                background: #0f1535 !important;
+                border: 1px solid #1e3a5f !important;
+                border-radius: 8px !important;
+                color: #e0e7ff !important;
+                font-family: 'Space Mono', monospace !important;
+                font-size: 0.82rem !important;
+            }
+            [data-testid="stTextInput"] input:focus {
+                border-color: #3b82f6 !important;
+            }
+
             /* ── NEW: Timeline ── */
             .timeline-item {
                 display: flex;
@@ -1446,6 +1459,37 @@ def _render_sidebar() -> None:
             with st.expander("Pipeline JSON", expanded=False):
                 st.json(state)
             st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+
+        # HTS Code Search
+        st.markdown(
+            "<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;"
+            "letter-spacing:0.1em;color:#4a5568;margin:16px 0 8px;font-weight:700'>HTS Code Search</div>",
+            unsafe_allow_html=True,
+        )
+        hts_query = st.text_input(
+            "", placeholder="e.g. washing machine, 8703, solar...",
+            key="hts_search_input", label_visibility="collapsed"
+        )
+        if hts_query and len(hts_query.strip()) >= 2:
+            try:
+                import requests as _req
+                resp = _req.get(
+                    "http://fastapi:8001/tools/hts/search",
+                    params={"query": hts_query.strip(), "limit": 8},
+                    timeout=5
+                )
+                hts_results = resp.json() if resp.ok else []
+                if hts_results:
+                    for item in hts_results[:8]:
+                        code = item.get("hts_code", "")
+                        desc = (item.get("description") or "")[:80]
+                        label = f"{code} — {desc}"
+                        if st.button(label, key=f"hts_{code}", use_container_width=True):
+                            _append_user_and_run(desc)
+                else:
+                    st.markdown("<div style='font-size:0.75rem;color:#4a5568;padding:4px 0'>No results found</div>", unsafe_allow_html=True)
+            except Exception:
+                st.markdown("<div style='font-size:0.75rem;color:#ef4444'>Search unavailable</div>", unsafe_allow_html=True)
 
         # NEW FEATURE 4: Categorized example queries
         st.markdown(
