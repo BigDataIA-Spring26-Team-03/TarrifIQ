@@ -510,9 +510,22 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     # ── Step 2b2: Drop chunks from wrong HTS chapter ─────────────────────────────
     if hts_chapter:
         before = len(chunks)
+        country_lower = (country or "").lower().strip()
+        is_china = country_lower in ("china", "prc", "people's republic of china")
+        is_india = "india" in country_lower
+
         def _keep(c):
             c_hts = (c.get("hts_code") or "").replace(".","")[:2]
             c_chap = (c.get("hts_chapter") or "").strip().lstrip("0")
+            title = (c.get("title") or "").lower()
+
+            # Drop China-specific docs for non-China queries
+            if not is_china and any(kw in title for kw in ["china", "chinese", "people's republic"]):
+                return False
+            # Drop India-specific docs for non-India queries
+            if not is_india and "india" in title and "executive order" in title:
+                return False
+
             # No HTS info on chunk — keep it (generic policy doc)
             if not c_hts and not c_chap:
                 return True
@@ -536,7 +549,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     # when retrieved via hybrid search but irrelevant to the tariff query.
     if len(chunks) > 8:
         bm25_query = f"{product} {hts_code} tariff duty section 301 {country}"
-        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=15, min_score_ratio=0.25)
+        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=12, min_score_ratio=0.35)
         logger.info("policy_agent_final_filter chunks_after=%d", len(chunks))
 
     # ── Step 3: LLM synthesis with numbered citations ─────────────────────────
