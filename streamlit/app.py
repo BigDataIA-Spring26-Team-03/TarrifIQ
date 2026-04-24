@@ -29,31 +29,6 @@ st.set_page_config(
 
 _PENDING_PIPELINE_QUERY = "pending_pipeline_query"
 
-# ── NEW: Categorized example queries ─────────────────────────────────────────
-EXAMPLE_QUERIES = {
-    "🇨🇳 China Tariffs": [
-        "electric vehicles from China",
-        "semiconductors from China",
-        "solar panels from China",
-        "lithium batteries from China",
-    ],
-    "🤝 FTA Countries": [
-        "washing machines from South Korea",
-        "cotton t-shirts from Mexico",
-        "auto parts from Canada",
-        "laptops from Vietnam",
-    ],
-    "⚖️ Compare Sources": [
-        "cheaper to import laptops from China or Vietnam?",
-        "steel wire from China vs Germany",
-    ],
-    "📈 Rate Changes": [
-        "has the tariff on lithium batteries changed?",
-        "steel tariff history",
-    ],
-}
-
-
 def _inject_styles() -> None:
     st.markdown(
         """
@@ -1107,60 +1082,6 @@ def _render_importers_treemap(top_importers: list) -> None:
     )
 
 
-# ── NEW VIZ 3: Duty Escalation Ladder ────────────────────────────────────────
-
-def _render_duty_escalation(state: Dict[str, Any]) -> None:
-    """Visual ladder showing how duty builds up: Free → Base MFN → +Adder → Total."""
-    base = float(state.get("base_rate") or 0)
-    adder = float(state.get("adder_rate") or 0)
-    total = float(state.get("total_duty") or 0)
-    fta = state.get("fta_applied", False)
-    fta_rate = float(state.get("fta_rate") or 0) if fta else None
-    fta_program = state.get("fta_program") or ""
-    adder_doc = state.get("adder_doc") or ""
-    adder_method = (state.get("adder_method") or "").upper().replace("_"," ")
-    if total == 0 and not fta:
-        return
-
-    steps = [("Free (0%)", 0, "#4a5568", "Starting point — no duty")]
-    if fta and fta_rate is not None:
-        steps.append((f"{fta_program} Rate", fta_rate, "#10b981", f"FTA preferential rate"))
-    steps.append((f"Base MFN", base, "#3b82f6", f"Standard most-favored-nation rate"))
-    if adder > 0:
-        steps.append((f"+{adder_method or 'Adder'}", base+adder, "#ef4444", f"{adder_doc} — Section 301/232/IEEPA"))
-    
-    max_val = max(s[1] for s in steps) or 1
-    W, H_step = 560, 52
-    svg_h = H_step * len(steps) + 20
-    items_svg = ""
-    bar_x, bar_w_max = 160, 260
-
-    for i, (label, val, color, note) in enumerate(steps):
-        y = i * H_step + 10
-        filled_w = (val / max_val) * bar_w_max if max_val > 0 else 0
-        connector = (f'<line x1="{bar_x + (steps[i-1][1]/max_val)*bar_w_max:.0f}" y1="{y}" '
-                     f'x2="{bar_x + (steps[i-1][1]/max_val)*bar_w_max:.0f}" y2="{y+4}" '
-                     f'stroke="#1e3a5f" stroke-width="1" stroke-dasharray="3,2"/>') if i > 0 else ""
-        items_svg += (
-            f'{connector}'
-            f'<text x="{bar_x-6}" y="{y+H_step//2+4}" text-anchor="end" font-family="Poppins,sans-serif" '
-            f'font-size="11" fill="#94a3b8" font-weight="500">{html.escape(label)}</text>'
-            f'<rect x="{bar_x}" y="{y+8}" width="{bar_w_max}" height="20" fill="#1a2553" rx="3"/>'
-            f'<rect x="{bar_x}" y="{y+8}" width="{filled_w:.1f}" height="20" fill="{color}" rx="3"/>'
-            f'<text x="{bar_x+bar_w_max+8}" y="{y+H_step//2+4}" font-family="Space Mono,monospace" '
-            f'font-size="11" fill="{color}" font-weight="700">{val:.1f}%</text>'
-            f'<text x="{bar_x}" y="{y+H_step-2}" font-family="Space Mono,monospace" '
-            f'font-size="8" fill="#4a5568">{html.escape(note)}</text>'
-        )
-    svg = f'<svg viewBox="0 0 {W} {svg_h}" xmlns="http://www.w3.org/2000/svg">{items_svg}</svg>'
-    st.markdown(
-        f'<div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;padding:18px 20px;margin-bottom:12px">'
-        f'<div style="font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#64748b;margin-bottom:12px;font-weight:700">Duty Escalation Ladder</div>'
-        f'{svg}</div>',
-        unsafe_allow_html=True
-    )
-
-
 # ── Main answer renderer ───────────────────────────────────────────────────────
 
 def _render_answer_text(state: Dict[str, Any]) -> str:
@@ -1339,11 +1260,6 @@ def _render_assistant_details(
         st.markdown('<div class="section-header">Duty Breakdown</div>', unsafe_allow_html=True)
         _render_duty_gauge(state)
         _render_duty_donut(state)
-        _render_duty_escalation(state)
-
-    # ── Exposure Score ──
-    if state.get("total_duty") is not None:
-        _render_exposure_score(state)
 
     # ── Sourcing Recommendation ──
     _render_sourcing_recommendation(state)
@@ -1443,24 +1359,7 @@ def _render_assistant_details(
                 rows_disp.append(row_d)
             st.markdown(_html_table(rows_disp, disp_cols), unsafe_allow_html=True)
 
-    # ── NEW: Rate Change Timeline ──
-    rate_history = state.get("rate_change_history") or []
     citations_list = state.get("citations") or []
-    if rate_history:
-        st.markdown('<div class="section-header">Policy Timeline</div>', unsafe_allow_html=True)
-        _render_rate_timeline(rate_history, citations_list)
-
-    # ── Policy Context ──
-    policy_summary = state.get("policy_summary")
-    if policy_summary:
-        with st.expander("📋 Policy Context", expanded=False):
-            st.markdown(
-                f"<div style='font-size:0.85rem;color:#94a3b8;line-height:1.7'>{policy_summary}</div>",
-                unsafe_allow_html=True,
-            )
-
-    # ── What-If Calculator ──
-    _render_whatif_slider(state, widget_key_prefix=widget_key_prefix)
 
     # ── Citations (now with agency colors) ──
     _render_citations(citations_list)
@@ -1678,128 +1577,6 @@ def _render_sourcing_recommendation(state: Dict[str, Any]) -> None:
     </div>""", unsafe_allow_html=True)
 
 
-# ── FEATURE 2: Section 301 Exposure Score ────────────────────────────────────
-
-def _render_exposure_score(state: Dict[str, Any]) -> None:
-    """0-100 risk score combining adder rate, country risk, and trade volume."""
-    total = float(state.get("total_duty") or 0)
-    adder = float(state.get("adder_rate") or 0)
-    country = (state.get("country") or "").lower()
-    import_val = float(state.get("import_value_usd") or 0)
-    trend = state.get("trade_trend_pct") or 0
-
-    if total == 0:
-        return
-
-    # Score components (0-100)
-    rate_score = min(adder / 1.5, 40)  # max 40 pts from adder rate
-    country_risk = 35 if "china" in country else 20 if country in ("russia","iran","north korea") else 5
-    volume_score = min(import_val / 5_000_000 * 15, 15)  # max 15 pts
-    trend_score = 10 if float(trend or 0) < -20 else 0  # declining = risky supply
-
-    score = int(rate_score + country_risk + volume_score + trend_score)
-    score = min(score, 100)
-
-    if score >= 70:
-        color, label, desc = "#ef4444", "HIGH RISK", "Significant tariff exposure — consider diversifying supply chain"
-    elif score >= 40:
-        color, label, desc = "#f59e0b", "MEDIUM RISK", "Moderate exposure — monitor policy changes closely"
-    else:
-        color, label, desc = "#10b981", "LOW RISK", "Manageable tariff exposure at current rates"
-
-    arc_pct = score / 100
-    import math
-    r, cx, cy = 40, 50, 50
-    circ = 2 * math.pi * r
-    filled = arc_pct * circ * 0.75  # 270 deg arc
-    gap = circ - filled
-
-    st.markdown(f"""
-    <div style="background:#0f1535;border:1px solid #1e3a5f;border-radius:10px;
-                padding:16px 20px;margin-bottom:12px;display:flex;align-items:center;gap:20px">
-        <svg width="100" height="100" viewBox="0 0 100 100">
-            <circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="#1a2553" stroke-width="10"
-                    stroke-dasharray="{circ*0.75:.1f} {circ*0.25:.1f}"
-                    stroke-dashoffset="-{circ*0.125:.1f}" transform="rotate(0 {cx} {cy})"/>
-            <circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}" stroke-width="10"
-                    stroke-linecap="round"
-                    stroke-dasharray="{filled:.1f} {circ:.1f}"
-                    stroke-dashoffset="-{circ*0.125:.1f}" transform="rotate(0 {cx} {cy})"/>
-            <text x="{cx}" y="{cy-4}" text-anchor="middle" font-family="Space Mono,monospace"
-                  font-size="18" font-weight="700" fill="{color}">{score}</text>
-            <text x="{cx}" y="{cy+12}" text-anchor="middle" font-family="Poppins,sans-serif"
-                  font-size="7" fill="#64748b">/100</text>
-        </svg>
-        <div style="flex:1">
-            <div style="font-family:Space Mono,monospace;font-size:0.7rem;font-weight:700;
-                        color:{color};margin-bottom:4px">TARIFF EXPOSURE · {label}</div>
-            <div style="font-size:0.78rem;color:#94a3b8;font-family:Poppins,sans-serif;
-                        line-height:1.4;margin-bottom:8px">{html.escape(desc)}</div>
-            <div style="display:flex;gap:6px;flex-wrap:wrap">
-                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#64748b;
-                             background:#1a2553;padding:2px 6px;border-radius:3px">
-                    Rate: {int(rate_score)}/40
-                </span>
-                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#64748b;
-                             background:#1a2553;padding:2px 6px;border-radius:3px">
-                    Country: {country_risk}/35
-                </span>
-                <span style="font-family:Space Mono,monospace;font-size:0.6rem;color:#64748b;
-                             background:#1a2553;padding:2px 6px;border-radius:3px">
-                    Volume: {int(volume_score)}/15
-                </span>
-            </div>
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-
-# ── FEATURE 3: What-If Tariff Slider ─────────────────────────────────────────
-
-def _render_whatif_slider(state: Dict[str, Any], widget_key_prefix: str = "whatif") -> None:
-    """Interactive what-if slider to recalculate duty at different adder rates."""
-    base = float(state.get("base_rate") or 0)
-    adder = float(state.get("adder_rate") or 0)
-    total = float(state.get("total_duty") or 0)
-    if adder == 0 or total == 0:
-        return
-
-    with st.expander("🔧 What-If Calculator — Adjust Tariff Rate", expanded=False):
-        new_adder = st.slider(
-            "Hypothetical adder rate (%)",
-            min_value=0.0, max_value=float(max(adder * 2, 100)),
-            value=float(adder), step=2.5,
-            key=f"{widget_key_prefix}_slider"
-        )
-        new_total = base + new_adder
-        delta = new_total - total
-        delta_color = "#ef4444" if delta > 0 else "#10b981"
-        delta_sign = "+" if delta > 0 else ""
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(f"""<div class='metric-box'>
-                <div class='metric-val' style='color:#64748b;text-decoration:line-through'>{total:.1f}%</div>
-                <div class='metric-lbl'>Current Total</div></div>""", unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"""<div class='metric-box'>
-                <div class='metric-val' style='color:#60a5fa'>{new_total:.1f}%</div>
-                <div class='metric-lbl'>New Total</div></div>""", unsafe_allow_html=True)
-        with col3:
-            st.markdown(f"""<div class='metric-box'>
-                <div class='metric-val' style='color:{delta_color}'>{delta_sign}{delta:.1f}%</div>
-                <div class='metric-lbl'>Change</div></div>""", unsafe_allow_html=True)
-
-        if st.session_state.get("calc_import_val"):
-            import_v = float(st.session_state.get("calc_import_val", 10000))
-            old_duty = import_v * (total / 100)
-            new_duty = import_v * (new_total / 100)
-            saving = old_duty - new_duty
-            if abs(saving) > 0:
-                s_color = "#10b981" if saving > 0 else "#ef4444"
-                s_label = f"saves ${abs(saving):,.0f}" if saving > 0 else f"costs ${abs(saving):,.0f} more"
-                st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:{s_color};margin-top:8px'>On ${import_v:,.0f} import value → {s_label}</div>", unsafe_allow_html=True)
-
-
 # ── Recent Policy Changes Sidebar Widget ─────────────────────────────────────
 
 @st.cache_data(ttl=3600)
@@ -1911,61 +1688,11 @@ def _render_sidebar() -> None:
 
         st.button("＋ New Conversation", use_container_width=True, on_click=_new_conversation)
 
-        # ── Query History ──
-        if st.session_state.get("query_history"):
-            st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin:12px 0 6px;font-weight:700'>Recent Queries</div>", unsafe_allow_html=True)
-            for i, q in enumerate(st.session_state.get("query_history", [])):
-                short = q[:38] + "…" if len(q) > 38 else q
-                if st.button(short, key=f"hist_q_{i}", use_container_width=True):
-                    _append_user_and_run(q)
-
         state = _last_state()
         if state:
-            conf = (state.get("pipeline_confidence") or "UNKNOWN").upper()
-            color_cls = _confidence_color(conf)
-            hts = state.get("hts_code") or "—"
-            total = state.get("total_duty")
-            product = state.get("product") or "—"
-            country = state.get("country") or "—"
-            st.markdown(
-                f"""
-                <div style="margin-top:16px">
-                    <div style="font-family:'Space Mono',monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin-bottom:12px">Last Query</div>
-                    <div class="tiq-card">
-                        <div style="font-size:0.78rem;color:#e0e7ff;margin-bottom:8px">{html.escape(str(product))} from {html.escape(str(country))}</div>
-                        <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#60a5fa">{html.escape(hts)}</div>
-                        <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
-                            <span style="font-family:'Space Mono',monospace;font-size:1rem;font-weight:600;color:#e0e7ff">{_fmt_pct(total)}</span>
-                            <span class="{color_cls}" style="font-family:'Space Mono',monospace;font-size:0.7rem">{conf}</span>
-                        </div>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
             with st.expander("Pipeline JSON", expanded=False):
                 st.json(state)
 
-            # ── Tariff Calculator ──
-            total_rate = state.get("total_duty")
-            if total_rate is not None:
-                try:
-                    rate_f = float(total_rate) / 100
-                    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin:14px 0 6px;font-weight:700'>Duty Calculator</div>", unsafe_allow_html=True)
-                    import_val = st.number_input("Import value (USD)", min_value=0.0, value=10000.0, step=1000.0, format="%.0f", key="calc_import_val", label_visibility="collapsed")
-                    if import_val > 0:
-                        duty_amt = import_val * rate_f
-                        total_landed = import_val + duty_amt
-                        st.markdown(f"""<div style='background:#0f1535;border:1px solid #1e3a5f;border-radius:8px;padding:12px 14px;font-family:Space Mono,monospace;font-size:0.75rem'>
-                            <div style='color:#64748b;margin-bottom:4px'>Import Value</div>
-                            <div style='color:#e0e7ff;font-weight:700'>${import_val:,.0f}</div>
-                            <div style='color:#64748b;margin:6px 0 4px'>Duty ({total_rate:.1f}%)</div>
-                            <div style='color:#ef4444;font-weight:700'>+${duty_amt:,.0f}</div>
-                            <div style='border-top:1px solid #1e3a5f;margin-top:8px;padding-top:8px;color:#64748b'>Landed Cost</div>
-                            <div style='color:#60a5fa;font-weight:700;font-size:0.9rem'>${total_landed:,.0f}</div>
-                        </div>""", unsafe_allow_html=True)
-                except Exception:
-                    pass
             st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
 
         # Recent policy changes button at bottom
@@ -2004,44 +1731,6 @@ def _render_sidebar() -> None:
                     st.markdown("<div style='font-size:0.75rem;color:#4a5568;padding:4px 0'>No results found</div>", unsafe_allow_html=True)
             except Exception:
                 st.markdown("<div style='font-size:0.75rem;color:#ef4444'>Search unavailable</div>", unsafe_allow_html=True)
-
-
-
-        # ── Example Queries ──
-        st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin:16px 0 8px;font-weight:700'>Example Queries</div>", unsafe_allow_html=True)
-        for category, queries in EXAMPLE_QUERIES.items():
-            if category == "📈 Rate Changes":
-                continue
-            st.markdown(f"<div class='eq-category'>{html.escape(category)}</div>", unsafe_allow_html=True)
-            for q in queries:
-                if st.button(q, key=f"eq_{q}", use_container_width=True):
-                    _append_user_and_run(q)
-
-        # ── Demo Scenarios at bottom ──
-        st.markdown("<div style='border-top:1px solid #1e3a5f;margin:20px 0 12px'></div>", unsafe_allow_html=True)
-        st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;color:#4a5568;margin-bottom:8px;font-weight:700'>🎯 Demo Scenarios</div>", unsafe_allow_html=True)
-
-        st.markdown("<div class='eq-category'>🔍 Ambiguous Product Classification</div>", unsafe_allow_html=True)
-        _AMB = {
-            "What tariff applies to batteries?": "batteries",
-            "Import duty on steel products?": "steel",
-            "Tariff rate for electric motors?": "motors",
-            "What is the duty on pipes?": "pipes",
-        }
-        for label, q in _AMB.items():
-            if st.button(label, key=f"demo_amb_{q}", use_container_width=True):
-                _append_user_and_run(q)
-
-        st.markdown("<div class='eq-category'>⚠️ HITL — Human Review Triggered</div>", unsafe_allow_html=True)
-        _HITL = {
-            "What is the tariff on metal parts from Germany?": "metal parts from Germany",
-            "Import duty on industrial machinery parts?": "machinery parts",
-        }
-        for label, q in _HITL.items():
-            if st.button(label, key=f"demo_hitl_{q}", use_container_width=True):
-                _append_user_and_run(q)
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
