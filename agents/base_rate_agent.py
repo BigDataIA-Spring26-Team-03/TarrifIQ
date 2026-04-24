@@ -77,7 +77,8 @@ def run_base_rate_agent(state: TariffState) -> Dict[str, Any]:
         return {
             "base_rate": None, "mfn_rate": None,
             "fta_rate": None, "fta_program": None, "fta_applied": False,
-            "rate_record_id": None, "hts_footnotes": [],
+            "rate_record_id": None, "rate_source": "TARIFFIQ.RAW.HTS_CODES",
+            "rate_source_hts": None, "hts_footnotes": [],
             "error": "No HTS code for base rate lookup",
         }
 
@@ -95,7 +96,8 @@ def run_base_rate_agent(state: TariffState) -> Dict[str, Any]:
         return {
             "base_rate": None, "mfn_rate": None,
             "fta_rate": None, "fta_program": None, "fta_applied": False,
-            "rate_record_id": None, "hts_footnotes": [],
+            "rate_record_id": None, "rate_source": "TARIFFIQ.RAW.HTS_CODES",
+            "rate_source_hts": None, "hts_footnotes": [],
             "error": msg,
         }
 
@@ -106,13 +108,18 @@ def run_base_rate_agent(state: TariffState) -> Dict[str, Any]:
         logger.info("base_rate_agent_done hts=%s resolved=%s base=%.4f",
                     hts_code, result["hts_code"], result["base_rate"])
 
+    resolved_hts = result["hts_code"]  # may differ from input if fallback resolved to parent
     out = {
         "base_rate": result["base_rate"],
         "mfn_rate": result["mfn_rate"],
         "fta_rate": result["fta_rate"],
         "fta_program": result["fta_program"],
         "fta_applied": result["fta_applied"],
-        "rate_record_id": result["hts_code"],
+        # rate_record_id is the HTS code string verified in Snowflake HTS_CODES,
+        # not a row UUID. tools.hts_verify(rate_record_id) confirms it exists.
+        "rate_record_id": resolved_hts,
+        "rate_source": "TARIFFIQ.RAW.HTS_CODES",
+        "rate_source_hts": resolved_hts,
         "hts_footnotes": result.get("footnotes", []),
     }
     _cache_set(hts_code, out, country)

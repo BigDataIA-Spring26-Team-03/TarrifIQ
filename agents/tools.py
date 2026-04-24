@@ -531,16 +531,22 @@ def fetch_doc_numbers_for_hts(hts_code: str) -> Set[str]:
     cur = conn.cursor()
     docs: Set[str] = set()
     try:
-        cur.execute(
-            "SELECT DISTINCT document_number FROM TARIFFIQ.RAW.NOTICE_HTS_CODES WHERE hts_code=%s",
-            (hts_code,),
-        )
-        docs.update(r[0] for r in cur.fetchall() if r[0])
-        cur.execute(
-            "SELECT DISTINCT document_number FROM TARIFFIQ.RAW.CBP_NOTICE_HTS_CODES WHERE hts_code=%s",
-            (hts_code,),
-        )
-        docs.update(r[0] for r in cur.fetchall() if r[0])
+        for table in [
+            "NOTICE_HTS_CODES",
+            "CBP_NOTICE_HTS_CODES",
+            "NOTICE_HTS_CODES_ITC",
+            "NOTICE_HTS_CODES_EOP",
+            "ITA_NOTICE_HTS_CODES",
+        ]:
+            try:
+                cur.execute(
+                    f"SELECT DISTINCT document_number FROM TARIFFIQ.RAW.{table} WHERE hts_code=%s",
+                    (hts_code,),
+                )
+                docs.update(r[0] for r in cur.fetchall() if r[0])
+            except Exception as e:
+                logger.debug("fetch_doc_numbers_table_skip table=%s error=%s", table, e)
+                continue
         logger.info("fetch_doc_numbers hts=%s found=%d", hts_code, len(docs))
         return docs
     except Exception as e:
@@ -1745,14 +1751,27 @@ def fetch_adder_chunks_from_all_agencies(
         )
 
         if not is_china:
-            chunks = [
-                c
-                for c in chunks
-                if not any(
-                    kw in (c.get("chunk_text") or "").lower()
-                    for kw in ["section 301", "people's republic of china"]
-                )
-            ]
+            # For non-China queries, filter out chunks that are exclusively
+            # about China Section 301 — but keep Section 232 and IEEPA chunks
+            # that may mention China in passing alongside universal duties.
+            # A chunk is China-specific if it mentions Section 301 AND China
+            # together, but NOT if it's about Section 232 (steel/aluminum)
+            # or IEEPA reciprocal tariffs which apply universally.
+            def _is_china_specific(chunk: Dict[str, Any]) -> bool:
+                text = (chunk.get("chunk_text") or "").lower()
+                title = (chunk.get("title") or "").lower()
+                # Drop if title explicitly calls out China
+                if any(kw in title for kw in ["china", "chinese", "people's republic"]):
+                    return True
+                # Drop if chunk text is specifically Section 301 China content
+                # Section 301 is China-only; Section 232 and IEEPA are not
+                has_301 = "section 301" in text
+                has_china = any(kw in text for kw in ["people's republic of china", "chinese goods", "chinese products"])
+                if has_301 and has_china:
+                    return True
+                return False
+
+            chunks = [c for c in chunks if not _is_china_specific(c)]
 
         # Sort by date (metadata or [YYYY-MM-DD] prefix in chunk text) — most recent first
         chunks.sort(key=_extract_date_from_chunk, reverse=True)

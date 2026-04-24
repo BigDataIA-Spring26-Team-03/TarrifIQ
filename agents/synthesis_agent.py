@@ -39,12 +39,12 @@ PIPELINE CONFIDENCE: {pipeline_confidence}
 
 HTS CLASSIFICATION: {hts_code} — {hts_description} (confidence: {confidence})
 
-VERIFIED DUTY RATE [HTS {record_id}]:
+VERIFIED DUTY RATE [HTS code {record_id} — verified in Snowflake HTS_CODES]:
   {rate_line}
   Section 301/IEEPA:     {adder_rate:.2f}% {adder_source}
   Total effective duty:  {total_duty:.2f}%
 {footnote_line}
-POLICY CHUNKS (full text per chunk until SYNTHESIS_* env budgets; cite ONLY these FR doc numbers: {valid_docs}):
+POLICY CHUNKS (full text per chunk until SYNTHESIS_* env budgets; cite ONLY these FR doc numbers as (FR: doc_number), e.g. (FR: 2025-07325): {valid_docs}):
 {policy_excerpts}
 
 POLICY ANALYSIS (intermediate summary from retrieval): {policy_summary}
@@ -258,7 +258,16 @@ def _fetch_doc_metadata(doc_numbers: Set[str]) -> Dict[str, Dict]:
 def _validate_citations(text: str, valid_docs: Set[str]) -> tuple[bool, Set[str]]:
     if not valid_docs:
         return True, set()
-    cited = set(re.findall(r"\b(\d{4}-\d{5,6})\b", text))
+    # Extract doc numbers from both formats:
+    #   bare: 2025-07325
+    #   prefixed: (FR: 2025-07325)  ← format we now use
+    cited: Set[str] = set()
+    # Prefixed format first — strip the FR: prefix
+    for m in re.finditer(r"\(FR:\s*([\w\-]+)\)", text):
+        cited.add(m.group(1).strip())
+    # Also catch bare YYYY-NNNNN format (e.g. in section headings or history block)
+    for m in re.finditer(r"\b(\d{4}-\d{4,6})\b", text):
+        cited.add(m.group(1))
     if not cited:
         return True, set()
     hallucinated = cited - valid_docs
@@ -366,6 +375,7 @@ def _build_context(
 ) -> str:
     hts_code = state.get("hts_code") or "Unknown"
     record_id = state.get("rate_record_id") or hts_code
+    rate_source = state.get("rate_source") or "TARIFFIQ.RAW.HTS_CODES"
     base_rate = state.get("base_rate") or 0.0
     adder_rate = state.get("adder_rate") or 0.0
     total_duty = state.get("total_duty") or 0.0
@@ -461,14 +471,16 @@ _SOURCE_AGENCY_MAP = {
 
 
 def _fr_url(doc_number: str) -> str:
-    """Fallback when Snowflake has no html_url — FR keyword search by document number."""
+    """
+    Build a Federal Register URL for a document number.
+    Uses the /search endpoint with the doc number as query — this reliably
+    surfaces the correct document as the top result without needing the slug.
+    """
     dn = (doc_number or "").strip()
     if not dn:
         return ""
-    return (
-        "https://www.federalregister.gov/documents/search"
-        f"?conditions%5Bterm%5D={quote(dn, safe='')}"
-    )
+    # FR search with exact doc number surfaces the correct doc as top result
+    return f"https://www.federalregister.gov/search?query={quote(dn, safe='')}"
 
 
 def _usitc_hts_lookup_url(hts_code: Optional[str]) -> Optional[str]:
@@ -484,6 +496,7 @@ def _build_citations(
     deduped: List[Dict],
     valid_docs: Set[str],
     doc_metadata: Optional[Dict[str, Dict]] = None,
+    rate_change_history: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     citations = []
     seen: Set[str] = set()
@@ -508,7 +521,7 @@ def _build_citations(
             "agency_short": "USITC",
             "title": f"HTS {state.get('hts_code')} — {state.get('hts_description', '')}",
             "text": rate_text,
-            "source": "TARIFFIQ.RAW.HTS_CODES",
+            "source": state.get("rate_source") or "TARIFFIQ.RAW.HTS_CODES",
             "url": _usitc_hts_lookup_url(state.get("hts_code")),
             "effective_date": None,
         })
@@ -521,12 +534,15 @@ def _build_citations(
         if adder_doc.startswith("9903"):
             ch99_title = f"Chapter 99 surcharge code {adder_doc}"
             ch99_text = f"Section 301/IEEPA adder rate — {adder_meta.get('title', adder_doc)}"
+            # Chapter 99 codes are HTS codes — link to USITC HTS lookup, not FR
+            adder_url = _usitc_hts_lookup_url(adder_doc) or ""
         else:
             ch99_title = adder_meta.get("title", f"FR {adder_doc}")
             ch99_text = f"Section 301/IEEPA adder rate — method: {state.get('adder_method', 'unknown')}"
-        adder_url = (adder_meta.get("html_url") or "").strip()
-        if not adder_url and not adder_doc.startswith("9903"):
-            adder_url = _fr_url(adder_doc)
+            # Use Snowflake html_url if available, else build FR search URL
+            adder_url = (adder_meta.get("html_url") or "").strip()
+            if not adder_url:
+                adder_url = _fr_url(adder_doc)
         citations.append({
             "type": "adder_source",
             "id": adder_doc,
@@ -539,16 +555,114 @@ def _build_citations(
             "effective_date": adder_meta.get("publication_date"),
         })
 
+    query_hts_code = (state.get("hts_code") or "").strip()
+    query_hts_chapter = query_hts_code[:2]
+    is_china_query = (state.get("country") or "").lower().strip() in (
+        "china", "prc", "people's republic of china"
+    )
+
+    # Ground truth: docs explicitly linked to this HTS in Snowflake
+    hts_linked_docs: Set[str] = set()
+    if query_hts_code:
+        try:
+            hts_linked_docs = tools.fetch_doc_numbers_for_hts(query_hts_code)
+            parts = query_hts_code.split(".")
+            while len(parts) > 1:
+                parts = parts[:-1]
+                hts_linked_docs |= tools.fetch_doc_numbers_for_hts(".".join(parts))
+        except Exception:
+            pass
+
+    # Docs from rate_change_history are explicitly fetched for this HTS — always keep
+    history_docs: Set[str] = set()
+    if rate_change_history:
+        history_docs = {r.get("document_number") for r in rate_change_history if r.get("document_number")}
+
+    def _is_relevant_citation(doc: str, chunk: dict, doc_meta: dict) -> bool:
+        # Always keep adder doc
+        if doc == adder_doc:
+            return True
+
+        title = (doc_meta.get("title") or chunk.get("title") or "").lower()
+
+        # Drop China 301 docs for non-China queries
+        if not is_china_query:
+            if any(s in title for s in [
+                "china's acts", "china's policies",
+                "people's republic of china",
+                "opioid supply chain in the people's republic",
+            ]):
+                return False
+
+        # Always drop antidumping/CVD, trade remedy investigations, and
+        # border enforcement docs — never relevant to import duty rates
+        if any(s in title for s in [
+            "less than fair value", "less-than-fair-value",
+            "antidumping", "countervailing",
+            "dumping margin", "sales at less than",
+            "opioid supply chain", "synthetic opioid",
+            "flow of illicit drugs", "illicit drugs across",
+            "northern border", "southern border",
+            "initiation of", "covered merchandise referral",
+            "affirmative determination", "negative determination",
+            "preliminary determination", "final determination",
+        ]):
+            return False
+
+        # Drop USMCA implementing regulations (rules of origin, not tariff rates)
+        if "implementing regulations" in title and any(
+            s in title for s in ["textile", "apparel", "automotive", "usmca"]
+        ):
+            return False
+
+        # Keep if Snowflake HTS linkage confirms this doc is about this product
+        if hts_linked_docs and doc in hts_linked_docs:
+            return True
+
+        # Keep if explicitly fetched from rate_change_history for this HTS
+        if doc in history_docs:
+            return True
+
+        # For China queries: keep Section 301/IEEPA policy docs even without
+        # HTS linkage in Snowflake — Section 301 lists are ingested at heading
+        # level and often not linked to individual 10-digit subheadings
+        if is_china_query and any(s in title for s in [
+            "section 301", "china's acts", "china's policies",
+            "people's republic of china", "technology transfer",
+            "intellectual property", "reciprocal tariff",
+        ]):
+            return True
+
+        # If chunk has explicit HTS chapter metadata, use it
+        chunk_hts = (chunk.get("hts_code") or "").replace(".", "")[:2]
+        chunk_chap = (chunk.get("hts_chapter") or "").strip().lstrip("0")
+        if chunk_hts and query_hts_chapter:
+            return chunk_hts == query_hts_chapter
+        if chunk_chap and query_hts_chapter:
+            return chunk_chap == query_hts_chapter.lstrip("0") or \
+                   chunk_chap == str(int(query_hts_chapter))
+
+        # No linkage data — drop it
+        # The policy_agent should have filtered these out but if it didn't,
+        # we'd rather show fewer citations than irrelevant ones
+        return False
+
     # Dedup by doc number here (not in _dedupe_chunks)
     for chunk in deduped:
         doc = chunk.get("document_number")
         if doc and doc not in seen and doc in valid_docs:
+            doc_meta = meta.get(doc, {})
+
+            if not _is_relevant_citation(doc, chunk, doc_meta):
+                logger.debug("citations_skip_irrelevant doc=%s", doc)
+                continue
+
             seen.add(doc)
             src = chunk.get("source", "USTR").upper()
             agency_meta = _SOURCE_AGENCY_MAP.get(src, {"agency": src, "agency_short": src})
-            doc_meta = meta.get(doc, {})
             chunk_text = chunk.get("chunk_text", "") or ""
             text = chunk_text[:120].strip() if chunk_text else ""
+            # URL priority: Snowflake html_url → FR search URL (always populated)
             doc_url = (doc_meta.get("html_url") or "").strip()
             if not doc_url:
                 doc_url = _fr_url(doc)
@@ -564,10 +678,10 @@ def _build_citations(
                 "id": doc,
                 "agency": agency_meta["agency"],
                 "agency_short": agency_meta["agency_short"],
-                "title": doc_meta.get("title", f"Federal Register {doc}"),
+                "title": doc_meta.get("title", f"Federal Register Notice {doc}"),
                 "text": text,
                 "source": sf_tbl,
-                "url": doc_url or None,
+                "url": doc_url,
                 "effective_date": doc_meta.get("publication_date", ""),
             })
 
@@ -666,6 +780,22 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
         top_importers_block=top_importers_block,
     )
 
+    # Prepend intent hint for rate-change queries so LLM leads with history
+    query_intent = state.get("query_intent")
+    if query_intent == "rate_change":
+        context = (
+            "QUERY INTENT: rate_change — the user is asking about tariff history or changes. "
+            "Lead with ## 5 (historical timeline) and make it the most detailed section. "
+            "## 2 should still cover current rates but be brief.\n\n"
+        ) + context
+    elif query_intent == "country_compare":
+        context = (
+            "QUERY INTENT: country_compare — the user is comparing sourcing countries. "
+            "Lead with ## 4 (alternative sourcing) and make it the most detailed section. "
+            "Explicitly rank the countries by total effective duty in ## 4. "
+            "## 2 should cover the primary country's charges briefly.\n\n"
+        ) + context
+
     # LLM call via ModelRouter — ANSWER_SYNTHESIS (claude-haiku)
     from services.llm.router import get_router, TaskType
     router = get_router()
@@ -717,7 +847,7 @@ def run_synthesis_agent(state: TariffState) -> Dict[str, Any]:
         fr_docs_verified=bool(valid_docs),
         hitl_was_triggered=bool(state.get("hitl_required", False)),
     )
-    citations = _build_citations(state, deduped, valid_docs, doc_metadata)
+    citations = _build_citations(state, deduped, valid_docs, doc_metadata, rate_change_history)
 
     logger.info("synthesis_agent_done citations=%d confidence=%s", len(citations), conf)
 

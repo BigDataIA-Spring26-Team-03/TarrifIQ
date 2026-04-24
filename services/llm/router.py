@@ -85,13 +85,22 @@ MODEL_ROUTING: Dict[TaskType, ModelConfig] = {
         max_tokens=150,
         cost_per_1k_tokens=0.000150,
         system_prompt=(
-            "You are a query parser for a US tariff intelligence platform. "
-            "Extract the product and country from the user query. "
-            "Correct any spelling errors in product or country names. "
-            "Return ONLY valid JSON with exactly two keys: "
-            "{\"product\": \"...\", \"country\": \"...\"} "
-            "If no country is mentioned, use \"country\": \"all\". "
-            "If no product is mentioned, use \"product\": \"unknown\"."
+            "You are a trade intelligence query parser for a US import tariff platform. "
+            "Your job is to extract the importable PRODUCT and COUNTRY OF ORIGIN from the user's query. "
+            "Think carefully — the product is what is being imported into the US, the country is where it comes from. "
+            "\n\nRules:"
+            "\n- Correct spelling errors in product and country names."
+            "\n- For abbreviated or colloquial product names, return the canonical trade name "
+            "(e.g. 'EVs' → 'electric vehicles', 'chips' → 'semiconductors', 'panels' → 'solar panels')."
+            "\n- For vague queries like 'steel tariff history' extract the product even without a country."
+            "\n- For policy questions like 'what is Section 301' extract product=null, country=null."
+            "\n- For comparison queries like 'China vs Vietnam for laptops', return the first country mentioned."
+            "\n- Country aliases: 'PRC' → 'China', 'EU' → country='European Union', 'Korea' → 'South Korea'."
+            "\n- If no country is mentioned or implied, use country='all'."
+            "\n- If no product is mentioned or identifiable, use product='unknown'."
+            "\n- Never invent a product or country not present or implied in the query."
+            "\nReturn ONLY valid JSON with exactly two keys: "
+            "{\"product\": \"...\", \"country\": \"...\"}"
         ),
     ),
 
@@ -153,17 +162,16 @@ MODEL_ROUTING: Dict[TaskType, ModelConfig] = {
         cost_per_1k_tokens=0.000800,
         system_prompt=(
             "You are a trade sourcing analyst for TariffIQ. "
-            "Given verified tariff data, write a clear natural language answer "
-            "for a procurement professional. "
+            "Given verified tariff data, write a structured Markdown answer "
+            "for a procurement professional using exactly the ## section headings provided. "
             "Rules: "
-            "1. Write in prose — 3 to 6 sentences, no JSON, no code blocks. "
-            "2. State the HTS code, base rate, any Section 301/232/IEEPA adder, and total effective duty. "
-            "3. Cite every rate claim inline as HTS[code] or FR[document_number]. "
-            "4. Mention trade volume and trend if provided. "
-            "5. If an FTA preferential rate applies, say so explicitly. "
-            "6. Never invent rates, HTS codes, or document numbers not in the context. "
-            "7. If data is missing or unverified, say so explicitly rather than guessing. " 
-            "8. Do NOT include any URLs or hyperlinks in the response text — citations panel handles links."
+            "1. Use the ## 1 through ## 7 section headings from the format template — no prose blob, no JSON. "
+            "2. Cite every Federal Register document inline as (FR: document_number) — e.g. (FR: 2025-07325). "
+            "3. Never invent rates, HTS codes, or document numbers not present in the context. "
+            "4. If a section has no supporting data, write one honest sentence — do not skip the heading. "
+            "5. If an FTA preferential rate applies, say so explicitly in section 2. "
+            "6. Do NOT include bare URLs in the text — the citations panel handles links. "
+            "7. If data is missing or unverified, say so explicitly rather than guessing."
         ),
     ),
 

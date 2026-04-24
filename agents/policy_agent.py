@@ -409,7 +409,7 @@ def _resolve_citations(summary: str, index_to_doc: Dict[int, str]) -> Tuple[str,
     def _replace(m: re.Match) -> str:
         idx = int(m.group(1))
         doc = index_to_doc.get(idx)
-        return f"({doc})" if doc else f"[INVALID-{idx}]"
+        return f"(FR: {doc})" if doc else f"[INVALID-{idx}]"
 
     resolved = re.sub(r"\[(\d+)\]", _replace, summary)
     return resolved, invalid
@@ -438,6 +438,7 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
         product=product,
         country=country,
         hts_chapter=hts_chapter or None,
+        hts_code=hts_code or None,
     )
     logger.info("policy_agent_hyde=%s", hyde_query[:120])
 
@@ -526,10 +527,10 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
             if not is_india and "india" in title and "executive order" in title:
                 return False
 
-            # No HTS info on chunk — keep it (generic policy doc)
+            # No HTS info on chunk — keep it, BM25 will rerank by relevance
             if not c_hts and not c_chap:
                 return True
-            # Has HTS info — must match query chapter
+            # Has HTS chapter metadata — must match query chapter
             if c_hts and c_hts != hts_chapter:
                 return False
             if c_chap and c_chap != hts_chapter.lstrip("0") and c_chap != str(int(hts_chapter)):
@@ -548,8 +549,8 @@ def run_policy_agent(state: TariffState) -> Dict[str, Any]:
     # Prevents large documents like 2020-13865 (USMCA) from flooding context
     # when retrieved via hybrid search but irrelevant to the tariff query.
     if len(chunks) > 8:
-        bm25_query = f"{product} {hts_code} tariff duty section 301 {country}"
-        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=12, min_score_ratio=0.35)
+        bm25_query = f"{product} {hts_code} tariff duty {country}"
+        chunks = _bm25_rerank_exhaustive(chunks, bm25_query, top_n=12, min_score_ratio=0.15)
         logger.info("policy_agent_final_filter chunks_after=%d", len(chunks))
 
     # ── Step 3: LLM synthesis with numbered citations ─────────────────────────

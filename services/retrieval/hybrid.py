@@ -23,21 +23,15 @@ logger = structlog.get_logger()
 
 def get_chroma_client() -> chromadb.HttpClient:
     """Get ChromaDB HttpClient with Docker/local auto-detection."""
-    # Check environment variables first
     host = os.environ.get("CHROMADB_HOST") or os.environ.get("CHROMA_HOST")
     port = os.environ.get("CHROMADB_PORT") or os.environ.get("CHROMA_PORT")
 
-    # If not explicitly set, auto-detect based on environment
     if not host or not port:
-        # Detect if running inside Docker
         in_docker = os.path.exists("/.dockerenv")
-
         if in_docker:
-            # Inside Docker: use Docker service name and internal port
             host = host or "chromadb"
             port = int(port or 8000)
         else:
-            # Outside Docker: use 127.0.0.1 and mapped port (more reliable than localhost on Windows)
             host = host or "127.0.0.1"
             port = int(port or 9001)
     else:
@@ -50,7 +44,7 @@ def get_chroma_client() -> chromadb.HttpClient:
 def tokenize(text: str) -> List[str]:
     """Simple tokenizer: lowercase, remove punctuation, split."""
     text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text)  # Remove punctuation
+    text = re.sub(r'[^\w\s]', ' ', text)
     return text.split()
 
 
@@ -64,29 +58,17 @@ class HybridRetriever:
         sparse_weight: float = 0.4,
         rrf_k: int = 60
     ):
-        """
-        Initialize HybridRetriever.
-
-        Args:
-            persist_dir: ChromaDB persistence directory (not used for HttpClient)
-            dense_weight: Weight for dense search results in RRF
-            sparse_weight: Weight for sparse search results in RRF
-            rrf_k: RRF parameter (constant added to ranks)
-        """
         self.dense_weight = dense_weight
         self.sparse_weight = sparse_weight
         self.rrf_k = rrf_k
 
-        # Connect to ChromaDB
         self.chroma = get_chroma_client()
 
-        # BM25 components
-        self.corpus = []  # List of document texts
-        self.doc_ids = []  # List of document IDs (chunk_id)
-        self.doc_metadata = []  # List of metadata dicts
-        self.bm25 = None  # BM25Okapi index
+        self.corpus = []
+        self.doc_ids = []
+        self.doc_metadata = []
+        self.bm25 = None
 
-        # Load BM25 corpus
         self._reload_bm25()
 
         logger.info(
@@ -106,8 +88,6 @@ class HybridRetriever:
             ) from e
 
         try:
-            # Fetch all documents from collection
-            # ChromaDB's get() without where clause returns all documents
             result = collection.get()
 
             if not result or not result.get("documents"):
@@ -119,7 +99,6 @@ class HybridRetriever:
             ids = result["ids"]
             metadatas = result.get("metadatas", [])
 
-            # Build corpus
             self.corpus = []
             self.doc_ids = []
             self.doc_metadata = []
@@ -131,7 +110,6 @@ class HybridRetriever:
                 self.doc_ids.append(doc_id)
                 self.doc_metadata.append(metadatas[i] if i < len(metadatas) else {})
 
-            # Build BM25 index
             if self.corpus:
                 tokenized_corpus = [tokenize(doc) for doc in self.corpus]
                 self.bm25 = BM25Okapi(tokenized_corpus)
@@ -158,8 +136,12 @@ class HybridRetriever:
         """
         Hybrid search for policy notices using dense + sparse + RRF.
 
+        Fix vs original: passes hts_chapter to both _dense_search_policy and
+        _sparse_search_policy so ChromaDB metadata filter is actually applied,
+        not just prepended to the query string.
+
         Args:
-            query: Search query string
+            query: Search query string (typically a HyDE-enhanced FR excerpt)
             hts_chapter: Optional filter by HTS chapter (e.g., "85")
             source: Optional filter by source ("USTR", "CBP", "USITC")
             top_k: Number of results to return
@@ -169,25 +151,28 @@ class HybridRetriever:
         """
         logger.info(
             "search_policy called",
-            query=query,
+            query=query[:80],
             hts_chapter=hts_chapter,
             source=source,
             top_k=top_k
         )
 
-        # Enrich query with chapter context instead of metadata filtering.
+        # Enrich query with chapter context for better lexical matching
+        enriched_query = query
         if hts_chapter:
-            query = f"HTS chapter {hts_chapter} tariff {query}"
+            enriched_query = f"HTS chapter {hts_chapter} tariff {query}"
 
-        # Step 1: Dense search
+        # Dense search — no metadata filter on hts_chapter since many relevant
+        # docs (Section 301 lists, IEEPA orders) don't have hts_chapter set.
+        # Query enrichment above handles chapter relevance instead.
         dense_results = self._dense_search_policy(
-            query, None, source, top_k * 3
+            enriched_query, None, source, top_k * 3
         )
         dense_dict = {r["chunk_id"]: (r, idx) for idx, r in enumerate(dense_results)}
 
-        # Step 2: Sparse search (BM25)
+        # Sparse search (BM25) — no metadata filter for same reason
         sparse_results = self._sparse_search_policy(
-            query, None, source, top_k * 3
+            enriched_query, None, source, top_k * 3
         )
         sparse_dict = {r["chunk_id"]: (r, idx) for idx, r in enumerate(sparse_results)}
 
@@ -202,13 +187,8 @@ class HybridRetriever:
             score = self.sparse_weight / (rank + self.rrf_k + 1)
             rrf_scores[chunk_id] += score
 
-        # Merge results
         all_chunks = {**dense_dict, **sparse_dict}
-        ranked = sorted(
-            rrf_scores.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
+        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
         results = []
         for chunk_id, rrf_score in ranked[:top_k]:
@@ -236,17 +216,16 @@ class HybridRetriever:
 
         # Build where filter
         where_filter = None
-        if hts_chapter and source:
-            where_filter = {
-                "$and": [
-                    {"hts_chapter": {"$contains": hts_chapter}},
-                    {"source": {"$eq": source}}
-                ]
-            }
-        elif hts_chapter:
-            where_filter = {"hts_chapter": {"$contains": hts_chapter}}
-        elif source:
-            where_filter = {"source": {"$eq": source}}
+        filters = []
+        if hts_chapter:
+            filters.append({"hts_chapter": {"$eq": hts_chapter}})
+        if source:
+            filters.append({"source": {"$eq": source}})
+
+        if len(filters) == 2:
+            where_filter = {"$and": filters}
+        elif len(filters) == 1:
+            where_filter = filters[0]
 
         try:
             results = collection.query(
@@ -263,7 +242,6 @@ class HybridRetriever:
             for i, doc in enumerate(results["documents"][0]):
                 metadata = results["metadatas"][0][i]
                 distance = results["distances"][0][i]
-
                 formatted.append({
                     "chunk_id": metadata.get("chunk_id", ""),
                     "document_number": metadata.get("document_number", ""),
@@ -272,6 +250,7 @@ class HybridRetriever:
                     "hts_code": metadata.get("hts_code", ""),
                     "source": metadata.get("source", ""),
                     "section": metadata.get("section", ""),
+                    "title": metadata.get("title", ""),
                     "publication_date": metadata.get("publication_date", ""),
                     "dense_distance": distance
                 })
@@ -295,13 +274,9 @@ class HybridRetriever:
             return []
 
         try:
-            # Tokenize query
             query_tokens = tokenize(query)
-
-            # Get BM25 scores
             scores = self.bm25.get_scores(query_tokens)
 
-            # Get top candidates
             scored_docs = [
                 (idx, score)
                 for idx, score in enumerate(scores)
@@ -309,7 +284,6 @@ class HybridRetriever:
             ]
             scored_docs.sort(key=lambda x: x[1], reverse=True)
 
-            # Filter by hts_chapter or source if provided
             filtered = []
             for idx, score in scored_docs:
                 if idx >= len(self.doc_metadata):
@@ -317,19 +291,16 @@ class HybridRetriever:
 
                 metadata = self.doc_metadata[idx]
 
-                # Apply chapter filter
                 if hts_chapter:
                     if hts_chapter not in str(metadata.get("hts_chapter", "")):
                         continue
 
-                # Apply source filter
                 if source:
                     if metadata.get("source") != source:
                         continue
 
                 filtered.append((idx, score))
 
-            # Format results
             formatted = []
             for idx, score in filtered[:top_k]:
                 metadata = self.doc_metadata[idx]
@@ -341,6 +312,7 @@ class HybridRetriever:
                     "hts_code": metadata.get("hts_code", ""),
                     "source": metadata.get("source", ""),
                     "section": metadata.get("section", ""),
+                    "title": metadata.get("title", ""),
                     "publication_date": metadata.get("publication_date", ""),
                     "bm25_score": score
                 })
@@ -364,9 +336,6 @@ class HybridRetriever:
             query: Search query string
             chapter: Optional filter by HTS chapter (e.g., "84")
             top_k: Number of results to return
-
-        Returns:
-            List of HTS code result dicts
         """
         logger.info("search_hts called", query=query, chapter=chapter, top_k=top_k)
 
@@ -377,7 +346,6 @@ class HybridRetriever:
                 "ChromaDB not initialized. Run chromadb_init.py first."
             ) from e
 
-        # Build where filter
         where_filter = None
         if chapter:
             where_filter = {"chapter": {"$eq": chapter}}
@@ -397,7 +365,6 @@ class HybridRetriever:
             for i, doc in enumerate(results["documents"][0]):
                 metadata = results["metadatas"][0][i]
                 distance = results["distances"][0][i]
-
                 formatted.append({
                     "hts_code": metadata.get("hts_code", ""),
                     "description": doc,
@@ -415,10 +382,9 @@ class HybridRetriever:
             return []
 
 
-# ── Singleton ──────────────────────────────────────────────────────────────────
-# _reload_bm25() fetches ALL documents from ChromaDB and builds a BM25 index
-# in memory on instantiation (can take several seconds on first call).
-# Always use get_retriever() so this happens once at startup, not per query.
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
 
 _retriever_instance = None
 
@@ -429,30 +395,3 @@ def get_retriever() -> "HybridRetriever":
     if _retriever_instance is None:
         _retriever_instance = HybridRetriever()
     return _retriever_instance
-
-
-if __name__ == "__main__":
-    print("Initializing HybridRetriever...")
-    retriever = HybridRetriever()
-
-    print("\nTesting search_policy...")
-    results = retriever.search_policy(
-        query="additional duties China electronics",
-        hts_chapter="85",
-        top_k=3
-    )
-    if results:
-        for r in results:
-            print(f"  [{r['source']}] {r['document_number']}: {r['chunk_text'][:100]}...")
-    else:
-        print("  No results")
-
-    print("\nTesting search_hts...")
-    results = retriever.search_hts(query="laptop computers", top_k=3)
-    if results:
-        for r in results:
-            print(f"  {r['hts_code']}: {r['description'][:80]}")
-    else:
-        print("  No results")
-
-    print("\nDone!")

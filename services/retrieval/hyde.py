@@ -63,17 +63,18 @@ Write ONLY the paragraph itself."""
 HYDE_PROMPT_WITH_CHAPTER = """You are a US trade policy expert writing Federal Register notice excerpts.
 
 A procurement professional is researching tariffs on {product} imported from {country}.
-The relevant HTS chapter is {hts_chapter}.
+The relevant HTS subheading is {hts_code} (chapter {hts_chapter}).
 
 Write a SHORT paragraph (3-4 sentences) that looks exactly like a real Federal Register notice about this topic.
 
 Your paragraph MUST:
-- Reference HTS chapter {hts_chapter} or specific subheadings within that chapter
+- Reference HTS subheading {hts_code} or other subheadings within chapter {hts_chapter} by number
 - Use legal language like "ad valorem rate of duty", "entered for consumption", "subchapter III of chapter 99"
-- Mention the likely tariff action type for this product/country
+- Mention the likely tariff action type for this product/country combination
 - If the product is steel (chapter 72-73), aluminum (chapter 76), or copper (chapter 74),
   mention Section 232 and that tariff rates have been increased or modified
 - If the product is from China, mention Section 301 or IEEPA duties
+- For Canada/Mexico, mention USMCA rules of origin and any IEEPA executive orders
 - For other countries with steel/aluminum, mention Section 232 duty modifications
 - Sound like it was copied from an actual Federal Register notice
 
@@ -103,7 +104,8 @@ class HyDEQueryEnhancer:
             query="what are the tariffs on smartphones from China?",
             product="smartphones",
             country="China",
-            hts_chapter="85"
+            hts_chapter="85",
+            hts_code="8517.13.00"
         )
 
         results = retriever.search_policy(
@@ -113,12 +115,6 @@ class HyDEQueryEnhancer:
     """
 
     def __init__(self, router=None) -> None:
-        """
-        Initialize HyDE enhancer with optional custom router.
-
-        Args:
-            router: ModelRouter instance (uses singleton if None)
-        """
         if router is not None:
             self.router = router
         else:
@@ -131,6 +127,7 @@ class HyDEQueryEnhancer:
         product: str,
         country: str,
         hts_chapter: Optional[str] = None,
+        hts_code: Optional[str] = None,
     ) -> str:
         """
         Enhance a search query using HyDE.
@@ -143,6 +140,7 @@ class HyDEQueryEnhancer:
             product: Extracted product name (e.g., "smartphones")
             country: Extracted country name (e.g., "China")
             hts_chapter: Optional HTS chapter (e.g., "85")
+            hts_code: Optional full HTS code (e.g., "8517.13.00")
 
         Returns:
             Hypothetical FR text string for use as search query.
@@ -152,10 +150,13 @@ class HyDEQueryEnhancer:
             from services.llm.router import TaskType
 
             if hts_chapter:
+                # Use full HTS code if available, fall back to chapter-only
+                effective_hts_code = hts_code or f"{hts_chapter}XX.XX.XX"
                 prompt = HYDE_PROMPT_WITH_CHAPTER.format(
                     product=product,
                     country=country,
                     hts_chapter=hts_chapter,
+                    hts_code=effective_hts_code,
                 )
             else:
                 chapter_hint = ""
@@ -189,6 +190,7 @@ class HyDEQueryEnhancer:
                 product=product,
                 country=country,
                 hts_chapter=hts_chapter,
+                hts_code=hts_code,
                 original_query_len=len(query),
                 hypothetical_len=len(hypothetical)
             )
@@ -210,21 +212,13 @@ class HyDEQueryEnhancer:
         product: str,
         country: str,
         hts_chapter: Optional[str] = None,
+        hts_code: Optional[str] = None,
     ) -> str:
         """
         Synchronous version of enhance().
 
         Use this in non-async FastAPI endpoints or sync contexts.
         Falls back to original query on any error.
-
-        Args:
-            query: Original user question
-            product: Extracted product name
-            country: Extracted country name
-            hts_chapter: Optional HTS chapter
-
-        Returns:
-            Enhanced query (hypothetical FR text) or original query
         """
         try:
             loop = asyncio.new_event_loop()
@@ -236,6 +230,7 @@ class HyDEQueryEnhancer:
                         product=product,
                         country=country,
                         hts_chapter=hts_chapter,
+                        hts_code=hts_code,
                     )
                 )
                 return result
@@ -260,11 +255,9 @@ class HyDEQueryEnhancer:
 
         Args:
             queries: List of (query, product, country, hts_chapter) tuples.
-                     Pass None for hts_chapter if unknown.
 
         Returns:
             List of enhanced queries in same order.
-            Failed enhancements fall back to original query.
         """
         tasks = [
             self.enhance(
@@ -276,19 +269,12 @@ class HyDEQueryEnhancer:
             for q, p, c, ch in queries
         ]
 
-        results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True
-        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         enhanced = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.warning(
-                    "hyde_batch_item_failed",
-                    index=i,
-                    error=str(result)
-                )
+                logger.warning("hyde_batch_item_failed", index=i, error=str(result))
                 enhanced.append(queries[i][0])
             else:
                 enhanced.append(result)
@@ -309,82 +295,3 @@ def get_enhancer() -> HyDEQueryEnhancer:
     if _enhancer_instance is None:
         _enhancer_instance = HyDEQueryEnhancer()
     return _enhancer_instance
-
-
-# ---------------------------------------------------------------------------
-# Test Block
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import asyncio
-
-    async def test_hyde():
-        """Test HyDE query enhancement."""
-        enhancer = HyDEQueryEnhancer()
-
-        test_cases = [
-            {
-                "query": "what are the tariffs on smartphones from China?",
-                "product": "smartphones",
-                "country": "China",
-                "hts_chapter": "85"
-            },
-            {
-                "query": "duty on steel pipes from Canada",
-                "product": "steel pipes",
-                "country": "Canada",
-                "hts_chapter": "73"
-            },
-            {
-                "query": "tariff on laptops from Mexico",
-                "product": "laptops",
-                "country": "Mexico",
-                "hts_chapter": "84"
-            },
-            {
-                "query": "import duty on solar panels from China",
-                "product": "solar panels",
-                "country": "China",
-                "hts_chapter": "85"
-            },
-            {
-                "query": "what is the rate on tuna from Thailand",
-                "product": "tuna",
-                "country": "Thailand",
-                "hts_chapter": "16"
-            },
-        ]
-
-        print("=" * 70)
-        print("HyDE Query Enhancement Tests")
-        print("=" * 70)
-
-        for test in test_cases:
-            print(f"\nOriginal query:")
-            print(f"  {test['query']}")
-
-            enhanced = await enhancer.enhance(
-                query=test["query"],
-                product=test["product"],
-                country=test["country"],
-                hts_chapter=test["hts_chapter"]
-            )
-
-            print(f"\nEnhanced query (HyDE):")
-            print(f"  {enhanced[:300]}...")
-            print(f"  Length: {len(enhanced)} chars")
-            print("-" * 70)
-
-        print("\nTesting batch enhancement...")
-        batch_input = [
-            (t["query"], t["product"], t["country"], t["hts_chapter"])
-            for t in test_cases[:3]
-        ]
-        batch_results = await enhancer.enhance_batch(batch_input)
-        print(f"Batch returned {len(batch_results)} results")
-        for i, result in enumerate(batch_results):
-            print(f"  [{i}]: {result[:100]}...")
-
-        print("\nAll tests passed!")
-
-    asyncio.run(test_hyde())

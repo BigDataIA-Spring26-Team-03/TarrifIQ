@@ -270,7 +270,11 @@ def _step4_chapter99_lookup(hts_code: str, hts_footnotes: Optional[List[str]], c
                 logger.debug("step4_chap99_from_footnote codes=%s", matches)
 
     # Sub-step 4c: If no footnotes, scan NOTICE_HTS_CODES snippets for chapter 99 codes
+    # IMPORTANT: filter China-specific 9903.88.xx and 9903.91.xx codes here
+    # based on country — don't collect them and rely on description matching later
     if not chapter99_codes:
+        country_lower_4c = (country or "").lower().strip()
+        is_china_4c = country_lower_4c in ("china", "prc", "people's republic of china")
         try:
             conn = tools._sf()
             cur = conn.cursor()
@@ -291,7 +295,18 @@ def _step4_chapter99_lookup(hts_code: str, hts_footnotes: Optional[List[str]], c
                         for row in rows:
                             snippet = row[0] if row else ""
                             matches = CHAP99_RE.findall(snippet)
-                            chapter99_codes.extend(matches)
+                            for ch99 in matches:
+                                # Skip China-specific Section 301 codes for non-China countries
+                                # 9903.88.xx = Section 301 China, 9903.91.xx = IEEPA China
+                                if not is_china_4c and (
+                                    ch99.startswith("9903.88") or ch99.startswith("9903.91")
+                                ):
+                                    logger.debug(
+                                        "step4c_skip_china_ch99 code=%s country=%s",
+                                        ch99, country,
+                                    )
+                                    continue
+                                chapter99_codes.append(ch99)
                         if chapter99_codes:
                             break
                     except Exception:
@@ -428,6 +443,7 @@ def _step5_notice_lookup(hts_code: str, country: Optional[str]) -> tuple[Optiona
                     rows = cur.fetchall()
                     country_lower_s5 = (country or "").lower().strip()
                     is_china_s5 = country_lower_s5 in ("china", "prc", "people's republic of china")
+                    added_from_this_table = 0
                     for doc_num, snippet, title, pub_date in rows:
                         if not snippet:
                             continue
@@ -448,12 +464,16 @@ def _step5_notice_lookup(hts_code: str, country: Optional[str]) -> tuple[Optiona
                             ),
                             "publication_date": str(pub_date) if pub_date else "",
                         })
-                    if snippets:
+                        added_from_this_table += 1
+                    # Only break to next table if we actually added non-filtered snippets
+                    if added_from_this_table > 0:
                         break
                 except Exception as e:
                     logger.debug("step5_table_error table=%s code=%s error=%s", table, code, e)
                     continue
-            if snippets:
+            # Continue to next table regardless — accumulate from all sources
+            # Stop only when we have enough snippets (8+) for good LLM context
+            if len(snippets) >= 8:
                 break
 
         cur.close()

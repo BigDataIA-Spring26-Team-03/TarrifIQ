@@ -86,9 +86,12 @@ INJECTION_PATTERNS = [
 ]
 
 TARIFF_SIGNALS = [
-    "tariff", "duty", "import", "customs", "hts", "rate", "tax",
-    "from", "sourcing", "buy", "purchase", "product", "goods",
+    "tariff", "duty", "duties", "import", "customs", "hts", "rate", "tax",
+    "from", "sourcing", "source", "buy", "purchase", "product", "goods",
     "section 301", "section 232", "ieepa", "trade", "supply chain",
+    "cost", "charge", "fee", "levy", "cheaper", "expensive", "compare",
+    "chapter", "classify", "classification", "exempt", "exclusion",
+    "steel", "aluminum", "solar", "semiconductor", "vehicle", "furniture",
 ]
 
 # Abbreviations and technical shortforms only.
@@ -252,8 +255,9 @@ def _check_ambiguity(product: str, country: Optional[str]) -> Optional[Dict]:
     if alias_result and alias_result[1] >= 0.95:
         return None
 
-    # Multi-word products with 3+ words are specific enough to skip
-    if len(product_lower.split()) >= 3:
+    # Multi-word products with 2+ words are specific enough to skip ambiguity check.
+    # Single-word terms like "steel", "pipe", "pump" are the ones that need it.
+    if len(product_lower.split()) >= 2:
         return None
 
     try:
