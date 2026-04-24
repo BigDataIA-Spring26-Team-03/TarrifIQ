@@ -2,12 +2,15 @@
 
 **Course:** DAMG 7245 — Big Data and Intelligent Analytics (Team 3)
 **Institution:** Northeastern University, College of Engineering — Spring 2026
-
 ---
+> WE ATTEST THAT WE HAVEN'T USED ANY OTHER STUDENTS' WORK IN OUR ASSIGNMENT AND ABIDE BY THE POLICIES LISTED IN THE STUDENT HANDBOOK.
 
-## Live Application
-
-| Component | Link |
+| Member | Contribution |
+|---|---|
+| Ayush Fulsundar | 33.3% |
+| Ishaan Samel | 33.3% |
+| Vaishnavi Srinivas | 33.3% |
+---
 ## Live Application
 
 | Component | Link |
@@ -365,11 +368,3 @@ requirements-api.txt          API-specific dependencies
 **AI Usage Disclosure:** Claude (Anthropic) was used as a coding assistant for agent logic, retrieval pipeline design, and citation filtering. All architectural decisions, data modeling, and validation were made and verified by the team.
 
 ---
-
-> WE ATTEST THAT WE HAVEN'T USED ANY OTHER STUDENTS' WORK IN OUR ASSIGNMENT AND ABIDE BY THE POLICIES LISTED IN THE STUDENT HANDBOOK.
-
-| Member | Contribution |
-|---|---|
-| Ayush Fulsundar | 33.3% |
-| Ishaan Samel | 33.3% |
-| Vaishnavi Srinivas | 33.3% |
